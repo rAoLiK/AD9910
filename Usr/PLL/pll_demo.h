@@ -28,6 +28,8 @@ typedef struct {
   float measured_phase_deg;
   float phase_error_deg;
   float phase_quality;
+  float frequency_step_hz;
+  bool fine_mode;
   uint32_t sample_rate_hz;
   uint32_t dma_overrun_count;
   uint32_t adc_error_count;

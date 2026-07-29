@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define PLL_DMA_HALF_PAIR_COUNT       (256U)
+#define PLL_DMA_HALF_PAIR_COUNT       (2048U)
 #define PLL_DMA_PAIR_COUNT            (2U * PLL_DMA_HALF_PAIR_COUNT)
 #define PLL_RX_RING_SIZE              (128U)
 #define PLL_RX_RING_MASK              (PLL_RX_RING_SIZE - 1U)
@@ -37,6 +37,7 @@ typedef struct {
   uint32_t last_valid_tick;
   uint32_t last_dds_update_tick;
   uint32_t last_ftw;
+  double ftw_fraction_accumulator;
   float dds_frequency_hz;
   bool initialized;
   bool running;
@@ -146,6 +147,8 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
                               bool force)
 {
   ad9910_profile_word_t profile;
+  double exact_ftw;
+  double fractional_ftw;
   uint32_t ftw;
   ad9910_status_t result;
 
@@ -153,9 +156,34 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
     return false;
   }
 
-  ftw = AD9910_FrequencyToFTW(
-      (double)frequency_hz,
-      (double)s_context.dds->cfg.sysclk.sys_clk_hz);
+  /*
+   * At 1 GHz SYSCLK one FTW LSB is about 0.233 Hz.  First-order fractional
+   * FTW modulation at the 1 kHz service rate gives a sub-0.1 Hz average
+   * command without asking the AD9910 for an impossible fractional word.
+   */
+  exact_ftw =
+      ((double)frequency_hz * 4294967296.0) /
+      (double)s_context.dds->cfg.sysclk.sys_clk_hz;
+  if ((exact_ftw < 0.0) || (exact_ftw > 4294967295.0)) {
+    return false;
+  }
+  ftw = (uint32_t)exact_ftw;
+  fractional_ftw = exact_ftw - (double)ftw;
+  if (force) {
+    s_context.ftw_fraction_accumulator = 0.0;
+  }
+  s_context.ftw_fraction_accumulator += fractional_ftw;
+  if ((s_context.ftw_fraction_accumulator >= 1.0) &&
+      (ftw != UINT32_MAX)) {
+    ftw++;
+    s_context.ftw_fraction_accumulator -= 1.0;
+  }
+
+  /*
+   * Advance the modulator only at the scheduled service interval, even when
+   * the selected integer FTW happens to be unchanged.
+   */
+  s_context.last_dds_update_tick = HAL_GetTick();
   if (!force && s_context.have_ftw &&
       (ftw == s_context.last_ftw) &&
       (output_enabled == s_context.dds_output_enabled)) {
@@ -177,7 +205,6 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
   s_context.have_ftw = true;
   s_context.dds_output_enabled = output_enabled;
   s_context.dds_frequency_hz = frequency_hz;
-  s_context.last_dds_update_tick = HAL_GetTick();
   return true;
 }
 
@@ -376,7 +403,7 @@ static bool PLL_Demo_ParseDecimal(const char *text, float *value)
 
 static void PLL_Demo_SendStatus(void)
 {
-  static char line[240];
+  static char line[288];
   int32_t phase_mdeg =
       (int32_t)lroundf(s_status.measured_phase_deg * 1000.0f);
   int32_t error_mdeg =
@@ -391,11 +418,17 @@ static void PLL_Demo_SendStatus(void)
       (uint32_t)lroundf(s_status.dds_frequency_hz * 100.0f);
   uint32_t quality_milli =
       (uint32_t)lroundf(s_status.phase_quality * 1000.0f);
+  int32_t step_millihz =
+      (int32_t)lroundf(s_status.frequency_step_hz * 1000.0f);
+  uint32_t step_abs =
+      (uint32_t)((step_millihz < 0) ? -step_millihz :
+                                        step_millihz);
 
   (void)snprintf(
       line, sizeof(line),
       "STATE=%s MUL=%u REF=%lu.%02luHz DDS=%lu.%02luHz "
       "PH=%c%lu.%03lu ERR=%c%lu.%03lu Q=%lu.%03lu FS=%lu "
+      "STEP=%c%lu.%03luHz MODE=%s "
       "OVR=%lu ADCERR=%lu RXOVR=%lu DDSERR=%lu\r\n",
       PLL_Demo_StateName(s_status.state),
       (unsigned int)s_status.multiplier,
@@ -412,6 +445,10 @@ static void PLL_Demo_SendStatus(void)
       (unsigned long)(quality_milli / 1000U),
       (unsigned long)(quality_milli % 1000U),
       (unsigned long)s_status.sample_rate_hz,
+      (step_millihz < 0) ? '-' : '+',
+      (unsigned long)(step_abs / 1000U),
+      (unsigned long)(step_abs % 1000U),
+      s_status.fine_mode ? "FINE" : "COARSE",
       (unsigned long)s_status.dma_overrun_count,
       (unsigned long)s_status.adc_error_count,
       (unsigned long)s_status.uart_overflow_count,
@@ -587,6 +624,9 @@ static void PLL_Demo_UpdateStatus(void)
   s_status.phase_error_deg =
       s_context.control.phase_error_rad * PLL_DEG_PER_RAD;
   s_status.phase_quality = s_context.measurement.phase_quality;
+  s_status.frequency_step_hz =
+      s_context.control.frequency_step_hz;
+  s_status.fine_mode = s_context.control.fine_mode;
   s_status.sample_rate_hz = s_context.actual_sample_rate_hz;
   s_status.dma_overrun_count = s_dma_overrun_count;
   s_status.adc_error_count = s_adc_error_count;

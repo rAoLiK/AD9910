@@ -13,7 +13,9 @@ extern "C" {
 typedef struct {
   bool command_valid;
   bool phase_locked;
+  bool fine_mode;
   float dds_frequency_hz;
+  float frequency_step_hz;
   uint32_t requested_sample_rate_hz;
   float phase_error_rad;
 } lock_controller_output_t;
@@ -21,11 +23,20 @@ typedef struct {
 typedef struct {
   uint8_t multiplier;
   float target_phase_rad;
+  float coarse_frequency_hz;
+  float tracked_frequency_hz;
+  float command_frequency_hz;
   float filtered_phase_error_rad;
   float frequency_trim_hz;
+  float phase_elapsed_s;
+  float frequency_change_time_s;
+  float missing_frequency_time_s;
   float locked_time_s;
   float unlocked_time_s;
+  float last_frequency_step_hz;
+  bool frequency_initialized;
   bool filter_initialized;
+  bool fine_mode;
   bool phase_locked;
 } lock_controller_t;
 

@@ -8,6 +8,7 @@
 
 #define TEST_PI             (3.14159265358979323846)
 #define TEST_PAIR_COUNT     (256U)
+#define TEST_HIGH_PAIR_COUNT (2048U)
 
 static uint32_t make_pair(double reference, double dds)
 {
@@ -90,6 +91,7 @@ static int run_controller_case(void)
       .signal_valid = true,
       .frequency_valid = true,
       .phase_valid = true,
+      .phase_updated = true,
       .reference_frequency_hz = 10000.0f,
       .generalized_phase_rad = 30.0f * (float)TEST_PI / 180.0f,
       .phase_quality = 0.95f
@@ -116,13 +118,126 @@ static int run_controller_case(void)
              : 0;
 }
 
+static int run_100khz_detector_case(void)
+{
+  phase_detector_t detector;
+  phase_measurement_t measurement = {0};
+  uint32_t pairs[TEST_HIGH_PAIR_COUNT];
+  const double sample_rate = 2400000.0;
+  const double frequency = 100000.0;
+  uint64_t sample_index = 0U;
+  unsigned int block;
+
+  PhaseDetector_Init(&detector, (float)sample_rate);
+  for (block = 0U; block < 8U; ++block) {
+    uint32_t i;
+    for (i = 0U; i < TEST_HIGH_PAIR_COUNT; ++i, ++sample_index) {
+      double reference_phase =
+          2.0 * TEST_PI * frequency * (double)sample_index /
+              sample_rate +
+          10.0 * TEST_PI / 180.0;
+      double dds_phase =
+          2.0 * TEST_PI * frequency * (double)sample_index /
+              sample_rate +
+          55.0 * TEST_PI / 180.0;
+      pairs[i] = make_pair(sin(reference_phase), sin(dds_phase));
+    }
+    PhaseDetector_Process(&detector, pairs, TEST_HIGH_PAIR_COUNT,
+                          1U, &measurement);
+  }
+
+  printf("100k detector: f=%.3f Hz phase=%.3f deg quality=%.3f\n",
+         (double)measurement.reference_frequency_hz,
+         (double)measurement.generalized_phase_rad *
+             180.0 / TEST_PI,
+         (double)measurement.phase_quality);
+  return (!measurement.frequency_valid || !measurement.phase_valid ||
+          (fabs((double)measurement.reference_frequency_hz -
+                frequency) > 10.0) ||
+          (fabs((double)measurement.generalized_phase_rad *
+                    180.0 / TEST_PI -
+                45.0) > 1.0))
+             ? 1
+             : 0;
+}
+
+static double wrap_radians(double radians)
+{
+  while (radians > TEST_PI) {
+    radians -= 2.0 * TEST_PI;
+  }
+  while (radians <= -TEST_PI) {
+    radians += 2.0 * TEST_PI;
+  }
+  return radians;
+}
+
+static int run_100khz_gradient_case(void)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .reference_frequency_hz = 100000.0f,
+      .phase_quality = 0.95f
+  };
+  const double dt = 0.001;
+  double input_frequency = 100000.0;
+  double phase = 120.0 * TEST_PI / 180.0;
+  double largest_fine_step = 0.0;
+  bool saw_fine_mode = false;
+  unsigned int i;
+
+  LockController_Init(&controller);
+  for (i = 0U; i < 2600U; ++i) {
+    if (i == 1300U) {
+      /* Exercise the clean reacquisition path after an input-frequency hop. */
+      input_frequency = 112345.0;
+      measurement.reference_frequency_hz = (float)input_frequency;
+    }
+
+    measurement.generalized_phase_rad = (float)phase;
+    LockController_Step(&controller, &measurement, (float)dt, &output);
+    phase = wrap_radians(
+        phase +
+        2.0 * TEST_PI *
+            ((double)output.dds_frequency_hz - input_frequency) * dt);
+
+    if (output.fine_mode) {
+      double step = fabs((double)output.frequency_step_hz);
+      saw_fine_mode = true;
+      if (step > largest_fine_step) {
+        largest_fine_step = step;
+      }
+    }
+  }
+
+  printf("100k/hop: dds=%.4f Hz input=%.4f Hz phase=%.3f deg "
+         "fine_step<=%.4f Hz locked=%u\n",
+         (double)output.dds_frequency_hz, input_frequency,
+         phase * 180.0 / TEST_PI, largest_fine_step,
+         output.phase_locked ? 1U : 0U);
+  return (!output.command_valid || !output.phase_locked ||
+          !saw_fine_mode || (largest_fine_step > 0.0501) ||
+          (fabs((double)output.dds_frequency_hz -
+                input_frequency) > 0.10) ||
+          (fabs(phase * 180.0 / TEST_PI) > 3.0))
+             ? 1
+             : 0;
+}
+
 int main(void)
 {
   int failures = 0;
 
   failures += run_detector_case(1U, 20.0, 65.0, 45.0);
   failures += run_detector_case(2U, 20.0, 80.0, 40.0);
+  failures += run_100khz_detector_case();
   failures += run_controller_case();
+  failures += run_100khz_gradient_case();
   if (failures != 0) {
     fprintf(stderr, "phase-lock tests failed: %d\n", failures);
     return EXIT_FAILURE;

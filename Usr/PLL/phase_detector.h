@@ -12,6 +12,8 @@ typedef struct {
   bool signal_valid;
   bool frequency_valid;
   bool phase_valid;
+  /* True for exactly one call when a new demodulated phase is produced. */
+  bool phase_updated;
   float reference_frequency_hz;
   float generalized_phase_rad;
   float reference_amplitude_counts;
@@ -28,6 +30,7 @@ typedef struct {
   uint64_t last_good_crossing_sample;
   uint64_t last_signal_sample;
   uint64_t last_phase_sample;
+  uint64_t previous_reference_sample;
   uint32_t valid_period_count;
   float last_phase_rad;
   float last_phase_quality;

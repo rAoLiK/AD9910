@@ -12,6 +12,7 @@
 #define PHASE_MAX_NYQUIST_FRACTION    (0.45f)
 #define PHASE_SIGNAL_HOLD_SECONDS     (0.50f)
 #define PHASE_DEMOD_INTERVAL_SECONDS  (0.00075f)
+#define PHASE_DEMOD_NOMINAL_PAIRS     (128U)
 
 static float PhaseDetector_Wrap(float radians)
 {
@@ -81,15 +82,18 @@ void PhaseDetector_SetSampleRate(phase_detector_t *detector,
 static void PhaseDetector_EstimateFrequency(phase_detector_t *detector,
                                             const uint32_t *packed_pairs,
                                             uint32_t pair_count,
+                                            uint32_t analysis_stride,
                                             float hysteresis_counts)
 {
   uint64_t interval_sum_q16 = 0ULL;
   uint32_t interval_count = 0U;
   uint32_t i;
 
-  for (i = 0U; i < pair_count; ++i) {
+  for (i = 0U; i < pair_count; i += analysis_stride) {
     uint16_t raw = (uint16_t)(packed_pairs[i] & 0x0FFFU);
     float centered = (float)raw - detector->dc_reference_counts;
+    uint64_t current_sample =
+        detector->sample_index + (uint64_t)i;
 
     if (centered <= -hysteresis_counts) {
       detector->crossing_armed = true;
@@ -114,8 +118,12 @@ static void PhaseDetector_EstimateFrequency(phase_detector_t *detector,
         }
 
         crossing_q16 =
-            ((detector->sample_index + (uint64_t)i - 1ULL) << 16U) +
-            (uint64_t)(fraction * 65536.0f);
+            (detector->previous_reference_sample << 16U) +
+            (uint64_t)(
+                fraction *
+                (float)(current_sample -
+                        detector->previous_reference_sample) *
+                65536.0f);
 
         if (detector->have_crossing &&
             (crossing_q16 > detector->last_crossing_q16)) {
@@ -143,6 +151,7 @@ static void PhaseDetector_EstimateFrequency(phase_detector_t *detector,
     }
 
     detector->previous_reference_raw = raw;
+    detector->previous_reference_sample = current_sample;
     detector->have_previous_sample = true;
   }
 
@@ -291,6 +300,8 @@ void PhaseDetector_Process(phase_detector_t *detector,
   float p2p_dds;
   float hysteresis;
   uint64_t stale_samples;
+  uint32_t analysis_stride;
+  uint32_t analysis_count = 0U;
   uint32_t i;
 
   if (measurement != NULL) {
@@ -303,10 +314,23 @@ void PhaseDetector_Process(phase_detector_t *detector,
     return;
   }
 
-  for (i = 0U; i < pair_count; ++i) {
+  /*
+   * The current 100 kHz operating point still has six analysed samples per
+   * cycle at stride four.  The raw DMA stream remains fully synchronous and
+   * the phase DFT uses contiguous, unskipped pairs.
+   */
+  if (detector->sample_rate_hz >= 2000000.0f) {
+    analysis_stride = 4U;
+  } else if (detector->sample_rate_hz >= 1000000.0f) {
+    analysis_stride = 2U;
+  } else {
+    analysis_stride = 1U;
+  }
+  for (i = 0U; i < pair_count; i += analysis_stride) {
     uint16_t reference = (uint16_t)(packed_pairs[i] & 0x0FFFU);
     uint16_t dds = (uint16_t)((packed_pairs[i] >> 16U) & 0x0FFFU);
 
+    analysis_count++;
     sum_reference += reference;
     sum_dds += dds;
     if (reference < min_reference) {
@@ -323,8 +347,8 @@ void PhaseDetector_Process(phase_detector_t *detector,
     }
   }
 
-  mean_reference = (float)sum_reference / (float)pair_count;
-  mean_dds = (float)sum_dds / (float)pair_count;
+  mean_reference = (float)sum_reference / (float)analysis_count;
+  mean_dds = (float)sum_dds / (float)analysis_count;
   p2p_reference = (float)(max_reference - min_reference);
   p2p_dds = (float)(max_dds - min_dds);
   measurement->reference_amplitude_counts = p2p_reference * 0.5f;
@@ -344,7 +368,7 @@ void PhaseDetector_Process(phase_detector_t *detector,
   }
 
   PhaseDetector_EstimateFrequency(detector, packed_pairs, pair_count,
-                                  hysteresis);
+                                  analysis_stride, hysteresis);
 
   detector->sample_index += (uint64_t)pair_count;
   stale_samples =
@@ -381,10 +405,22 @@ void PhaseDetector_Process(phase_detector_t *detector,
          demod_interval)) {
       float phase_rad;
       float quality;
+      uint32_t demod_count = PHASE_DEMOD_NOMINAL_PAIRS;
+      uint32_t minimum_count =
+          (uint32_t)(
+              (1.75f * detector->sample_rate_hz) /
+              detector->reference_frequency_hz) + 1U;
+
+      if (demod_count < minimum_count) {
+        demod_count = minimum_count;
+      }
+      if (demod_count > pair_count) {
+        demod_count = pair_count;
+      }
 
       detector->have_phase =
           PhaseDetector_Demodulate(
-              packed_pairs, pair_count, detector->sample_rate_hz,
+              packed_pairs, demod_count, detector->sample_rate_hz,
               detector->reference_frequency_hz, multiplier,
               mean_reference, mean_dds,
               measurement->reference_amplitude_counts,
@@ -394,6 +430,7 @@ void PhaseDetector_Process(phase_detector_t *detector,
       if (detector->have_phase) {
         detector->last_phase_rad = phase_rad;
         detector->last_phase_quality = quality;
+        measurement->phase_updated = true;
       }
     }
 
