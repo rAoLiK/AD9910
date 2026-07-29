@@ -27,6 +27,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ad9910.h"
+#include "app_board.h"
+#include "app_integration.h"
 #include "pll_demo.h"
 /* USER CODE END Includes */
 
@@ -111,10 +113,14 @@ int main(void)
   MX_TIM2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  AppBoard_Init();
   if (DDS_Init() != AD9910_STATUS_OK) {
     Error_Handler();
   }
   if (PLL_Demo_Init(&g_ad9910) != HAL_OK) {
+    Error_Handler();
+  }
+  if (AppIntegration_Init() != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE END 2 */
@@ -125,7 +131,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    PLL_Demo_Process();
+    AppIntegration_Process();
   }
   /* USER CODE END 3 */
 }
