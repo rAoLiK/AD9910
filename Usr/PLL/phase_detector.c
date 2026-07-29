@@ -12,7 +12,13 @@
 #define PHASE_MAX_NYQUIST_FRACTION    (0.45f)
 #define PHASE_SIGNAL_HOLD_SECONDS     (0.50f)
 #define PHASE_DEMOD_INTERVAL_SECONDS  (0.00075f)
-#define PHASE_DEMOD_NOMINAL_PAIRS     (128U)
+#define PHASE_ANALYSIS_POINTS_PER_CYCLE (6.0f)
+#define PHASE_ANALYSIS_MAX_STRIDE     (8U)
+#define PHASE_LOW_BAND_HZ             (40000.0f)
+#define PHASE_HIGH_BAND_HZ            (80000.0f)
+#define PHASE_LOW_DEMOD_PAIRS         (256U)
+#define PHASE_MID_DEMOD_PAIRS         (192U)
+#define PHASE_HIGH_DEMOD_PAIRS        (128U)
 
 static float PhaseDetector_Wrap(float radians)
 {
@@ -23,6 +29,42 @@ static float PhaseDetector_Wrap(float radians)
     radians += PHASE_TWO_PI_F;
   }
   return radians;
+}
+
+static uint32_t PhaseDetector_SelectAnalysisStride(
+    const phase_detector_t *detector)
+{
+  uint32_t stride = 4U;
+
+  if ((detector->reference_frequency_hz > 0.0f) &&
+      (detector->valid_period_count != 0U)) {
+    float samples_per_cycle =
+        detector->sample_rate_hz /
+        detector->reference_frequency_hz;
+
+    stride = (uint32_t)(
+        (samples_per_cycle / PHASE_ANALYSIS_POINTS_PER_CYCLE) +
+        0.5f);
+  }
+
+  if (stride < 1U) {
+    stride = 1U;
+  } else if (stride > PHASE_ANALYSIS_MAX_STRIDE) {
+    stride = PHASE_ANALYSIS_MAX_STRIDE;
+  }
+  return stride;
+}
+
+static uint32_t PhaseDetector_SelectDemodPairs(
+    float reference_frequency_hz)
+{
+  if (reference_frequency_hz < PHASE_LOW_BAND_HZ) {
+    return PHASE_LOW_DEMOD_PAIRS;
+  }
+  if (reference_frequency_hz < PHASE_HIGH_BAND_HZ) {
+    return PHASE_MID_DEMOD_PAIRS;
+  }
+  return PHASE_HIGH_DEMOD_PAIRS;
 }
 
 void PhaseDetector_Init(phase_detector_t *detector, float sample_rate_hz)
@@ -315,17 +357,13 @@ void PhaseDetector_Process(phase_detector_t *detector,
   }
 
   /*
-   * The current 100 kHz operating point still has six analysed samples per
-   * cycle at stride four.  The raw DMA stream remains fully synchronous and
-   * the phase DFT uses contiguous, unskipped pairs.
+   * Select the decimation from samples-per-cycle instead of absolute Fs.
+   * With dynamic Fs this keeps CPU load continuous across 1 MHz (about
+   * 41.7 kHz input) and retains roughly six points per reference cycle.
    */
-  if (detector->sample_rate_hz >= 2000000.0f) {
-    analysis_stride = 4U;
-  } else if (detector->sample_rate_hz >= 1000000.0f) {
-    analysis_stride = 2U;
-  } else {
-    analysis_stride = 1U;
-  }
+  analysis_stride =
+      PhaseDetector_SelectAnalysisStride(detector);
+  measurement->analysis_stride = (uint8_t)analysis_stride;
   for (i = 0U; i < pair_count; i += analysis_stride) {
     uint16_t reference = (uint16_t)(packed_pairs[i] & 0x0FFFU);
     uint16_t dds = (uint16_t)((packed_pairs[i] >> 16U) & 0x0FFFU);
@@ -405,7 +443,9 @@ void PhaseDetector_Process(phase_detector_t *detector,
          demod_interval)) {
       float phase_rad;
       float quality;
-      uint32_t demod_count = PHASE_DEMOD_NOMINAL_PAIRS;
+      uint32_t demod_count =
+          PhaseDetector_SelectDemodPairs(
+              detector->reference_frequency_hz);
       uint32_t minimum_count =
           (uint32_t)(
               (1.75f * detector->sample_rate_hz) /
@@ -417,6 +457,7 @@ void PhaseDetector_Process(phase_detector_t *detector,
       if (demod_count > pair_count) {
         demod_count = pair_count;
       }
+      measurement->phase_pair_count = (uint16_t)demod_count;
 
       detector->have_phase =
           PhaseDetector_Demodulate(

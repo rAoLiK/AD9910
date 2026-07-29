@@ -19,6 +19,8 @@ typedef struct {
   float reference_amplitude_counts;
   float dds_amplitude_counts;
   float phase_quality;
+  uint16_t phase_pair_count;
+  uint8_t analysis_stride;
 } phase_measurement_t;
 
 typedef struct {

@@ -37,8 +37,10 @@ typedef struct {
   uint32_t last_valid_tick;
   uint32_t last_dds_update_tick;
   uint32_t last_ftw;
+  uint16_t last_pow;
   double ftw_fraction_accumulator;
   float dds_frequency_hz;
+  float dds_phase_offset_rad;
   bool initialized;
   bool running;
   bool dds_output_enabled;
@@ -82,6 +84,19 @@ static const char *PLL_Demo_StateName(pll_demo_state_t state)
     case PLL_DEMO_ERROR:
     default:
       return "ERROR";
+  }
+}
+
+static const char *PLL_Demo_BandName(uint8_t band)
+{
+  switch ((lock_band_t)band) {
+    case LOCK_BAND_LOW:
+      return "LOW";
+    case LOCK_BAND_HIGH:
+      return "HIGH";
+    case LOCK_BAND_MID:
+    default:
+      return "MID";
   }
 }
 
@@ -143,6 +158,7 @@ static void PLL_Demo_SendHelp(void)
 }
 
 static bool PLL_Demo_ApplyDDS(float frequency_hz,
+                              float phase_offset_rad,
                               bool output_enabled,
                               bool force)
 {
@@ -150,11 +166,14 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
   double exact_ftw;
   double fractional_ftw;
   uint32_t ftw;
+  uint16_t pow;
   ad9910_status_t result;
 
   if ((s_context.dds == NULL) || (frequency_hz <= 0.0f)) {
     return false;
   }
+  pow = AD9910_PhaseDegToPOW(
+      (double)phase_offset_rad * (double)PLL_DEG_PER_RAD);
 
   /*
    * At 1 GHz SYSCLK one FTW LSB is about 0.233 Hz.  First-order fractional
@@ -186,13 +205,15 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
   s_context.last_dds_update_tick = HAL_GetTick();
   if (!force && s_context.have_ftw &&
       (ftw == s_context.last_ftw) &&
+      (pow == s_context.last_pow) &&
       (output_enabled == s_context.dds_output_enabled)) {
     s_context.dds_frequency_hz = frequency_hz;
+    s_context.dds_phase_offset_rad = phase_offset_rad;
     return true;
   }
 
   profile.ftw = ftw;
-  profile.pow = 0U;
+  profile.pow = pow;
   profile.asf = output_enabled ? AD9910_ASF_MAX : 0U;
   result = AD9910_ProgramProfile(
       s_context.dds, AD9910_PROFILE_0, &profile, 1U);
@@ -202,9 +223,11 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
   }
 
   s_context.last_ftw = ftw;
+  s_context.last_pow = pow;
   s_context.have_ftw = true;
   s_context.dds_output_enabled = output_enabled;
   s_context.dds_frequency_hz = frequency_hz;
+  s_context.dds_phase_offset_rad = phase_offset_rad;
   return true;
 }
 
@@ -248,6 +271,7 @@ static void PLL_Demo_EnterError(const char *reason)
       (s_context.dds_frequency_hz > 0.0f)
           ? s_context.dds_frequency_hz
           : PLL_INITIAL_DDS_FREQUENCY_HZ,
+      s_context.dds_phase_offset_rad,
       false, true);
   PLL_Demo_Send("ERR ");
   PLL_Demo_Send((reason != NULL) ? reason : "UNKNOWN");
@@ -340,19 +364,29 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
       return;
     }
 
-    if ((uint32_t)(now - s_context.last_dds_update_tick) >=
-        PLL_DDS_UPDATE_INTERVAL_MS) {
-      if (!PLL_Demo_ApplyDDS(s_context.control.dds_frequency_hz,
-                             true, false)) {
-        PLL_Demo_EnterError("DDS");
-        return;
-      }
-    }
   }
 
   s_status.state = s_context.control.phase_locked
                        ? PLL_DEMO_LOCKED
                        : PLL_DEMO_ACQUIRING;
+}
+
+static void PLL_Demo_ServiceDDS(void)
+{
+  if (!s_context.running ||
+      !s_context.control.command_valid ||
+      (s_status.state == PLL_DEMO_ERROR) ||
+      ((uint32_t)(HAL_GetTick() -
+                  s_context.last_dds_update_tick) <
+       PLL_DDS_UPDATE_INTERVAL_MS)) {
+    return;
+  }
+
+  if (!PLL_Demo_ApplyDDS(s_context.control.dds_frequency_hz,
+                         s_context.control.dds_phase_offset_rad,
+                         true, false)) {
+    PLL_Demo_EnterError("DDS");
+  }
 }
 
 static bool PLL_Demo_ParseDecimal(const char *text, float *value)
@@ -403,7 +437,7 @@ static bool PLL_Demo_ParseDecimal(const char *text, float *value)
 
 static void PLL_Demo_SendStatus(void)
 {
-  static char line[288];
+  static char line[336];
   int32_t phase_mdeg =
       (int32_t)lroundf(s_status.measured_phase_deg * 1000.0f);
   int32_t error_mdeg =
@@ -428,7 +462,7 @@ static void PLL_Demo_SendStatus(void)
       line, sizeof(line),
       "STATE=%s MUL=%u REF=%lu.%02luHz DDS=%lu.%02luHz "
       "PH=%c%lu.%03lu ERR=%c%lu.%03lu Q=%lu.%03lu FS=%lu "
-      "STEP=%c%lu.%03luHz MODE=%s "
+      "STEP=%c%lu.%03luHz MODE=%s CTRL=%s BAND=%s STRIDE=%u WIN=%u "
       "OVR=%lu ADCERR=%lu RXOVR=%lu DDSERR=%lu\r\n",
       PLL_Demo_StateName(s_status.state),
       (unsigned int)s_status.multiplier,
@@ -449,6 +483,10 @@ static void PLL_Demo_SendStatus(void)
       (unsigned long)(step_abs / 1000U),
       (unsigned long)(step_abs % 1000U),
       s_status.fine_mode ? "FINE" : "COARSE",
+      s_status.direct_phase_mode ? "POW" : "FTW",
+      PLL_Demo_BandName(s_status.lock_band),
+      (unsigned int)s_status.analysis_stride,
+      (unsigned int)s_status.phase_pair_count,
       (unsigned long)s_status.dma_overrun_count,
       (unsigned long)s_status.adc_error_count,
       (unsigned long)s_status.uart_overflow_count,
@@ -469,6 +507,7 @@ static void PLL_Demo_StartCommand(void)
           (s_context.dds_frequency_hz > 0.0f)
               ? s_context.dds_frequency_hz
               : PLL_INITIAL_DDS_FREQUENCY_HZ,
+          s_context.dds_phase_offset_rad,
           true, true) ||
       !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
     PLL_Demo_EnterError("START");
@@ -490,6 +529,7 @@ static void PLL_Demo_StopCommand(void)
           (s_context.dds_frequency_hz > 0.0f)
               ? s_context.dds_frequency_hz
               : PLL_INITIAL_DDS_FREQUENCY_HZ,
+          s_context.dds_phase_offset_rad,
           false, true)) {
     s_status.state = PLL_DEMO_ERROR;
   }
@@ -626,7 +666,18 @@ static void PLL_Demo_UpdateStatus(void)
   s_status.phase_quality = s_context.measurement.phase_quality;
   s_status.frequency_step_hz =
       s_context.control.frequency_step_hz;
+  s_status.dds_phase_offset_deg =
+      s_context.control.dds_phase_offset_rad * PLL_DEG_PER_RAD;
+  s_status.phase_step_deg =
+      s_context.control.phase_step_rad * PLL_DEG_PER_RAD;
   s_status.fine_mode = s_context.control.fine_mode;
+  s_status.direct_phase_mode =
+      s_context.control.direct_phase_mode;
+  s_status.lock_band = (uint8_t)s_context.control.band;
+  s_status.phase_pair_count =
+      s_context.measurement.phase_pair_count;
+  s_status.analysis_stride =
+      s_context.measurement.analysis_stride;
   s_status.sample_rate_hz = s_context.actual_sample_rate_hz;
   s_status.dma_overrun_count = s_dma_overrun_count;
   s_status.adc_error_count = s_adc_error_count;
@@ -656,6 +707,7 @@ HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds)
   PLL_Demo_SendHelp();
 
   if (!PLL_Demo_ApplyDDS(PLL_INITIAL_DDS_FREQUENCY_HZ,
+                         0.0f,
                          true, true) ||
       !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
     PLL_Demo_EnterError("INIT");
@@ -703,6 +755,7 @@ void PLL_Demo_Process(void)
   }
 
   PLL_Demo_ProcessSearchRate();
+  PLL_Demo_ServiceDDS();
   PLL_Demo_UpdateStatus();
 }
 

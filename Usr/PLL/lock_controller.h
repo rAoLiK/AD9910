@@ -10,22 +10,34 @@
 extern "C" {
 #endif
 
+typedef enum {
+  LOCK_BAND_LOW = 0,
+  LOCK_BAND_MID,
+  LOCK_BAND_HIGH
+} lock_band_t;
+
 typedef struct {
   bool command_valid;
   bool phase_locked;
   bool fine_mode;
+  bool direct_phase_mode;
+  lock_band_t band;
   float dds_frequency_hz;
+  float dds_phase_offset_rad;
   float frequency_step_hz;
+  float phase_step_rad;
   uint32_t requested_sample_rate_hz;
   float phase_error_rad;
 } lock_controller_output_t;
 
 typedef struct {
   uint8_t multiplier;
+  lock_band_t band;
   float target_phase_rad;
   float coarse_frequency_hz;
   float tracked_frequency_hz;
   float command_frequency_hz;
+  float phase_offset_rad;
   float filtered_phase_error_rad;
   float frequency_trim_hz;
   float phase_elapsed_s;
@@ -34,6 +46,7 @@ typedef struct {
   float locked_time_s;
   float unlocked_time_s;
   float last_frequency_step_hz;
+  float last_phase_step_rad;
   bool frequency_initialized;
   bool filter_initialized;
   bool fine_mode;
