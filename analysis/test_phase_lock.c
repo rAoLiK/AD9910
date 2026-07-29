@@ -635,6 +635,60 @@ static int run_high_frequency_ramp_case(void)
              : 0;
 }
 
+static int run_low_frequency_bias_case(double input_frequency,
+                                       double estimate_bias_hz)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .phase_quality = 0.95f
+  };
+  double sample_rate = 24.0 * input_frequency;
+  double dt =
+      (double)select_block_pairs(sample_rate) / sample_rate;
+  double phase = 120.0 * TEST_PI / 180.0;
+  double previous_phase_offset = 0.0;
+  double elapsed = 0.0;
+  double lock_time = -1.0;
+
+  measurement.reference_frequency_hz =
+      (float)(input_frequency + estimate_bias_hz);
+  LockController_Init(&controller);
+  while (elapsed < 3.0) {
+    measurement.generalized_phase_rad = (float)phase;
+    LockController_Step(&controller, &measurement, (float)dt, &output);
+    phase = wrap_radians(
+        phase +
+        2.0 * TEST_PI *
+            ((double)output.dds_frequency_hz - input_frequency) * dt +
+        wrap_radians(
+            (double)output.dds_phase_offset_rad -
+            previous_phase_offset));
+    previous_phase_offset = (double)output.dds_phase_offset_rad;
+    elapsed += dt;
+    if (output.phase_locked && (lock_time < 0.0)) {
+      lock_time = elapsed;
+    }
+  }
+
+  printf("low bias: f=%.0f estimate=%+.2fHz dds=%.4f "
+         "phase=%7.3f lock=%.3fs\n",
+         input_frequency, estimate_bias_hz,
+         (double)output.dds_frequency_hz,
+         phase * 180.0 / TEST_PI, lock_time);
+  return (!output.command_valid || !output.phase_locked ||
+          (lock_time < 0.0) || (lock_time > 0.80) ||
+          (fabs((double)output.dds_frequency_hz -
+                input_frequency) > 0.10) ||
+          (fabs(phase * 180.0 / TEST_PI) > 3.0))
+             ? 1
+             : 0;
+}
+
 int main(void)
 {
   int failures = 0;
@@ -665,6 +719,8 @@ int main(void)
   failures += run_high_frequency_jitter_case();
   failures += run_high_frequency_jitter_hop_case();
   failures += run_high_frequency_ramp_case();
+  failures += run_low_frequency_bias_case(1000.0, 2.0);
+  failures += run_low_frequency_bias_case(4000.0, 3.0);
   if (failures != 0) {
     fprintf(stderr, "phase-lock tests failed: %d\n", failures);
     return EXIT_FAILURE;

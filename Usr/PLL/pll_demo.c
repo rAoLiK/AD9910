@@ -29,6 +29,7 @@
 #define PLL_RATE_CHANGE_HOLDOFF_MS    (100UL)
 #define PLL_DDS_UPDATE_INTERVAL_MS    (1UL)
 #define PLL_ACQUIRE_RESTART_MS        (1000UL)
+#define PLL_LOW_ACQUIRE_RESTART_MS    (3000UL)
 #define PLL_DEG_PER_RAD               (57.29577951308232f)
 
 typedef struct {
@@ -714,11 +715,15 @@ static void PLL_Demo_ProcessSearchRate(void)
 static void PLL_Demo_ProcessAcquireWatchdog(void)
 {
   uint32_t now = HAL_GetTick();
+  uint32_t timeout_ms =
+      s_context.control.direct_phase_mode
+          ? PLL_LOW_ACQUIRE_RESTART_MS
+          : PLL_ACQUIRE_RESTART_MS;
 
   if (!s_context.running ||
       (s_status.state != PLL_DEMO_ACQUIRING) ||
       ((uint32_t)(now - s_context.acquire_start_tick) <
-       PLL_ACQUIRE_RESTART_MS)) {
+       timeout_ms)) {
     return;
   }
 

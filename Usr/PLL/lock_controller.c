@@ -25,9 +25,12 @@
 #define LOCK_INPUT_CHANGE_FRACTION        (0.00200f)
 #define LOCK_INPUT_STABLE_MIN_HZ          (2.0f)
 #define LOCK_INPUT_STABLE_FRACTION        (0.00002f)
+#define LOCK_LOW_INPUT_STABLE_HZ          (1.0f)
 #define LOCK_PHASE_RATE_FILTER_TAU_S      (0.006f)
 #define LOCK_PHASE_RATE_GAIN              (0.50f)
 #define LOCK_PHASE_RATE_LIMIT_HZ          (500.0f)
+#define LOCK_LOW_RATE_FILTER_TAU_S        (0.020f)
+#define LOCK_LOW_RATE_LEARN_TAU_S         (0.020f)
 #define LOCK_FREQUENCY_MISSING_RESET_S    (0.100f)
 #define LOCK_MAX_DDS_FREQUENCY_HZ         (400000000.0f)
 #define LOCK_LOW_ENTER_HZ                 (35000.0f)
@@ -47,7 +50,7 @@ typedef struct {
 
 static const lock_band_parameters_t s_band_parameters[] = {
     /* LOW: reject block-to-block jitter and avoid repeated reacquisition. */
-    {0.010f, 0.015f, 0.0f, 5.0f, 0.080f, 0.10f, 0.50f},
+    {0.010f, 0.015f, 0.0f, 5.0f, 0.060f, 0.10f, 0.50f},
     /* MID: keep the previously board-verified high-frequency FTW loop. */
     {0.004f, 0.004f, 20.0f, 120.0f, 0.060f, 0.50f, 5.0f},
     /* HIGH: retain the fast loop already verified above 41 kHz. */
@@ -290,6 +293,10 @@ void LockController_Step(lock_controller_t *controller,
     if (stable_threshold < LOCK_INPUT_STABLE_MIN_HZ) {
       stable_threshold = LOCK_INPUT_STABLE_MIN_HZ;
     }
+    if ((controller->band == LOCK_BAND_LOW) &&
+        (stable_threshold > LOCK_LOW_INPUT_STABLE_HZ)) {
+      stable_threshold = LOCK_LOW_INPUT_STABLE_HZ;
+    }
 
     if (!controller->frequency_change_pending) {
       if (fabsf(controller->tracked_frequency_hz -
@@ -405,24 +412,47 @@ void LockController_Step(lock_controller_t *controller,
               controller->filtered_phase_error_rad + alpha * delta);
     }
 
-    if (controller->band != LOCK_BAND_LOW) {
-      if (controller->have_previous_phase_error) {
-        float phase_delta = LockController_Wrap(
-            error - controller->previous_phase_error_rad);
-        float instant_frequency_error_hz =
-            phase_delta / (LOCK_TWO_PI_F * phase_dt);
+    if (controller->have_previous_phase_error) {
+      float phase_delta =
+          error - controller->previous_phase_error_rad;
+      float rate_filter_tau_s = LOCK_PHASE_RATE_FILTER_TAU_S;
+      float instant_frequency_error_hz;
 
-        instant_frequency_error_hz =
-            LockController_Clamp(instant_frequency_error_hz,
-                                 LOCK_PHASE_RATE_LIMIT_HZ);
-        alpha = phase_dt /
-                (LOCK_PHASE_RATE_FILTER_TAU_S + phase_dt);
-        controller->filtered_frequency_error_hz +=
-            alpha * (instant_frequency_error_hz -
-                     controller->filtered_frequency_error_hz);
+      if (controller->band == LOCK_BAND_LOW) {
+        /*
+         * The phase measured now already includes the POW correction applied
+         * after the previous window.  Remove that known phase actuation so a
+         * static phase acquisition is not mistaken for frequency error.
+         */
+        phase_delta -= controller->last_phase_step_rad;
+        rate_filter_tau_s = LOCK_LOW_RATE_FILTER_TAU_S;
       }
-      controller->previous_phase_error_rad = error;
-      controller->have_previous_phase_error = true;
+      phase_delta = LockController_Wrap(phase_delta);
+      instant_frequency_error_hz =
+          phase_delta / (LOCK_TWO_PI_F * phase_dt);
+
+      instant_frequency_error_hz =
+          LockController_Clamp(instant_frequency_error_hz,
+                               LOCK_PHASE_RATE_LIMIT_HZ);
+      alpha = phase_dt /
+              (rate_filter_tau_s + phase_dt);
+      controller->filtered_frequency_error_hz +=
+          alpha * (instant_frequency_error_hz -
+                   controller->filtered_frequency_error_hz);
+    }
+    controller->previous_phase_error_rad = error;
+    controller->have_previous_phase_error = true;
+
+    if (controller->band == LOCK_BAND_LOW) {
+      /*
+       * Transfer persistent POW rotation into FTW trim.  This makes POW settle
+       * instead of endlessly chasing a small coarse-frequency bias.
+       */
+      alpha = phase_dt /
+              (LOCK_LOW_RATE_LEARN_TAU_S + phase_dt);
+      controller->frequency_trim_hz -=
+          alpha * controller->filtered_frequency_error_hz;
+    } else {
       phase_rate_correction_hz =
           LOCK_PHASE_RATE_GAIN *
           controller->filtered_frequency_error_hz;
