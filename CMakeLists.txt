@@ -50,6 +50,13 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/phase_detector.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/lock_controller.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/pll_demo.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/SCREEN_TJC/tjc_protocol_parser.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/SCREEN_TJC/tjc_usart_hmi.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/SCREEN_TJC/tjc_ctrl.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_core.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_hmi_map.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_board.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_integration.c
 )
 
 # Add include paths
@@ -57,11 +64,17 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/AD9910
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/SCREEN_TJC
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
+    TJC_UART_HANDLE=huart1
+    TJC_UART_INSTANCE=USART1
+    TJC_UART_RX_MODE=TJC_UART_MODE_IT
+    TJC_UART_TX_MODE=TJC_UART_MODE_IT
 )
 
 # Remove wrong libob.a library dependency when using cpp files

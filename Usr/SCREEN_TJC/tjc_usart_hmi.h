@@ -83,6 +83,11 @@
 #define TJC_TX_PACKET_MAX_LEN 256U
 #endif
 
+/** Non-blocking TX byte ring. Must be a power of two. */
+#ifndef TJC_TX_RINGBUFFER_LEN
+#define TJC_TX_RINGBUFFER_LEN 2048U
+#endif
+
 /**
  * @brief  串口传输模式枚举值：阻塞模式。
  */
@@ -99,17 +104,17 @@
 #define TJC_UART_MODE_DMA 2U
 
 /**
- * @brief  RX 模式配置，默认 DMA。
+ * @brief  RX 模式配置，默认逐字节中断。
  */
 #ifndef TJC_UART_RX_MODE
-#define TJC_UART_RX_MODE TJC_UART_MODE_DMA
+#define TJC_UART_RX_MODE TJC_UART_MODE_IT
 #endif
 
 /**
- * @brief  TX 模式配置，默认 DMA。
+ * @brief  TX 模式配置，默认中断发送。
  */
 #ifndef TJC_UART_TX_MODE
-#define TJC_UART_TX_MODE TJC_UART_MODE_DMA
+#define TJC_UART_TX_MODE TJC_UART_MODE_IT
 #endif
 
 #if (TJC_RX_CHUNK_SIZE == 0U)
@@ -118,6 +123,11 @@
 
 #if (TJC_RINGBUFFER_LEN < TJC_FRAME_LENGTH)
 #error "TJC_RINGBUFFER_LEN must be greater than or equal to TJC_FRAME_LENGTH"
+#endif
+
+#if ((TJC_TX_RINGBUFFER_LEN < TJC_TX_PACKET_MAX_LEN) || \
+     ((TJC_TX_RINGBUFFER_LEN & (TJC_TX_RINGBUFFER_LEN - 1U)) != 0U))
+#error "TJC_TX_RINGBUFFER_LEN must be a power of two and fit one packet"
 #endif
 
 #if ((TJC_UART_RX_MODE != TJC_UART_MODE_IT) && (TJC_UART_RX_MODE != TJC_UART_MODE_DMA))
@@ -149,10 +159,21 @@ extern UART_HandleTypeDef TJC_UART_HANDLE;
  */
 typedef void (*TJC_MessageHandler_t)(const TJC_ProtocolMessage_t *message);
 
+typedef struct {
+  uint32_t rx_overflow_count;
+  uint32_t rx_restart_count;
+  uint32_t tx_overflow_count;
+  uint32_t tx_error_count;
+  uint32_t isr_send_reject_count;
+} TJC_Diagnostics_t;
+
 /**
  * @brief  初始化驱动并启动接收。
  */
-void TJC_Init(void);
+HAL_StatusTypeDef TJC_Init(void);
+
+/** Parse RX data and retry pending non-blocking transport work. */
+void TJC_Service(void);
 
 /**
  * @brief  按当前宏配置启动接收。
@@ -165,6 +186,9 @@ HAL_StatusTypeDef TJC_StartReceive(void);
  * @param  huart 触发中断的 UART 句柄。
  */
 void TJC_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+
+/** Forward HAL TX-complete callbacks; this only advances the TX ring. */
+void TJC_UART_TxCpltCallback(UART_HandleTypeDef *huart);
 
 /**
  * @brief  串口异常回调转发函数。
@@ -189,6 +213,8 @@ void TJC_RegisterMessageHandler(TJC_MessageHandler_t handler);
  * @retval true 读取成功，false 当前没有新消息。
  */
 bool TJC_GetLastMessage(TJC_ProtocolMessage_t *message);
+
+void TJC_GetDiagnostics(TJC_Diagnostics_t *diagnostics);
 
 /**
  * @brief  发送字符串并自动追加结束符。

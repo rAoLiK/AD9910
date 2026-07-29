@@ -19,6 +19,14 @@ static TJC_ProtocolMessage_t s_lastMessage;
 static volatile uint8_t s_hasLastMessage = 0U;
 static volatile uint8_t s_rxRestartNeeded = 0U;
 static volatile uint32_t s_localOverflowCount = 0U;
+static uint8_t s_txRing[TJC_TX_RINGBUFFER_LEN];
+static volatile uint16_t s_txHead;
+static volatile uint16_t s_txTail;
+static volatile uint8_t s_txBusy;
+static volatile uint32_t s_rxRestartCount;
+static volatile uint32_t s_txOverflowCount;
+static volatile uint32_t s_txErrorCount;
+static volatile uint32_t s_isrSendRejectCount;
 
 /**
  * @brief  进入临界区。
@@ -60,96 +68,28 @@ static void TJC_RingBufferWriteByte(uint8_t byte)
  * @brief  判断当前是否处于中断上下文。
  * @retval true 当前处于中断上下文，false 当前处于线程上下文。
  */
-static bool TJC_IsInInterruptContext(void)
+static void TJC_TxKick(void)
 {
-  return (__get_IPSR() != 0U);
-}
+  uint32_t primask;
+  uint16_t tail = 0U;
+  bool start = false;
 
-/**
- * @brief  在中断上下文中等待指定串口标志位到达目标状态。
- * @param  flag 需要等待的标志位。
- * @param  expectedState 期望状态。
- * @retval HAL 状态值。
- */
-static HAL_StatusTypeDef TJC_WaitFlagInIsr(uint32_t flag, FlagStatus expectedState)
-{
-  uint32_t loopCount = TJC_ISR_TX_TIMEOUT_LOOPS;
-
-  while (__HAL_UART_GET_FLAG(&TJC_UART_HANDLE, flag) != expectedState) {
-    if (loopCount == 0UL) {
-      return HAL_TIMEOUT;
-    }
-    loopCount--;
+  TJC_ENTER_CRITICAL(primask);
+  if ((s_txBusy == 0U) && (s_txTail != s_txHead)) {
+    tail = s_txTail;
+    s_txBusy = 1U;
+    start = true;
   }
+  TJC_EXIT_CRITICAL(primask);
 
-  return HAL_OK;
-}
-
-/**
- * @brief  在中断上下文中使用轮询方式直接发送数据。
- * @param  data 数据指针。
- * @param  len 数据长度。
- * @retval HAL 状态值。
- */
-static HAL_StatusTypeDef TJC_TransmitDirectInIsr(const uint8_t *data, uint16_t len)
-{
-  uint16_t index;
-  HAL_StatusTypeDef status;
-
-  if ((data == NULL) || (len == 0U)) {
-    return HAL_ERROR;
+  if (start &&
+      (HAL_UART_Transmit_IT(
+           &TJC_UART_HANDLE, &s_txRing[tail], 1U) != HAL_OK)) {
+    TJC_ENTER_CRITICAL(primask);
+    s_txBusy = 0U;
+    s_txErrorCount++;
+    TJC_EXIT_CRITICAL(primask);
   }
-
-  for (index = 0U; index < len; index++) {
-    status = TJC_WaitFlagInIsr(UART_FLAG_TXE, SET);
-    if (status != HAL_OK) {
-      return status;
-    }
-
-    TJC_UART_HANDLE.Instance->DR = data[index];
-  }
-
-  return TJC_WaitFlagInIsr(UART_FLAG_TC, SET);
-}
-
-/**
- * @brief  等待异步发送结束。
- * @retval HAL 状态值。
- */
-static HAL_StatusTypeDef TJC_WaitForTxComplete(void)
-{
-#if (TJC_UART_TX_MODE == TJC_UART_MODE_BLOCKING)
-  return HAL_OK;
-#else
-  if (TJC_IsInInterruptContext()) {
-    return HAL_OK;
-  }
-
-  uint32_t startTick = HAL_GetTick();
-  HAL_UART_StateTypeDef txState;
-
-  do {
-    /*
-     * HAL_UART_GetState() ORs gState with RxState.  RX DMA is continuously
-     * active in this driver, so that combined value remains BUSY_RX even
-     * after TX has completed.  HAL_UART_StateTypeDef values are encoded
-     * states, not independent bit flags; testing them with bitwise AND makes
-     * READY (0x20) look busy against BUSY_TX (0x21).  gState is the HAL field
-     * that exclusively owns TX progress.
-     */
-    txState = TJC_UART_HANDLE.gState;
-    if (txState == HAL_UART_STATE_READY) {
-      return HAL_OK;
-    }
-    if ((txState == HAL_UART_STATE_ERROR) ||
-        (txState == HAL_UART_STATE_TIMEOUT) ||
-        (txState == HAL_UART_STATE_RESET)) {
-      return HAL_ERROR;
-    }
-  } while ((HAL_GetTick() - startTick) < TJC_TX_WAIT_TIMEOUT_MS);
-  return HAL_TIMEOUT;
-
-#endif
 }
 
 /**
@@ -175,87 +115,54 @@ static HAL_StatusTypeDef TJC_StartReceiveInternal(UART_HandleTypeDef *huart)
  * @param  len 发送长度。
  * @retval HAL 状态值。
  */
-static HAL_StatusTypeDef TJC_StartTransmitInternal(const uint8_t *data, uint16_t len)
-{
-  HAL_StatusTypeDef status;
-
-  if (TJC_IsInInterruptContext()) {
-    return TJC_TransmitDirectInIsr(data, len);
-  }
-
-  status = TJC_UART_START_TX(&TJC_UART_HANDLE, (uint8_t *)data, len);
-  if (status != HAL_OK) {
-    return status;
-  }
-
-  return TJC_WaitForTxComplete();
-}
-
-/**
- * @brief  发送协议结束符。
- * @retval HAL 状态值。
- */
-static HAL_StatusTypeDef TJC_SendTerminator(void)
-{
-  static const uint8_t endBytes[3] = {
-    TJC_FRAME_END_BYTE,
-    TJC_FRAME_END_BYTE,
-    TJC_FRAME_END_BYTE
-  };
-
-  return TJC_StartTransmitInternal(endBytes, 3U);
-}
-
-/**
- * @brief  发送正文与可选结束符，优先合并为一次完整发送。
- * @param  data 正文数据指针。
- * @param  len 正文长度。
- * @param  appendTerminator 是否追加结束符。
- * @retval HAL 状态值。
- */
 static HAL_StatusTypeDef TJC_SendPacket(const uint8_t *data, uint16_t len, bool appendTerminator)
 {
-  uint8_t packet[TJC_TX_PACKET_MAX_LEN];
+  uint32_t primask;
+  uint16_t used;
+  uint16_t free_bytes;
   uint16_t totalLen;
+  uint16_t index;
 
   if ((data == NULL) || (len == 0U)) {
     return HAL_ERROR;
   }
-
-  if (!appendTerminator) {
-    return TJC_StartTransmitInternal(data, len);
+  if (__get_IPSR() != 0U) {
+    s_isrSendRejectCount++;
+    return HAL_BUSY;
   }
 
-  totalLen = (uint16_t)(len + 3U);
-  if (totalLen <= TJC_TX_PACKET_MAX_LEN) {
-    memcpy(packet, data, len);
-    packet[len] = TJC_FRAME_END_BYTE;
-    packet[(uint16_t)(len + 1U)] = TJC_FRAME_END_BYTE;
-    packet[(uint16_t)(len + 2U)] = TJC_FRAME_END_BYTE;
-    return TJC_StartTransmitInternal(packet, totalLen);
+  totalLen = (uint16_t)(len + (appendTerminator ? 3U : 0U));
+  if ((totalLen < len) ||
+      (totalLen >= TJC_TX_RINGBUFFER_LEN)) {
+    return HAL_ERROR;
   }
 
-  if (TJC_IsInInterruptContext()) {
-    HAL_StatusTypeDef status;
+  TJC_ENTER_CRITICAL(primask);
+  used = (uint16_t)(
+      (s_txHead - s_txTail) & (TJC_TX_RINGBUFFER_LEN - 1U));
+  free_bytes = (uint16_t)(
+      (TJC_TX_RINGBUFFER_LEN - 1U) - used);
+  if (totalLen > free_bytes) {
+    s_txOverflowCount++;
+    TJC_EXIT_CRITICAL(primask);
+    return HAL_BUSY;
+  }
 
-    status = TJC_TransmitDirectInIsr(data, len);
-    if (status != HAL_OK) {
-      return status;
+  for (index = 0U; index < len; ++index) {
+    s_txRing[s_txHead] = data[index];
+    s_txHead = (uint16_t)(
+        (s_txHead + 1U) & (TJC_TX_RINGBUFFER_LEN - 1U));
+  }
+  if (appendTerminator) {
+    for (index = 0U; index < 3U; ++index) {
+      s_txRing[s_txHead] = TJC_FRAME_END_BYTE;
+      s_txHead = (uint16_t)(
+          (s_txHead + 1U) & (TJC_TX_RINGBUFFER_LEN - 1U));
     }
-
-    return TJC_SendTerminator();
   }
-
-  {
-    HAL_StatusTypeDef status;
-
-    status = TJC_StartTransmitInternal(data, len);
-    if (status != HAL_OK) {
-      return status;
-    }
-
-    return TJC_SendTerminator();
-  }
+  TJC_EXIT_CRITICAL(primask);
+  TJC_TxKick();
+  return HAL_OK;
 }
 
 /**
@@ -283,13 +190,30 @@ static void TJC_DispatchMessage(const TJC_ProtocolMessage_t *message)
 /**
  * @brief  初始化驱动并启动接收。
  */
-void TJC_Init(void)
+HAL_StatusTypeDef TJC_Init(void)
 {
+  uint32_t primask;
+
   TJC_RingBufferReset();
+  TJC_ENTER_CRITICAL(primask);
   s_hasLastMessage = 0U;
   s_rxRestartNeeded = 0U;
   s_localOverflowCount = 0U;
-  (void)TJC_StartReceive();
+  s_txHead = 0U;
+  s_txTail = 0U;
+  s_txBusy = 0U;
+  s_rxRestartCount = 0U;
+  s_txOverflowCount = 0U;
+  s_txErrorCount = 0U;
+  s_isrSendRejectCount = 0U;
+  TJC_EXIT_CRITICAL(primask);
+  return TJC_StartReceive();
+}
+
+void TJC_Service(void)
+{
+  TJC_ParseIncomingData();
+  TJC_TxKick();
 }
 
 /**
@@ -320,6 +244,21 @@ void TJC_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   (void)TJC_StartReceiveInternal(huart);
 }
 
+void TJC_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart == NULL) || (huart->Instance != TJC_UART_INSTANCE)) {
+    return;
+  }
+
+  if (s_txBusy != 0U) {
+    s_txTail = (uint16_t)(
+        (s_txTail + 1U) & (TJC_TX_RINGBUFFER_LEN - 1U));
+    s_txBusy = 0U;
+    __DMB();
+  }
+  TJC_TxKick();
+}
+
 /**
  * @brief  串口异常回调转发函数。
  * @param  huart 触发异常的 UART 句柄。
@@ -330,7 +269,12 @@ void TJC_UART_ErrorCallback(UART_HandleTypeDef *huart)
     return;
   }
 
+  __HAL_UART_CLEAR_OREFLAG(huart);
   s_rxRestartNeeded = 1U;
+  if (s_txBusy != 0U) {
+    s_txBusy = 0U;
+    s_txErrorCount++;
+  }
 }
 
 /**
@@ -344,7 +288,9 @@ void TJC_ParseIncomingData(void)
 
   if (s_rxRestartNeeded != 0U) {
     s_rxRestartNeeded = 0U;
-    if (TJC_StartReceive() != HAL_OK) {
+    if (TJC_StartReceive() == HAL_OK) {
+      s_rxRestartCount++;
+    } else {
       s_rxRestartNeeded = 1U;
     }
   }
@@ -403,6 +349,22 @@ bool TJC_GetLastMessage(TJC_ProtocolMessage_t *message)
   TJC_EXIT_CRITICAL(primask);
 
   return true;
+}
+
+void TJC_GetDiagnostics(TJC_Diagnostics_t *diagnostics)
+{
+  uint32_t primask;
+
+  if (diagnostics == NULL) {
+    return;
+  }
+  TJC_ENTER_CRITICAL(primask);
+  diagnostics->rx_overflow_count = s_localOverflowCount;
+  diagnostics->rx_restart_count = s_rxRestartCount;
+  diagnostics->tx_overflow_count = s_txOverflowCount;
+  diagnostics->tx_error_count = s_txErrorCount;
+  diagnostics->isr_send_reject_count = s_isrSendRejectCount;
+  TJC_EXIT_CRITICAL(primask);
 }
 
 /**

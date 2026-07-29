@@ -5,12 +5,9 @@
 #include "lock_controller.h"
 #include "phase_detector.h"
 #include "tim.h"
-#include "usart.h"
 
-#include <ctype.h>
 #include <math.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <string.h>
 
 #define PLL_DMA_MIN_HALF_PAIRS        (128U)
@@ -19,11 +16,6 @@
 #define PLL_DMA_TARGET_BLOCK_HZ       (1000U)
 #define PLL_DMA_PROVEN_HIGH_RATE_HZ   (960000U)
 #define PLL_DMA_PAIR_COUNT            (2U * PLL_DMA_MAX_HALF_PAIRS)
-#define PLL_RX_RING_SIZE              (128U)
-#define PLL_RX_RING_MASK              (PLL_RX_RING_SIZE - 1U)
-#define PLL_TX_RING_SIZE              (1024U)
-#define PLL_TX_RING_MASK              (PLL_TX_RING_SIZE - 1U)
-#define PLL_COMMAND_LINE_SIZE         (64U)
 #define PLL_INITIAL_DDS_FREQUENCY_HZ  (10000.0f)
 #define PLL_SEARCH_HIGH_RATE_HZ       DUAL_ADC_MAX_SAMPLE_RATE_HZ
 #define PLL_RATE_CHANGE_HOLDOFF_MS    (100UL)
@@ -51,6 +43,7 @@ typedef struct {
   double ftw_fraction_accumulator;
   float dds_frequency_hz;
   float dds_phase_offset_rad;
+  float output_scale;
   bool initialized;
   bool running;
   bool dds_output_enabled;
@@ -68,105 +61,6 @@ static volatile uint8_t s_dma_ready_mask;
 static volatile bool s_adc_error_pending;
 static volatile uint32_t s_dma_overrun_count;
 static volatile uint32_t s_adc_error_count;
-
-static uint8_t s_uart_rx_byte;
-static uint8_t s_uart_rx_ring[PLL_RX_RING_SIZE];
-static volatile uint16_t s_uart_rx_head;
-static volatile uint16_t s_uart_rx_tail;
-static volatile uint32_t s_uart_overflow_count;
-static uint8_t s_uart_tx_ring[PLL_TX_RING_SIZE];
-static volatile uint16_t s_uart_tx_head;
-static volatile uint16_t s_uart_tx_tail;
-static volatile bool s_uart_tx_busy;
-static char s_command_line[PLL_COMMAND_LINE_SIZE];
-static uint32_t s_command_length;
-
-static const char *PLL_Demo_StateName(pll_demo_state_t state)
-{
-  switch (state) {
-    case PLL_DEMO_STOPPED:
-      return "STOPPED";
-    case PLL_DEMO_SEARCHING:
-      return "SEARCH";
-    case PLL_DEMO_ACQUIRING:
-      return "ACQUIRE";
-    case PLL_DEMO_LOCKED:
-      return "LOCKED";
-    case PLL_DEMO_ERROR:
-    default:
-      return "ERROR";
-  }
-}
-
-static const char *PLL_Demo_BandName(uint8_t band)
-{
-  switch ((lock_band_t)band) {
-    case LOCK_BAND_LOW:
-      return "LOW";
-    case LOCK_BAND_HIGH:
-      return "HIGH";
-    case LOCK_BAND_MID:
-    default:
-      return "MID";
-  }
-}
-
-static void PLL_Demo_TxKick(void)
-{
-  uint32_t primask;
-  uint16_t tail;
-  bool start = false;
-
-  primask = __get_PRIMASK();
-  __disable_irq();
-  __DMB();
-  tail = s_uart_tx_tail;
-  if (!s_uart_tx_busy && (tail != s_uart_tx_head)) {
-    s_uart_tx_busy = true;
-    start = true;
-  }
-  __DMB();
-  __set_PRIMASK(primask);
-
-  if (start &&
-      (HAL_UART_Transmit_IT(
-           &huart1, &s_uart_tx_ring[tail], 1U) != HAL_OK)) {
-    primask = __get_PRIMASK();
-    __disable_irq();
-    s_uart_tx_busy = false;
-    __DMB();
-    __set_PRIMASK(primask);
-  }
-}
-
-static void PLL_Demo_Send(const char *text)
-{
-  if (text == NULL) {
-    return;
-  }
-
-  while (*text != '\0') {
-    uint16_t head = s_uart_tx_head;
-    uint16_t next =
-        (uint16_t)((head + 1U) & PLL_TX_RING_MASK);
-
-    if (next == s_uart_tx_tail) {
-      s_uart_overflow_count++;
-      break;
-    }
-    s_uart_tx_ring[head] = (uint8_t)*text++;
-    __DMB();
-    s_uart_tx_head = next;
-  }
-  PLL_Demo_TxKick();
-}
-
-static void PLL_Demo_SendHelp(void)
-{
-  PLL_Demo_Send(
-      "Commands: MUL 1|2, PHASE <deg>, START, STOP, STATUS, HELP\r\n"
-      "Phase definition: phi_DDS - MUL*phi_REF, normalized to [-180,180).\r\n");
-}
 
 static bool PLL_Demo_ApplyDDS(float frequency_hz,
                               float phase_offset_rad,
@@ -225,7 +119,10 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
 
   profile.ftw = ftw;
   profile.pow = pow;
-  profile.asf = output_enabled ? AD9910_ASF_MAX : 0U;
+  profile.asf = output_enabled
+                    ? AD9910_AmplitudeScaleToASF(
+                          (double)s_context.output_scale)
+                    : 0U;
   result = AD9910_ProgramProfile(
       s_context.dds, AD9910_PROFILE_0, &profile, 1U);
   if (result != AD9910_STATUS_OK) {
@@ -302,6 +199,7 @@ static bool PLL_Demo_StartSampling(uint32_t requested_rate_hz,
 
 static void PLL_Demo_EnterError(const char *reason)
 {
+  (void)reason;
   (void)DualADC_Stop();
   s_context.running = false;
   s_status.state = PLL_DEMO_ERROR;
@@ -311,9 +209,6 @@ static void PLL_Demo_EnterError(const char *reason)
           : PLL_INITIAL_DDS_FREQUENCY_HZ,
       s_context.dds_phase_offset_rad,
       false, true);
-  PLL_Demo_Send("ERR ");
-  PLL_Demo_Send((reason != NULL) ? reason : "UNKNOWN");
-  PLL_Demo_Send("\r\n");
 }
 
 static bool PLL_Demo_ChangeRateIfNeeded(uint32_t requested_rate_hz,
@@ -453,252 +348,6 @@ static void PLL_Demo_ServiceDDS(void)
   }
 }
 
-static bool PLL_Demo_ParseDecimal(const char *text, float *value)
-{
-  bool negative = false;
-  bool have_digit = false;
-  float integer = 0.0f;
-  float fraction = 0.0f;
-  float scale = 1.0f;
-
-  if ((text == NULL) || (value == NULL)) {
-    return false;
-  }
-  while (*text == ' ') {
-    text++;
-  }
-  if ((*text == '+') || (*text == '-')) {
-    negative = (*text == '-');
-    text++;
-  }
-  while (isdigit((unsigned char)*text) != 0) {
-    integer = integer * 10.0f + (float)(*text - '0');
-    have_digit = true;
-    text++;
-  }
-  if (*text == '.') {
-    text++;
-    while (isdigit((unsigned char)*text) != 0) {
-      scale *= 0.1f;
-      fraction += (float)(*text - '0') * scale;
-      have_digit = true;
-      text++;
-    }
-  }
-  while (*text == ' ') {
-    text++;
-  }
-  if (!have_digit || (*text != '\0')) {
-    return false;
-  }
-
-  *value = integer + fraction;
-  if (negative) {
-    *value = -*value;
-  }
-  return true;
-}
-
-static void PLL_Demo_SendStatus(void)
-{
-  static char line[336];
-  int32_t phase_mdeg =
-      (int32_t)lroundf(s_status.measured_phase_deg * 1000.0f);
-  int32_t error_mdeg =
-      (int32_t)lroundf(s_status.phase_error_deg * 1000.0f);
-  uint32_t phase_abs =
-      (uint32_t)((phase_mdeg < 0) ? -phase_mdeg : phase_mdeg);
-  uint32_t error_abs =
-      (uint32_t)((error_mdeg < 0) ? -error_mdeg : error_mdeg);
-  uint32_t ref_centi =
-      (uint32_t)lroundf(s_status.reference_frequency_hz * 100.0f);
-  uint32_t dds_centi =
-      (uint32_t)lroundf(s_status.dds_frequency_hz * 100.0f);
-  uint32_t quality_milli =
-      (uint32_t)lroundf(s_status.phase_quality * 1000.0f);
-  int32_t step_millihz =
-      (int32_t)lroundf(s_status.frequency_step_hz * 1000.0f);
-  uint32_t step_abs =
-      (uint32_t)((step_millihz < 0) ? -step_millihz :
-                                        step_millihz);
-
-  (void)snprintf(
-      line, sizeof(line),
-      "STATE=%s MUL=%u REF=%lu.%02luHz DDS=%lu.%02luHz "
-      "PH=%c%lu.%03lu ERR=%c%lu.%03lu Q=%lu.%03lu FS=%lu "
-      "STEP=%c%lu.%03luHz MODE=%s CTRL=%s BAND=%s "
-      "CHG=%u STRIDE=%u WIN=%u BLK=%u "
-      "ANCHOR=%lu RST=%lu "
-      "OVR=%lu ADCERR=%lu RXOVR=%lu DDSERR=%lu\r\n",
-      PLL_Demo_StateName(s_status.state),
-      (unsigned int)s_status.multiplier,
-      (unsigned long)(ref_centi / 100U),
-      (unsigned long)(ref_centi % 100U),
-      (unsigned long)(dds_centi / 100U),
-      (unsigned long)(dds_centi % 100U),
-      (phase_mdeg < 0) ? '-' : '+',
-      (unsigned long)(phase_abs / 1000U),
-      (unsigned long)(phase_abs % 1000U),
-      (error_mdeg < 0) ? '-' : '+',
-      (unsigned long)(error_abs / 1000U),
-      (unsigned long)(error_abs % 1000U),
-      (unsigned long)(quality_milli / 1000U),
-      (unsigned long)(quality_milli % 1000U),
-      (unsigned long)s_status.sample_rate_hz,
-      (step_millihz < 0) ? '-' : '+',
-      (unsigned long)(step_abs / 1000U),
-      (unsigned long)(step_abs % 1000U),
-      s_status.fine_mode ? "FINE" : "COARSE",
-      s_status.direct_phase_mode ? "POW" : "FTW",
-      PLL_Demo_BandName(s_status.lock_band),
-      s_status.frequency_change_pending ? 1U : 0U,
-      (unsigned int)s_status.analysis_stride,
-      (unsigned int)s_status.phase_pair_count,
-      (unsigned int)s_status.block_pair_count,
-      (unsigned long)s_status.frequency_reanchor_count,
-      (unsigned long)s_status.search_restart_count,
-      (unsigned long)s_status.dma_overrun_count,
-      (unsigned long)s_status.adc_error_count,
-      (unsigned long)s_status.uart_overflow_count,
-      (unsigned long)s_status.dds_error_count);
-  PLL_Demo_Send(line);
-}
-
-static void PLL_Demo_StartCommand(void)
-{
-  if (s_context.running) {
-    PLL_Demo_Send("OK START\r\n");
-    return;
-  }
-
-  LockController_ResetLoop(&s_context.controller);
-  PhaseDetector_ResetFrequency(&s_context.detector);
-  s_context.frequency_change_pending_seen = false;
-  if (!PLL_Demo_ApplyDDS(
-          (s_context.dds_frequency_hz > 0.0f)
-              ? s_context.dds_frequency_hz
-              : PLL_INITIAL_DDS_FREQUENCY_HZ,
-          s_context.dds_phase_offset_rad,
-          true, true) ||
-      !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
-    PLL_Demo_EnterError("START");
-    return;
-  }
-
-  s_context.running = true;
-  s_status.state = PLL_DEMO_SEARCHING;
-  PLL_Demo_Send("OK START\r\n");
-}
-
-static void PLL_Demo_StopCommand(void)
-{
-  (void)DualADC_Stop();
-  PLL_Demo_ClearPendingDMA();
-  s_context.running = false;
-  s_status.state = PLL_DEMO_STOPPED;
-  if (!PLL_Demo_ApplyDDS(
-          (s_context.dds_frequency_hz > 0.0f)
-              ? s_context.dds_frequency_hz
-              : PLL_INITIAL_DDS_FREQUENCY_HZ,
-          s_context.dds_phase_offset_rad,
-          false, true)) {
-    s_status.state = PLL_DEMO_ERROR;
-  }
-  PLL_Demo_Send("OK STOP\r\n");
-}
-
-static void PLL_Demo_HandleCommand(char *line)
-{
-  uint32_t i;
-
-  if (line == NULL) {
-    return;
-  }
-  for (i = 0U; line[i] != '\0'; ++i) {
-    line[i] = (char)toupper((unsigned char)line[i]);
-  }
-
-  if (strcmp(line, "HELP") == 0) {
-    PLL_Demo_SendHelp();
-  } else if (strcmp(line, "STATUS") == 0) {
-    PLL_Demo_SendStatus();
-  } else if (strcmp(line, "START") == 0) {
-    PLL_Demo_StartCommand();
-  } else if (strcmp(line, "STOP") == 0) {
-    PLL_Demo_StopCommand();
-  } else if (strncmp(line, "MUL ", 4U) == 0) {
-    uint8_t multiplier =
-        (line[4] == '1' && line[5] == '\0') ? 1U :
-        (line[4] == '2' && line[5] == '\0') ? 2U : 0U;
-    if ((multiplier == 0U) ||
-        !LockController_SetMultiplier(
-            &s_context.controller, multiplier)) {
-      PLL_Demo_Send("ERR MUL expects 1 or 2\r\n");
-    } else {
-      PhaseDetector_ResetFrequency(&s_context.detector);
-      s_context.frequency_change_pending_seen = false;
-      PLL_Demo_Send("OK MUL\r\n");
-    }
-  } else if (strncmp(line, "PHASE ", 6U) == 0) {
-    float phase_deg;
-    if (!PLL_Demo_ParseDecimal(&line[6], &phase_deg)) {
-      PLL_Demo_Send("ERR PHASE expects degrees\r\n");
-    } else {
-      LockController_SetTargetPhaseDeg(
-          &s_context.controller, phase_deg);
-      PLL_Demo_Send("OK PHASE\r\n");
-    }
-  } else if (line[0] != '\0') {
-    PLL_Demo_Send("ERR UNKNOWN; use HELP\r\n");
-  }
-}
-
-static bool PLL_Demo_PopRxByte(uint8_t *byte)
-{
-  uint16_t tail;
-
-  if (byte == NULL) {
-    return false;
-  }
-
-  tail = s_uart_rx_tail;
-  __DMB();
-  if (tail == s_uart_rx_head) {
-    return false;
-  }
-
-  *byte = s_uart_rx_ring[tail];
-  s_uart_rx_tail = (uint16_t)((tail + 1U) & PLL_RX_RING_MASK);
-  __DMB();
-  return true;
-}
-
-static void PLL_Demo_ProcessSerial(void)
-{
-  uint8_t byte;
-
-  while (PLL_Demo_PopRxByte(&byte)) {
-    if ((byte == '\r') || (byte == '\n')) {
-      if (s_command_length != 0U) {
-        s_command_line[s_command_length] = '\0';
-        PLL_Demo_HandleCommand(s_command_line);
-        s_command_length = 0U;
-      }
-    } else if ((byte == '\b') || (byte == 0x7FU)) {
-      if (s_command_length != 0U) {
-        s_command_length--;
-      }
-    } else if ((byte >= 0x20U) && (byte <= 0x7EU)) {
-      if (s_command_length < (PLL_COMMAND_LINE_SIZE - 1U)) {
-        s_command_line[s_command_length++] = (char)byte;
-      } else {
-        s_command_length = 0U;
-        PLL_Demo_Send("ERR LINE TOO LONG\r\n");
-      }
-    }
-  }
-}
-
 static void PLL_Demo_ProcessSearchRate(void)
 {
   if (!s_context.running ||
@@ -780,6 +429,7 @@ static void PLL_Demo_UpdateStatus(void)
       s_context.control.dds_phase_offset_rad * PLL_DEG_PER_RAD;
   s_status.phase_step_deg =
       s_context.control.phase_step_rad * PLL_DEG_PER_RAD;
+  s_status.output_scale = s_context.output_scale;
   s_status.fine_mode = s_context.control.fine_mode;
   s_status.direct_phase_mode =
       s_context.control.direct_phase_mode;
@@ -795,7 +445,7 @@ static void PLL_Demo_UpdateStatus(void)
   s_status.sample_rate_hz = s_context.actual_sample_rate_hz;
   s_status.dma_overrun_count = s_dma_overrun_count;
   s_status.adc_error_count = s_adc_error_count;
-  s_status.uart_overflow_count = s_uart_overflow_count;
+  s_status.uart_overflow_count = 0U;
 }
 
 HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds)
@@ -812,28 +462,145 @@ HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds)
   PhaseDetector_Init(&s_context.detector,
                      (float)PLL_SEARCH_HIGH_RATE_HZ);
   LockController_Init(&s_context.controller);
-
-  if (HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1U) != HAL_OK) {
-    s_status.state = PLL_DEMO_ERROR;
-    return HAL_ERROR;
-  }
-  PLL_Demo_Send("\r\nAD9910 1x/2x phase-lock demo ready\r\n");
-  PLL_Demo_SendHelp();
-
+  s_context.output_scale = 1.0f;
   if (!PLL_Demo_ApplyDDS(PLL_INITIAL_DDS_FREQUENCY_HZ,
                          0.0f,
-                         true, true) ||
-      !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
+                         false, true)) {
     PLL_Demo_EnterError("INIT");
     return HAL_ERROR;
   }
 
-  s_context.running = true;
+  s_context.running = false;
   s_context.initialized = true;
   s_context.last_valid_tick = HAL_GetTick();
+  s_status.state = PLL_DEMO_STOPPED;
+  PLL_Demo_UpdateStatus();
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef PLL_Demo_Configure(uint8_t multiplier,
+                                     float target_phase_deg,
+                                     float output_scale)
+{
+  uint8_t old_multiplier;
+
+  if (!s_context.initialized ||
+      ((multiplier != 1U) && (multiplier != 2U)) ||
+      !isfinite(target_phase_deg) ||
+      !isfinite(output_scale) ||
+      (output_scale < 0.0f) ||
+      (output_scale > 1.0f)) {
+    return HAL_ERROR;
+  }
+
+  old_multiplier =
+      LockController_GetMultiplier(&s_context.controller);
+  if (!LockController_SetMultiplier(
+          &s_context.controller, multiplier)) {
+    return HAL_ERROR;
+  }
+  if (fabsf(LockController_GetTargetPhaseDeg(
+                &s_context.controller) -
+            target_phase_deg) > 0.0001f) {
+    LockController_SetTargetPhaseDeg(
+        &s_context.controller, target_phase_deg);
+  }
+  s_context.output_scale = output_scale;
+
+  if (old_multiplier != multiplier) {
+    PhaseDetector_ResetFrequency(&s_context.detector);
+    memset(&s_context.measurement, 0, sizeof(s_context.measurement));
+    memset(&s_context.control, 0, sizeof(s_context.control));
+    s_context.frequency_change_pending_seen = false;
+    if (s_context.running &&
+        !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
+      PLL_Demo_EnterError("CONFIG_RATE");
+      PLL_Demo_UpdateStatus();
+      return HAL_ERROR;
+    }
+    if (s_context.running) {
+      s_status.state = PLL_DEMO_SEARCHING;
+    }
+  }
+
+  if (!PLL_Demo_ApplyDDS(
+          (s_context.dds_frequency_hz > 0.0f)
+              ? s_context.dds_frequency_hz
+              : PLL_INITIAL_DDS_FREQUENCY_HZ,
+          s_context.dds_phase_offset_rad,
+          s_context.running, true)) {
+    PLL_Demo_EnterError("CONFIG_DDS");
+    PLL_Demo_UpdateStatus();
+    return HAL_ERROR;
+  }
+  PLL_Demo_UpdateStatus();
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef PLL_Demo_Start(void)
+{
+  if (!s_context.initialized) {
+    return HAL_ERROR;
+  }
+  if (s_context.running) {
+    return HAL_OK;
+  }
+
+  LockController_ResetLoop(&s_context.controller);
+  PhaseDetector_ResetFrequency(&s_context.detector);
+  memset(&s_context.measurement, 0, sizeof(s_context.measurement));
+  memset(&s_context.control, 0, sizeof(s_context.control));
+  s_context.dds_phase_offset_rad = 0.0f;
+  s_context.frequency_change_pending_seen = false;
+  if (!PLL_Demo_ApplyDDS(
+          (s_context.dds_frequency_hz > 0.0f)
+              ? s_context.dds_frequency_hz
+              : PLL_INITIAL_DDS_FREQUENCY_HZ,
+          s_context.dds_phase_offset_rad,
+          true, true) ||
+      !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
+    PLL_Demo_EnterError("START");
+    PLL_Demo_UpdateStatus();
+    return HAL_ERROR;
+  }
+
+  s_context.running = true;
+  s_context.last_valid_tick = HAL_GetTick();
+  s_context.acquire_start_tick = s_context.last_valid_tick;
   s_status.state = PLL_DEMO_SEARCHING;
   PLL_Demo_UpdateStatus();
   return HAL_OK;
+}
+
+HAL_StatusTypeDef PLL_Demo_Stop(void)
+{
+  HAL_StatusTypeDef result;
+  bool dds_ok;
+
+  if (!s_context.initialized) {
+    return HAL_ERROR;
+  }
+
+  result = DualADC_Stop();
+  PLL_Demo_ClearPendingDMA();
+  s_context.running = false;
+  s_context.actual_sample_rate_hz = 0U;
+  s_context.active_half_pair_count = 0U;
+  s_context.frequency_change_pending_seen = false;
+  memset(&s_context.measurement, 0, sizeof(s_context.measurement));
+  memset(&s_context.control, 0, sizeof(s_context.control));
+  dds_ok = PLL_Demo_ApplyDDS(
+      (s_context.dds_frequency_hz > 0.0f)
+          ? s_context.dds_frequency_hz
+          : PLL_INITIAL_DDS_FREQUENCY_HZ,
+      s_context.dds_phase_offset_rad,
+      false, true);
+  s_status.state =
+      ((result == HAL_OK) && dds_ok)
+          ? PLL_DEMO_STOPPED
+          : PLL_DEMO_ERROR;
+  PLL_Demo_UpdateStatus();
+  return (s_status.state == PLL_DEMO_STOPPED) ? HAL_OK : HAL_ERROR;
 }
 
 void PLL_Demo_Process(void)
@@ -844,8 +611,6 @@ void PLL_Demo_Process(void)
   if (!s_context.initialized) {
     return;
   }
-
-  PLL_Demo_ProcessSerial();
 
   if (s_adc_error_pending && s_context.running) {
     s_adc_error_pending = false;
@@ -917,44 +682,6 @@ void PLL_Demo_AdcErrorISR(ADC_HandleTypeDef *hadc)
   }
 }
 
-void PLL_Demo_UartRxCpltISR(UART_HandleTypeDef *huart)
-{
-  if ((huart != NULL) && (huart->Instance == USART1)) {
-    uint16_t head = s_uart_rx_head;
-    uint16_t next =
-        (uint16_t)((head + 1U) & PLL_RX_RING_MASK);
-
-    if (next == s_uart_rx_tail) {
-      s_uart_overflow_count++;
-    } else {
-      s_uart_rx_ring[head] = s_uart_rx_byte;
-      __DMB();
-      s_uart_rx_head = next;
-    }
-    (void)HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1U);
-  }
-}
-
-void PLL_Demo_UartTxCpltISR(UART_HandleTypeDef *huart)
-{
-  if ((huart != NULL) && (huart->Instance == USART1)) {
-    s_uart_tx_tail =
-        (uint16_t)((s_uart_tx_tail + 1U) & PLL_TX_RING_MASK);
-    s_uart_tx_busy = false;
-    __DMB();
-    PLL_Demo_TxKick();
-  }
-}
-
-void PLL_Demo_UartErrorISR(UART_HandleTypeDef *huart)
-{
-  if ((huart != NULL) && (huart->Instance == USART1)) {
-    s_uart_overflow_count++;
-    __HAL_UART_CLEAR_OREFLAG(huart);
-    (void)HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1U);
-  }
-}
-
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
   PLL_Demo_AdcHalfCpltISR(hadc);
@@ -968,19 +695,4 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 {
   PLL_Demo_AdcErrorISR(hadc);
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  PLL_Demo_UartRxCpltISR(huart);
-}
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-  PLL_Demo_UartTxCpltISR(huart);
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-  PLL_Demo_UartErrorISR(huart);
 }

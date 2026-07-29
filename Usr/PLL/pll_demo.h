@@ -31,6 +31,7 @@ typedef struct {
   float frequency_step_hz;
   float dds_phase_offset_deg;
   float phase_step_deg;
+  float output_scale;
   bool fine_mode;
   bool direct_phase_mode;
   bool frequency_change_pending;
@@ -48,6 +49,11 @@ typedef struct {
 } pll_demo_status_t;
 
 HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds);
+HAL_StatusTypeDef PLL_Demo_Configure(uint8_t multiplier,
+                                     float target_phase_deg,
+                                     float output_scale);
+HAL_StatusTypeDef PLL_Demo_Start(void);
+HAL_StatusTypeDef PLL_Demo_Stop(void);
 void PLL_Demo_Process(void);
 const pll_demo_status_t *PLL_Demo_GetStatus(void);
 
@@ -55,9 +61,6 @@ const pll_demo_status_t *PLL_Demo_GetStatus(void);
 void PLL_Demo_AdcHalfCpltISR(ADC_HandleTypeDef *hadc);
 void PLL_Demo_AdcCpltISR(ADC_HandleTypeDef *hadc);
 void PLL_Demo_AdcErrorISR(ADC_HandleTypeDef *hadc);
-void PLL_Demo_UartRxCpltISR(UART_HandleTypeDef *huart);
-void PLL_Demo_UartTxCpltISR(UART_HandleTypeDef *huart);
-void PLL_Demo_UartErrorISR(UART_HandleTypeDef *huart);
 
 #ifdef __cplusplus
 }
