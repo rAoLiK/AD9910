@@ -18,11 +18,16 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "dma.h"
 #include "gpio.h"
+#include "tim.h"
+#include "usart.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ad9910.h"
+#include "pll_demo.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,7 +61,8 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN 0 */
 static ad9910_t g_ad9910;
 
-void DDS_Init(void) {
+static ad9910_status_t DDS_Init(void)
+{
   ad9910_init_t init = AD9910_INIT_DEFAULT();
 
   init.sysclk.ref_clk_hz = 40000000ULL;
@@ -66,53 +72,7 @@ void DDS_Init(void) {
   init.sysclk.vco_sel = AD9910_VCO_SEL_5;
   init.sysclk.icp = 1U;
 
-  (void)AD9910_Init(&g_ad9910, &init);
-}
-
-#include <math.h>
-
-void DDS_ExpSweep_PhaseContinuous(double f_start_hz, double f_stop_hz,
-                                  uint32_t points, uint32_t step_delay_ms) {
-  uint32_t i;
-  double ratio;
-  double f_now;
-  ad9910_status_t status;
-
-  if ((points < 2U) || (f_start_hz <= 0.0) || (f_stop_hz <= f_start_hz)) {
-    return;
-  }
-
-  ratio = pow(f_stop_hz / f_start_hz, 1.0 / (double)(points - 1U));
-  f_now = f_start_hz;
-
-  /* 预先计算并固定 POW/ASF（保持相位连续）*/
-  uint16_t pow_word = AD9910_PhaseDegToPOW(0.0);
-  uint16_t asf_word = AD9910_AmplitudeScaleToASF(0.01);
-
-  /* 把 Profile0 初始化为起始点（一次性写入，确保 ASF 非 0）*/
-  ad9910_profile_word_t prof;
-  prof.ftw =
-      AD9910_FrequencyToFTW(f_now, (double)g_ad9910.cfg.sysclk.sys_clk_hz);
-  prof.pow = pow_word;
-  prof.asf = asf_word;
-  status = AD9910_ProgramProfile(&g_ad9910, AD9910_PROFILE_0, &prof, 1U);
-  if (status != AD9910_STATUS_OK) {
-    Error_Handler();
-    return;
-  }
-
-  /* 循环只更新 Profile0 的 FTW（保持 POW/ASF 不变）*/
-  for (i = 0U; i < points; ++i) {
-    prof.ftw =
-        AD9910_FrequencyToFTW(f_now, (double)g_ad9910.cfg.sysclk.sys_clk_hz);
-    status = AD9910_ProgramProfile(&g_ad9910, AD9910_PROFILE_0, &prof, 1U);
-    if (status != AD9910_STATUS_OK) {
-      Error_Handler();
-      return;
-    }
-    HAL_Delay(step_delay_ms);
-    f_now *= ratio;
-  }
+  return AD9910_Init(&g_ad9910, &init);
 }
 /* USER CODE END 0 */
 
@@ -145,10 +105,18 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_ADC2_Init();
+  MX_TIM2_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  DDS_Init();
-  AD9910_SetSingleToneHz(&g_ad9910, 10000.0, 0.0, 1.0f, 1U);
-  // DDS_ExpSweep_PhaseContinuous(1000, 500000.0, 1000, 10);
+  if (DDS_Init() != AD9910_STATUS_OK) {
+    Error_Handler();
+  }
+  if (PLL_Demo_Init(&g_ad9910) != HAL_OK) {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -157,6 +125,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    PLL_Demo_Process();
   }
   /* USER CODE END 3 */
 }

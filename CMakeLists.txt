@@ -46,12 +46,17 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/AD9910/ad9910.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/dual_adc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/phase_detector.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/lock_controller.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/pll_demo.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/AD9910
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL
 )
 
 # Add project symbols (macros)
