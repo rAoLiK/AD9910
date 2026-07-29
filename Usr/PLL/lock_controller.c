@@ -13,7 +13,7 @@
 #define LOCK_FINE_GRADIENT_HZ             (0.50f)
 #define LOCK_FINE_STEP_HZ                 (0.05f)
 #define LOCK_DIRECT_PHASE_GAIN            (0.65f)
-#define LOCK_DIRECT_FINE_STEP_RAD          (0.05f * LOCK_PI_F / 180.0f)
+#define LOCK_DIRECT_FINE_STEP_RAD          (0.15f * LOCK_PI_F / 180.0f)
 #define LOCK_DIRECT_MID_STEP_RAD           (1.0f * LOCK_PI_F / 180.0f)
 #define LOCK_DIRECT_COARSE_STEP_RAD        (10.0f * LOCK_PI_F / 180.0f)
 #define LOCK_DIRECT_LOCK_STEP_RAD          (0.10f * LOCK_PI_F / 180.0f)
@@ -21,8 +21,13 @@
 #define LOCK_RELEASE_THRESHOLD_RAD        (12.0f * LOCK_PI_F / 180.0f)
 #define LOCK_ACQUIRE_TIME_S               (0.050f)
 #define LOCK_RELEASE_TIME_S               (0.030f)
-#define LOCK_INPUT_CHANGE_MIN_HZ          (8.0f)
-#define LOCK_INPUT_CHANGE_FRACTION        (0.00030f)
+#define LOCK_INPUT_CHANGE_MIN_HZ          (40.0f)
+#define LOCK_INPUT_CHANGE_FRACTION        (0.00200f)
+#define LOCK_INPUT_STABLE_MIN_HZ          (2.0f)
+#define LOCK_INPUT_STABLE_FRACTION        (0.00002f)
+#define LOCK_PHASE_RATE_FILTER_TAU_S      (0.006f)
+#define LOCK_PHASE_RATE_GAIN              (0.50f)
+#define LOCK_PHASE_RATE_LIMIT_HZ          (500.0f)
 #define LOCK_FREQUENCY_MISSING_RESET_S    (0.100f)
 #define LOCK_MAX_DDS_FREQUENCY_HZ         (400000000.0f)
 #define LOCK_LOW_ENTER_HZ                 (35000.0f)
@@ -42,11 +47,11 @@ typedef struct {
 
 static const lock_band_parameters_t s_band_parameters[] = {
     /* LOW: reject block-to-block jitter and avoid repeated reacquisition. */
-    {0.010f, 0.015f, 0.0f, 5.0f, 0.030f, 0.10f, 0.50f},
-    /* MID: balanced response around the former 40/41 kHz boundary. */
-    {0.006f, 0.008f, 17.0f, 95.0f, 0.012f, 0.40f, 4.0f},
+    {0.010f, 0.015f, 0.0f, 5.0f, 0.080f, 0.10f, 0.50f},
+    /* MID: keep the previously board-verified high-frequency FTW loop. */
+    {0.004f, 0.004f, 20.0f, 120.0f, 0.060f, 0.50f, 5.0f},
     /* HIGH: retain the fast loop already verified above 41 kHz. */
-    {0.004f, 0.004f, 20.0f, 120.0f, 0.004f, 0.50f, 5.0f}
+    {0.004f, 0.004f, 20.0f, 120.0f, 0.060f, 0.50f, 5.0f}
 };
 
 static float LockController_Wrap(float radians)
@@ -112,12 +117,15 @@ static void LockController_ResetPhaseTracking(
     lock_controller_t *controller)
 {
   controller->filtered_phase_error_rad = 0.0f;
+  controller->previous_phase_error_rad = 0.0f;
+  controller->filtered_frequency_error_hz = 0.0f;
   controller->phase_elapsed_s = 0.0f;
   controller->locked_time_s = 0.0f;
   controller->unlocked_time_s = 0.0f;
   controller->last_frequency_step_hz = 0.0f;
   controller->last_phase_step_rad = 0.0f;
   controller->filter_initialized = false;
+  controller->have_previous_phase_error = false;
   controller->fine_mode = false;
   controller->phase_locked = false;
 }
@@ -135,6 +143,7 @@ static void LockController_AnchorFrequency(
   controller->frequency_change_time_s = 0.0f;
   controller->missing_frequency_time_s = 0.0f;
   controller->frequency_initialized = true;
+  controller->frequency_change_pending = false;
   LockController_ResetPhaseTracking(controller);
   controller->last_frequency_step_hz =
       (old_command > 0.0f) ? (frequency_hz - old_command) : 0.0f;
@@ -218,6 +227,7 @@ void LockController_Step(lock_controller_t *controller,
   float observed_frequency;
   float desired_rate;
   float change_threshold;
+  float stable_threshold;
   float alpha;
   const lock_band_parameters_t *parameters;
 
@@ -274,22 +284,55 @@ void LockController_Step(lock_controller_t *controller,
       change_threshold = LOCK_INPUT_CHANGE_MIN_HZ;
     }
 
-    if (fabsf(controller->tracked_frequency_hz -
-              controller->coarse_frequency_hz) >
-        change_threshold) {
-      controller->frequency_change_time_s += elapsed_seconds;
+    stable_threshold =
+        controller->coarse_frequency_hz *
+        LOCK_INPUT_STABLE_FRACTION;
+    if (stable_threshold < LOCK_INPUT_STABLE_MIN_HZ) {
+      stable_threshold = LOCK_INPUT_STABLE_MIN_HZ;
+    }
+
+    if (!controller->frequency_change_pending) {
+      if (fabsf(controller->tracked_frequency_hz -
+                controller->coarse_frequency_hz) >
+          change_threshold) {
+        /*
+         * Enter a distinct source-change episode.  Do not repeatedly anchor
+         * while a bench generator slews through intermediate frequencies.
+         */
+        controller->frequency_change_pending = true;
+        controller->frequency_change_time_s = 0.0f;
+        controller->frequency_change_candidate_hz =
+            observed_frequency;
+        LockController_ResetPhaseTracking(controller);
+      }
+    } else if (fabsf(controller->tracked_frequency_hz -
+                     controller->coarse_frequency_hz) <=
+               (0.5f * change_threshold)) {
+      /* A short estimator excursion returned inside the loop capture range. */
+      controller->frequency_change_pending = false;
+      controller->frequency_change_time_s = 0.0f;
+      LockController_ResetPhaseTracking(controller);
+    } else {
+      if (fabsf(observed_frequency -
+                controller->frequency_change_candidate_hz) <=
+          stable_threshold) {
+        controller->frequency_change_time_s += elapsed_seconds;
+      } else {
+        /*
+         * Restart the stability window around the newest frequency.  A slow
+         * ramp therefore produces one final anchor only after it stops.
+         */
+        controller->frequency_change_candidate_hz =
+            observed_frequency;
+        controller->frequency_change_time_s = 0.0f;
+      }
+
       if (controller->frequency_change_time_s >=
           parameters->input_change_hold_s) {
-        /*
-         * A real source-frequency change starts a clean acquisition.  Using
-         * the latest observation (not the lagging tracker) avoids repeatedly
-         * carrying the old phase-loop integral into the new frequency.
-         */
         LockController_AnchorFrequency(controller,
                                        observed_frequency);
+        output->frequency_reanchored = true;
       }
-    } else {
-      controller->frequency_change_time_s = 0.0f;
     }
   }
 
@@ -310,6 +353,8 @@ void LockController_Step(lock_controller_t *controller,
       controller->filtered_phase_error_rad;
   output->direct_phase_mode =
       controller->band == LOCK_BAND_LOW;
+  output->frequency_change_pending =
+      controller->frequency_change_pending;
 
   controller->phase_elapsed_s += elapsed_seconds;
   if (!measurement->phase_valid) {
@@ -338,6 +383,7 @@ void LockController_Step(lock_controller_t *controller,
     float maximum_trim;
     float step;
     float phase_step = 0.0f;
+    float phase_rate_correction_hz = 0.0f;
 
     controller->phase_elapsed_s = 0.0f;
     if (phase_dt < 0.00010f) {
@@ -359,13 +405,45 @@ void LockController_Step(lock_controller_t *controller,
               controller->filtered_phase_error_rad + alpha * delta);
     }
 
+    if (controller->band != LOCK_BAND_LOW) {
+      if (controller->have_previous_phase_error) {
+        float phase_delta = LockController_Wrap(
+            error - controller->previous_phase_error_rad);
+        float instant_frequency_error_hz =
+            phase_delta / (LOCK_TWO_PI_F * phase_dt);
+
+        instant_frequency_error_hz =
+            LockController_Clamp(instant_frequency_error_hz,
+                                 LOCK_PHASE_RATE_LIMIT_HZ);
+        alpha = phase_dt /
+                (LOCK_PHASE_RATE_FILTER_TAU_S + phase_dt);
+        controller->filtered_frequency_error_hz +=
+            alpha * (instant_frequency_error_hz -
+                     controller->filtered_frequency_error_hz);
+      }
+      controller->previous_phase_error_rad = error;
+      controller->have_previous_phase_error = true;
+      phase_rate_correction_hz =
+          LOCK_PHASE_RATE_GAIN *
+          controller->filtered_frequency_error_hz;
+    }
+
     maximum_trim = controller->coarse_frequency_hz * 0.002f;
     if (maximum_trim < 200.0f) {
       maximum_trim = 200.0f;
     }
-    controller->frequency_trim_hz -=
-        parameters->integral_hz_per_rad_s *
-        controller->filtered_phase_error_rad * phase_dt;
+    /*
+     * In direct-POW mode, integrating a large acquisition phase error as a
+     * frequency error creates trim wind-up.  Learn frequency only near the
+     * requested phase; POW handles the large initial phase displacement.
+     */
+    if ((controller->band != LOCK_BAND_LOW) ||
+        (fabsf(controller->filtered_phase_error_rad) <=
+         LOCK_FINE_PHASE_RAD)) {
+      controller->frequency_trim_hz -=
+          parameters->integral_hz_per_rad_s *
+          controller->filtered_phase_error_rad * phase_dt;
+    }
     controller->frequency_trim_hz =
         LockController_Clamp(controller->frequency_trim_hz,
                              maximum_trim);
@@ -374,7 +452,8 @@ void LockController_Step(lock_controller_t *controller,
         controller->coarse_frequency_hz +
         controller->frequency_trim_hz -
         (parameters->proportional_hz_per_rad *
-         controller->filtered_phase_error_rad);
+         controller->filtered_phase_error_rad) -
+        phase_rate_correction_hz;
     gradient =
         desired_frequency - controller->command_frequency_hz;
 
@@ -451,6 +530,8 @@ void LockController_Step(lock_controller_t *controller,
   output->fine_mode = controller->fine_mode;
   output->direct_phase_mode =
       controller->band == LOCK_BAND_LOW;
+  output->frequency_change_pending =
+      controller->frequency_change_pending;
   output->band = controller->band;
   output->phase_locked = controller->phase_locked;
 }

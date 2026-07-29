@@ -10,14 +10,14 @@
 #define PHASE_MIN_P2P_COUNTS          (32.0f)
 #define PHASE_MIN_FREQUENCY_HZ        (10.0f)
 #define PHASE_MAX_NYQUIST_FRACTION    (0.45f)
-#define PHASE_SIGNAL_HOLD_SECONDS     (0.50f)
+#define PHASE_SIGNAL_HOLD_SECONDS     (0.12f)
 #define PHASE_DEMOD_INTERVAL_SECONDS  (0.00075f)
 #define PHASE_ANALYSIS_POINTS_PER_CYCLE (6.0f)
 #define PHASE_ANALYSIS_MAX_STRIDE     (8U)
 #define PHASE_LOW_BAND_HZ             (40000.0f)
 #define PHASE_HIGH_BAND_HZ            (80000.0f)
 #define PHASE_LOW_DEMOD_PAIRS         (256U)
-#define PHASE_MID_DEMOD_PAIRS         (192U)
+#define PHASE_MID_DEMOD_PAIRS         (128U)
 #define PHASE_HIGH_DEMOD_PAIRS        (128U)
 
 static float PhaseDetector_Wrap(float radians)
@@ -38,13 +38,30 @@ static uint32_t PhaseDetector_SelectAnalysisStride(
 
   if ((detector->reference_frequency_hz > 0.0f) &&
       (detector->valid_period_count != 0U)) {
-    float samples_per_cycle =
-        detector->sample_rate_hz /
-        detector->reference_frequency_hz;
+    if (detector->reference_frequency_hz >= PHASE_LOW_BAND_HZ) {
+      /*
+       * Preserve the high-frequency detector cadence from the last
+       * board-verified revision: 1/2/4 for <1/1..2/>=2 MSPS.  Using the
+       * low-band six-points/cycle rule here reduced 41..83 kHz from 12
+       * analysed points per cycle to six and made zero-cross jitter large
+       * enough to trigger false source-change reacquisitions.
+       */
+      if (detector->sample_rate_hz >= 2000000.0f) {
+        stride = 4U;
+      } else if (detector->sample_rate_hz >= 1000000.0f) {
+        stride = 2U;
+      } else {
+        stride = 1U;
+      }
+    } else {
+      float samples_per_cycle =
+          detector->sample_rate_hz /
+          detector->reference_frequency_hz;
 
-    stride = (uint32_t)(
-        (samples_per_cycle / PHASE_ANALYSIS_POINTS_PER_CYCLE) +
-        0.5f);
+      stride = (uint32_t)(
+          (samples_per_cycle / PHASE_ANALYSIS_POINTS_PER_CYCLE) +
+          0.5f);
+    }
   }
 
   if (stride < 1U) {

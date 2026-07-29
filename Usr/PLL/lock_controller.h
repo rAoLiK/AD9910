@@ -21,6 +21,10 @@ typedef struct {
   bool phase_locked;
   bool fine_mode;
   bool direct_phase_mode;
+  /* One-shot event: a confirmed source-frequency change was re-anchored. */
+  bool frequency_reanchored;
+  /* True while the source is still moving and has not settled for re-lock. */
+  bool frequency_change_pending;
   lock_band_t band;
   float dds_frequency_hz;
   float dds_phase_offset_rad;
@@ -39,7 +43,10 @@ typedef struct {
   float command_frequency_hz;
   float phase_offset_rad;
   float filtered_phase_error_rad;
+  float previous_phase_error_rad;
+  float filtered_frequency_error_hz;
   float frequency_trim_hz;
+  float frequency_change_candidate_hz;
   float phase_elapsed_s;
   float frequency_change_time_s;
   float missing_frequency_time_s;
@@ -48,7 +55,9 @@ typedef struct {
   float last_frequency_step_hz;
   float last_phase_step_rad;
   bool frequency_initialized;
+  bool frequency_change_pending;
   bool filter_initialized;
+  bool have_previous_phase_error;
   bool fine_mode;
   bool phase_locked;
 } lock_controller_t;

@@ -13,8 +13,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#define PLL_DMA_HALF_PAIR_COUNT       (2048U)
-#define PLL_DMA_PAIR_COUNT            (2U * PLL_DMA_HALF_PAIR_COUNT)
+#define PLL_DMA_MIN_HALF_PAIRS        (128U)
+#define PLL_DMA_MAX_HALF_PAIRS        (2048U)
+#define PLL_DMA_HALF_ALIGNMENT        (64U)
+#define PLL_DMA_TARGET_BLOCK_HZ       (1000U)
+#define PLL_DMA_PROVEN_HIGH_RATE_HZ   (960000U)
+#define PLL_DMA_PAIR_COUNT            (2U * PLL_DMA_MAX_HALF_PAIRS)
 #define PLL_RX_RING_SIZE              (128U)
 #define PLL_RX_RING_MASK              (PLL_RX_RING_SIZE - 1U)
 #define PLL_TX_RING_SIZE              (1024U)
@@ -24,6 +28,7 @@
 #define PLL_SEARCH_HIGH_RATE_HZ       DUAL_ADC_MAX_SAMPLE_RATE_HZ
 #define PLL_RATE_CHANGE_HOLDOFF_MS    (100UL)
 #define PLL_DDS_UPDATE_INTERVAL_MS    (1UL)
+#define PLL_ACQUIRE_RESTART_MS        (1000UL)
 #define PLL_DEG_PER_RAD               (57.29577951308232f)
 
 typedef struct {
@@ -33,9 +38,11 @@ typedef struct {
   phase_measurement_t measurement;
   lock_controller_output_t control;
   uint32_t actual_sample_rate_hz;
+  uint32_t active_half_pair_count;
   uint32_t last_rate_change_tick;
   uint32_t last_valid_tick;
   uint32_t last_dds_update_tick;
+  uint32_t acquire_start_tick;
   uint32_t last_ftw;
   uint16_t last_pow;
   double ftw_fraction_accumulator;
@@ -246,15 +253,42 @@ static bool PLL_Demo_StartSampling(uint32_t requested_rate_hz,
                                    bool retain_frequency)
 {
   uint32_t actual_rate_hz = 0U;
+  uint32_t half_pair_count;
+
+  /*
+   * Keep analysis events near 1 kHz.  The 128-pair floor still spans more
+   * than five cycles at the normal 24-samples/cycle low-frequency rate.
+   */
+  if (requested_rate_hz >= PLL_DMA_PROVEN_HIGH_RATE_HZ) {
+    /*
+     * Keep the fixed 2048-pair high-frequency cadence that was already
+     * verified on the board.  Dynamic short blocks are only needed to remove
+     * the tens-of-milliseconds latency below 10 kHz.
+     */
+    half_pair_count = PLL_DMA_MAX_HALF_PAIRS;
+  } else {
+    half_pair_count =
+        (requested_rate_hz + (PLL_DMA_TARGET_BLOCK_HZ / 2U)) /
+        PLL_DMA_TARGET_BLOCK_HZ;
+    half_pair_count =
+        (half_pair_count + (PLL_DMA_HALF_ALIGNMENT - 1U)) &
+        ~(PLL_DMA_HALF_ALIGNMENT - 1U);
+    if (half_pair_count < PLL_DMA_MIN_HALF_PAIRS) {
+      half_pair_count = PLL_DMA_MIN_HALF_PAIRS;
+    } else if (half_pair_count > PLL_DMA_MAX_HALF_PAIRS) {
+      half_pair_count = PLL_DMA_MAX_HALF_PAIRS;
+    }
+  }
 
   (void)DualADC_Stop();
   PLL_Demo_ClearPendingDMA();
-  if (DualADC_Start(s_adc_buffer, PLL_DMA_PAIR_COUNT,
+  if (DualADC_Start(s_adc_buffer, 2U * half_pair_count,
                     requested_rate_hz, &actual_rate_hz) != HAL_OK) {
     return false;
   }
 
   s_context.actual_sample_rate_hz = actual_rate_hz;
+  s_context.active_half_pair_count = half_pair_count;
   s_context.last_rate_change_tick = HAL_GetTick();
   PhaseDetector_SetSampleRate(&s_context.detector,
                               (float)actual_rate_hz,
@@ -296,8 +330,15 @@ static bool PLL_Demo_ChangeRateIfNeeded(uint32_t requested_rate_hz,
       ((uint64_t)current * 12ULL)) {
     return true;
   }
-  if ((uint32_t)(now - s_context.last_rate_change_tick) <
-      PLL_RATE_CHANGE_HOLDOFF_MS) {
+  /*
+   * The first trustworthy frequency estimate is still measured at the
+   * alias-safe 2.4 MSPS search rate.  Apply its large rate reduction
+   * immediately; otherwise a 1 kHz input waits 100 ms before phase
+   * demodulation has a long enough time aperture.
+   */
+  if ((s_status.state != PLL_DEMO_SEARCHING) &&
+      ((uint32_t)(now - s_context.last_rate_change_tick) <
+       PLL_RATE_CHANGE_HOLDOFF_MS)) {
     return true;
   }
 
@@ -337,14 +378,16 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
 {
   float elapsed_seconds;
   uint32_t now = HAL_GetTick();
+  pll_demo_state_t next_state;
 
   PhaseDetector_Process(
-      &s_context.detector, samples, PLL_DMA_HALF_PAIR_COUNT,
+      &s_context.detector, samples,
+      s_context.active_half_pair_count,
       LockController_GetMultiplier(&s_context.controller),
       &s_context.measurement);
 
   elapsed_seconds =
-      (float)PLL_DMA_HALF_PAIR_COUNT /
+      (float)s_context.active_half_pair_count /
       (float)s_context.actual_sample_rate_hz;
   LockController_Step(&s_context.controller,
                       &s_context.measurement,
@@ -358,6 +401,14 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
 
   s_context.last_valid_tick = now;
   if (s_context.control.command_valid) {
+    if (s_context.control.frequency_reanchored) {
+      s_status.frequency_reanchor_count++;
+      s_context.acquire_start_tick = now;
+    }
+    if (s_context.control.frequency_change_pending) {
+      /* Do not time out while the external generator is still slewing. */
+      s_context.acquire_start_tick = now;
+    }
     if (!PLL_Demo_ChangeRateIfNeeded(
             s_context.control.requested_sample_rate_hz, true)) {
       PLL_Demo_EnterError("ADC_RATE");
@@ -366,9 +417,14 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
 
   }
 
-  s_status.state = s_context.control.phase_locked
-                       ? PLL_DEMO_LOCKED
-                       : PLL_DEMO_ACQUIRING;
+  next_state = s_context.control.phase_locked
+                   ? PLL_DEMO_LOCKED
+                   : PLL_DEMO_ACQUIRING;
+  if ((next_state == PLL_DEMO_ACQUIRING) &&
+      (s_status.state != PLL_DEMO_ACQUIRING)) {
+    s_context.acquire_start_tick = now;
+  }
+  s_status.state = next_state;
 }
 
 static void PLL_Demo_ServiceDDS(void)
@@ -462,7 +518,9 @@ static void PLL_Demo_SendStatus(void)
       line, sizeof(line),
       "STATE=%s MUL=%u REF=%lu.%02luHz DDS=%lu.%02luHz "
       "PH=%c%lu.%03lu ERR=%c%lu.%03lu Q=%lu.%03lu FS=%lu "
-      "STEP=%c%lu.%03luHz MODE=%s CTRL=%s BAND=%s STRIDE=%u WIN=%u "
+      "STEP=%c%lu.%03luHz MODE=%s CTRL=%s BAND=%s "
+      "CHG=%u STRIDE=%u WIN=%u BLK=%u "
+      "ANCHOR=%lu RST=%lu "
       "OVR=%lu ADCERR=%lu RXOVR=%lu DDSERR=%lu\r\n",
       PLL_Demo_StateName(s_status.state),
       (unsigned int)s_status.multiplier,
@@ -485,8 +543,12 @@ static void PLL_Demo_SendStatus(void)
       s_status.fine_mode ? "FINE" : "COARSE",
       s_status.direct_phase_mode ? "POW" : "FTW",
       PLL_Demo_BandName(s_status.lock_band),
+      s_status.frequency_change_pending ? 1U : 0U,
       (unsigned int)s_status.analysis_stride,
       (unsigned int)s_status.phase_pair_count,
+      (unsigned int)s_status.block_pair_count,
+      (unsigned long)s_status.frequency_reanchor_count,
+      (unsigned long)s_status.search_restart_count,
       (unsigned long)s_status.dma_overrun_count,
       (unsigned long)s_status.adc_error_count,
       (unsigned long)s_status.uart_overflow_count,
@@ -649,6 +711,34 @@ static void PLL_Demo_ProcessSearchRate(void)
   }
 }
 
+static void PLL_Demo_ProcessAcquireWatchdog(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (!s_context.running ||
+      (s_status.state != PLL_DEMO_ACQUIRING) ||
+      ((uint32_t)(now - s_context.acquire_start_tick) <
+       PLL_ACQUIRE_RESTART_MS)) {
+    return;
+  }
+
+  /*
+   * A large upward source jump can alias at the old dynamic sample rate, and
+   * a rare noisy capture can otherwise remain in ACQUIRE indefinitely.
+   * Restart the same deterministic workflow used at power-up: clear both
+   * estimators, return to the alias-safe rate, then derive the new rate.
+   */
+  LockController_ResetLoop(&s_context.controller);
+  memset(&s_context.measurement, 0, sizeof(s_context.measurement));
+  memset(&s_context.control, 0, sizeof(s_context.control));
+  if (!PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
+    PLL_Demo_EnterError("REACQUIRE");
+    return;
+  }
+  s_status.search_restart_count++;
+  s_status.state = PLL_DEMO_SEARCHING;
+}
+
 static void PLL_Demo_UpdateStatus(void)
 {
   s_status.multiplier =
@@ -673,9 +763,13 @@ static void PLL_Demo_UpdateStatus(void)
   s_status.fine_mode = s_context.control.fine_mode;
   s_status.direct_phase_mode =
       s_context.control.direct_phase_mode;
+  s_status.frequency_change_pending =
+      s_context.control.frequency_change_pending;
   s_status.lock_band = (uint8_t)s_context.control.band;
   s_status.phase_pair_count =
       s_context.measurement.phase_pair_count;
+  s_status.block_pair_count =
+      (uint16_t)s_context.active_half_pair_count;
   s_status.analysis_stride =
       s_context.measurement.analysis_stride;
   s_status.sample_rate_hz = s_context.actual_sample_rate_hz;
@@ -746,7 +840,7 @@ void PLL_Demo_Process(void)
   while ((processed < 4U) && PLL_Demo_PopReadyHalf(&half)) {
     const uint32_t *samples =
         &s_adc_buffer[(uint32_t)half *
-                      PLL_DMA_HALF_PAIR_COUNT];
+                      s_context.active_half_pair_count];
     PLL_Demo_ProcessSamples(samples);
     processed++;
     if (!s_context.running) {
@@ -755,6 +849,7 @@ void PLL_Demo_Process(void)
   }
 
   PLL_Demo_ProcessSearchRate();
+  PLL_Demo_ProcessAcquireWatchdog();
   PLL_Demo_ServiceDDS();
   PLL_Demo_UpdateStatus();
 }

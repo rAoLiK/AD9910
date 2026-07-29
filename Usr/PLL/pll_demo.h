@@ -33,14 +33,18 @@ typedef struct {
   float phase_step_deg;
   bool fine_mode;
   bool direct_phase_mode;
+  bool frequency_change_pending;
   uint8_t lock_band;
   uint16_t phase_pair_count;
+  uint16_t block_pair_count;
   uint8_t analysis_stride;
   uint32_t sample_rate_hz;
   uint32_t dma_overrun_count;
   uint32_t adc_error_count;
   uint32_t uart_overflow_count;
   uint32_t dds_error_count;
+  uint32_t frequency_reanchor_count;
+  uint32_t search_restart_count;
 } pll_demo_status_t;
 
 HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds);
