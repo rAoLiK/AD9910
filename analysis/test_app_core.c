@@ -73,12 +73,12 @@ static void TestHmiMap(void)
 {
   app_command_t command = APP_COMMAND_GO_MENU;
 
-  assert(!AppHmi_MapTouch(0U, 3U, APP_HMI_TOUCH_RELEASE, &command));
-  assert(!AppHmi_MapTouch(0U, 2U, APP_HMI_TOUCH_PRESS, &command));
-  assert(AppHmi_MapTouch(0U, 3U, APP_HMI_TOUCH_PRESS, &command));
+  assert(!AppHmi_MapTouch(0U, 2U, APP_HMI_TOUCH_RELEASE, &command));
+  assert(AppHmi_MapTouch(0U, 2U, APP_HMI_TOUCH_PRESS, &command));
   assert(command == APP_COMMAND_ENTER_TASK14);
-  assert(AppHmi_MapTouch(0U, 4U, APP_HMI_TOUCH_PRESS, &command));
+  assert(AppHmi_MapTouch(0U, 3U, APP_HMI_TOUCH_PRESS, &command));
   assert(command == APP_COMMAND_ENTER_TASK5);
+  assert(!AppHmi_MapTouch(0U, 4U, APP_HMI_TOUCH_PRESS, &command));
   assert(AppHmi_MapTouch(1U, 10U, APP_HMI_TOUCH_PRESS, &command));
   assert(command == APP_COMMAND_SELECT_TASK1);
   assert(AppHmi_MapTouch(1U, 6U, APP_HMI_TOUCH_PRESS, &command));
