@@ -231,6 +231,8 @@ void LockController_Step(lock_controller_t *controller,
   float desired_rate;
   float change_threshold;
   float stable_threshold;
+  float multiplier_scale;
+  float coarse_reference_frequency;
   float alpha;
   const lock_band_parameters_t *parameters;
 
@@ -280,15 +282,25 @@ void LockController_Step(lock_controller_t *controller,
     controller->tracked_frequency_hz +=
         alpha * (observed_frequency - controller->tracked_frequency_hz);
 
+    /*
+     * Define source-change thresholds in the reference-input domain, then
+     * scale them into the DDS domain used by the controller.  Otherwise MUL 2
+     * halves the effective input tolerance and can keep a noisy source in
+     * CHANGE_PENDING indefinitely.
+     */
+    multiplier_scale = (float)controller->multiplier;
+    coarse_reference_frequency =
+        controller->coarse_frequency_hz / multiplier_scale;
     change_threshold =
-        controller->coarse_frequency_hz *
+        coarse_reference_frequency *
         LOCK_INPUT_CHANGE_FRACTION;
     if (change_threshold < LOCK_INPUT_CHANGE_MIN_HZ) {
       change_threshold = LOCK_INPUT_CHANGE_MIN_HZ;
     }
+    change_threshold *= multiplier_scale;
 
     stable_threshold =
-        controller->coarse_frequency_hz *
+        coarse_reference_frequency *
         LOCK_INPUT_STABLE_FRACTION;
     if (stable_threshold < LOCK_INPUT_STABLE_MIN_HZ) {
       stable_threshold = LOCK_INPUT_STABLE_MIN_HZ;
@@ -297,6 +309,7 @@ void LockController_Step(lock_controller_t *controller,
         (stable_threshold > LOCK_LOW_INPUT_STABLE_HZ)) {
       stable_threshold = LOCK_LOW_INPUT_STABLE_HZ;
     }
+    stable_threshold *= multiplier_scale;
 
     if (!controller->frequency_change_pending) {
       if (fabsf(controller->tracked_frequency_hz -

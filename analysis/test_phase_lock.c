@@ -635,6 +635,54 @@ static int run_high_frequency_ramp_case(void)
              : 0;
 }
 
+static int run_change_tolerance_multiplier_case(uint8_t multiplier)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .phase_quality = 0.95f,
+      .generalized_phase_rad = 0.0f
+  };
+  const float dt = 0.001f;
+  unsigned int block;
+  unsigned int reanchor_count = 0U;
+
+  LockController_Init(&controller);
+  if (!LockController_SetMultiplier(&controller, multiplier)) {
+    return 1;
+  }
+
+  measurement.reference_frequency_hz = 4000.0f;
+  for (block = 0U; block < 200U; ++block) {
+    LockController_Step(&controller, &measurement, dt, &output);
+  }
+
+  /*
+   * The 0.8 Hz peak-to-peak reference jitter is inside the 1 Hz LOW-band
+   * source tolerance.  MUL 2 must not halve that input-domain tolerance.
+   */
+  for (block = 0U; block < 300U; ++block) {
+    measurement.reference_frequency_hz =
+        5000.0f + ((block & 1U) ? 0.4f : -0.4f);
+    LockController_Step(&controller, &measurement, dt, &output);
+    if (output.frequency_reanchored) {
+      reanchor_count++;
+    }
+  }
+
+  printf("change tolerance: mul=%u anchors=%u pending=%u dds=%.3f\n",
+         multiplier, reanchor_count,
+         output.frequency_change_pending ? 1U : 0U,
+         (double)output.dds_frequency_hz);
+  return (reanchor_count != 1U) || output.frequency_change_pending ||
+         (fabs((double)output.dds_frequency_hz -
+               5000.0 * (double)multiplier) > 1.0);
+}
+
 static int run_low_frequency_bias_case(double input_frequency,
                                        double estimate_bias_hz)
 {
@@ -719,6 +767,8 @@ int main(void)
   failures += run_high_frequency_jitter_case();
   failures += run_high_frequency_jitter_hop_case();
   failures += run_high_frequency_ramp_case();
+  failures += run_change_tolerance_multiplier_case(1U);
+  failures += run_change_tolerance_multiplier_case(2U);
   failures += run_low_frequency_bias_case(1000.0, 2.0);
   failures += run_low_frequency_bias_case(4000.0, 3.0);
   if (failures != 0) {

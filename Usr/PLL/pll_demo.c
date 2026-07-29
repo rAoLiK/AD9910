@@ -30,6 +30,7 @@
 #define PLL_DDS_UPDATE_INTERVAL_MS    (1UL)
 #define PLL_ACQUIRE_RESTART_MS        (1000UL)
 #define PLL_LOW_ACQUIRE_RESTART_MS    (3000UL)
+#define PLL_CHANGE_PENDING_RESTART_MS (600UL)
 #define PLL_DEG_PER_RAD               (57.29577951308232f)
 
 typedef struct {
@@ -44,6 +45,7 @@ typedef struct {
   uint32_t last_valid_tick;
   uint32_t last_dds_update_tick;
   uint32_t acquire_start_tick;
+  uint32_t frequency_change_start_tick;
   uint32_t last_ftw;
   uint16_t last_pow;
   double ftw_fraction_accumulator;
@@ -53,6 +55,7 @@ typedef struct {
   bool running;
   bool dds_output_enabled;
   bool have_ftw;
+  bool frequency_change_pending_seen;
 } pll_demo_context_t;
 
 static pll_demo_context_t s_context;
@@ -407,8 +410,12 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
       s_context.acquire_start_tick = now;
     }
     if (s_context.control.frequency_change_pending) {
-      /* Do not time out while the external generator is still slewing. */
-      s_context.acquire_start_tick = now;
+      if (!s_context.frequency_change_pending_seen) {
+        s_context.frequency_change_start_tick = now;
+        s_context.frequency_change_pending_seen = true;
+      }
+    } else {
+      s_context.frequency_change_pending_seen = false;
     }
     if (!PLL_Demo_ChangeRateIfNeeded(
             s_context.control.requested_sample_rate_hz, true)) {
@@ -566,6 +573,7 @@ static void PLL_Demo_StartCommand(void)
 
   LockController_ResetLoop(&s_context.controller);
   PhaseDetector_ResetFrequency(&s_context.detector);
+  s_context.frequency_change_pending_seen = false;
   if (!PLL_Demo_ApplyDDS(
           (s_context.dds_frequency_hz > 0.0f)
               ? s_context.dds_frequency_hz
@@ -628,6 +636,7 @@ static void PLL_Demo_HandleCommand(char *line)
       PLL_Demo_Send("ERR MUL expects 1 or 2\r\n");
     } else {
       PhaseDetector_ResetFrequency(&s_context.detector);
+      s_context.frequency_change_pending_seen = false;
       PLL_Demo_Send("OK MUL\r\n");
     }
   } else if (strncmp(line, "PHASE ", 6U) == 0) {
@@ -719,11 +728,16 @@ static void PLL_Demo_ProcessAcquireWatchdog(void)
       s_context.control.direct_phase_mode
           ? PLL_LOW_ACQUIRE_RESTART_MS
           : PLL_ACQUIRE_RESTART_MS;
+  bool change_timed_out =
+      s_context.frequency_change_pending_seen &&
+      ((uint32_t)(now - s_context.frequency_change_start_tick) >=
+       PLL_CHANGE_PENDING_RESTART_MS);
+  bool acquire_timed_out =
+      (s_status.state == PLL_DEMO_ACQUIRING) &&
+      ((uint32_t)(now - s_context.acquire_start_tick) >= timeout_ms);
 
   if (!s_context.running ||
-      (s_status.state != PLL_DEMO_ACQUIRING) ||
-      ((uint32_t)(now - s_context.acquire_start_tick) <
-       timeout_ms)) {
+      (!change_timed_out && !acquire_timed_out)) {
     return;
   }
 
@@ -736,6 +750,7 @@ static void PLL_Demo_ProcessAcquireWatchdog(void)
   LockController_ResetLoop(&s_context.controller);
   memset(&s_context.measurement, 0, sizeof(s_context.measurement));
   memset(&s_context.control, 0, sizeof(s_context.control));
+  s_context.frequency_change_pending_seen = false;
   if (!PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
     PLL_Demo_EnterError("REACQUIRE");
     return;
