@@ -1,0 +1,49 @@
+build
+mx.scratch
+!.settings
+
+# ===== Build output (CMake / Ninja / STM32 toolchain) =====
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.ninja
+.ninja_*
+
+# ===== Firmware binaries & intermediate artifacts =====
+*.o
+*.obj
+*.d
+*.a
+*.lib
+*.elf
+*.map
+*.hex
+*.bin
+*.lst
+*.su
+
+# ===== Logs =====
+log/*
+*.log
+
+# ===== Python analysis artifacts =====
+__pycache__/
+*.py[cod]
+analysis/output/
+
+# ===== IDE / editor local files =====
+.vscode/
+.idea/
+.settings/
+.clangd/
+
+# ===== STM32CubeMX / tool scratch =====
+mx.scratch
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db

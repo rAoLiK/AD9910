@@ -1,0 +1,46 @@
+# ==============================================================================
+# 功能：将数组/指针数据导出到文件，执行后自动恢复所有 GDB 设置，无任何副作用
+# 用法：sva <数组/指针名> <元素数量> <文件名>
+#   sva 数组名                输出数组全部元素，保存到数组名文件中
+#   sva 数组名 个数           输出数组全部元素，保存到指定文件中
+#   sva 数组名 个数 文件名     输出指定个数元素
+# 输出文件地址：./log/<文件名>
+# 示例：sva a 2048 data 
+# 注意：请确保当前目录下存在 log 文件夹，否则会报错
+# ==============================================================================
+
+# 关闭GDB日志通知（关键：去掉 =cmd-param-changed 行）
+set logging redirect on
+set pagination off
+
+define sva
+  # 解除输出限制
+  set print elements 0
+  set print repeats 0
+  set logging enabled off
+
+  # 导出数据到文件
+  if $argc == 3
+    set logging file ./log/$arg2
+  else
+    set logging file ./log/$arg0
+  end
+  set logging overwrite on
+  set logging enabled on
+  if $argc == 1
+    p $arg0
+  else
+    p *$arg0@$arg1
+  end
+  set logging enabled off
+
+  printf "Export array success!\n"
+end
+
+# 命令帮助说明
+document sva
+  Export array data to a file and automatically restore GDB settings.
+  Usage: savearray filename array count
+  Output file path: ./log/filename
+  Example: sva a 2048 data
+end
