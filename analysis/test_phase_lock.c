@@ -244,6 +244,55 @@ static int run_band_detector_case(double frequency)
              : 0;
 }
 
+static int run_45khz_x2_detector_case(double sample_rate,
+                                      double phase_tolerance_deg)
+{
+  phase_detector_t detector;
+  phase_measurement_t measurement = {0};
+  uint32_t pairs[TEST_HIGH_PAIR_COUNT];
+  const double reference_frequency = 45000.0;
+  const uint8_t multiplier = 2U;
+  const double expected_phase_deg = 35.0;
+  uint64_t sample_index = 0U;
+  unsigned int block;
+
+  PhaseDetector_Init(&detector, (float)sample_rate);
+  for (block = 0U; block < 12U; ++block) {
+    uint32_t i;
+    for (i = 0U; i < TEST_HIGH_PAIR_COUNT; ++i, ++sample_index) {
+      double reference_phase =
+          2.0 * TEST_PI * reference_frequency *
+              (double)sample_index / sample_rate +
+          10.0 * TEST_PI / 180.0;
+      double dds_phase =
+          2.0 * TEST_PI * reference_frequency *
+              (double)multiplier * (double)sample_index /
+              sample_rate +
+          55.0 * TEST_PI / 180.0;
+      pairs[i] = make_pair(sin(reference_phase), sin(dds_phase));
+    }
+    PhaseDetector_Process(&detector, pairs, TEST_HIGH_PAIR_COUNT,
+                          multiplier, &measurement);
+  }
+
+  printf("45k/2x detector: fs=%10.3f measured=%10.3f phase=%7.3f "
+         "stride=%u win=%u\n",
+         sample_rate,
+         (double)measurement.reference_frequency_hz,
+         (double)measurement.generalized_phase_rad *
+             180.0 / TEST_PI,
+         (unsigned int)measurement.analysis_stride,
+         (unsigned int)measurement.phase_pair_count);
+  return (!measurement.frequency_valid || !measurement.phase_valid ||
+          (fabs((double)measurement.reference_frequency_hz -
+                reference_frequency) > 10.0) ||
+          (fabs((double)measurement.generalized_phase_rad *
+                    180.0 / TEST_PI -
+                expected_phase_deg) > phase_tolerance_deg))
+             ? 1
+             : 0;
+}
+
 static double wrap_radians(double radians)
 {
   while (radians > TEST_PI) {
@@ -253,6 +302,64 @@ static double wrap_radians(double radians)
     radians += 2.0 * TEST_PI;
   }
   return radians;
+}
+
+static int run_exact_band_boundary_case(void)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .generalized_phase_rad = 0.0f,
+      .phase_quality = 0.95f
+  };
+  lock_band_t low_exit_band;
+  lock_band_t low_enter_band;
+  lock_band_t high_enter_band;
+  lock_band_t high_exit_band;
+
+  LockController_Init(&controller);
+  measurement.reference_frequency_hz = 34000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  measurement.reference_frequency_hz = 45000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  low_exit_band = output.band;
+
+  LockController_Init(&controller);
+  measurement.reference_frequency_hz = 50000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  measurement.reference_frequency_hz = 35000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  low_enter_band = output.band;
+
+  LockController_Init(&controller);
+  measurement.reference_frequency_hz = 50000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  measurement.reference_frequency_hz = 90000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  high_enter_band = output.band;
+
+  LockController_Init(&controller);
+  measurement.reference_frequency_hz = 100000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  measurement.reference_frequency_hz = 75000.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+  high_exit_band = output.band;
+
+  printf("exact band edges: 45k=%u 35k=%u 90k=%u 75k=%u\n",
+         (unsigned int)low_exit_band,
+         (unsigned int)low_enter_band,
+         (unsigned int)high_enter_band,
+         (unsigned int)high_exit_band);
+  return ((low_exit_band != LOCK_BAND_MID) ||
+          (low_enter_band != LOCK_BAND_LOW) ||
+          (high_enter_band != LOCK_BAND_HIGH) ||
+          (high_exit_band != LOCK_BAND_MID))
+             ? 1
+             : 0;
 }
 
 static int run_100khz_gradient_case(void)
@@ -877,6 +984,57 @@ static int run_high_locked_stability_case(double reference_frequency,
              : 0;
 }
 
+static int run_45khz_x2_hold_settle_spike_case(void)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .reference_frequency_hz = 45000.0f,
+      .generalized_phase_rad = 0.0f,
+      .phase_quality = 0.90f
+  };
+  const double dt = 2048.0 / (72000000.0 / 33.0);
+  double elapsed = 0.0;
+  double hold_time = -1.0;
+  unsigned int block = 0U;
+
+  LockController_Init(&controller);
+  if (!LockController_SetMultiplier(&controller, 2U)) {
+    return 1;
+  }
+
+  while (elapsed < 1.0) {
+    /*
+     * A 6-degree one-window spike is outside the 3-degree acquire window but
+     * safely inside the 12-degree release window.  Repeat it faster than the
+     * 150 ms hold delay to reproduce the old unreachable-hold condition.
+     */
+    measurement.generalized_phase_rad =
+        ((block != 0U) && ((block % 80U) == 0U))
+            ? (6.0f * (float)TEST_PI / 180.0f)
+            : 0.0f;
+    LockController_Step(&controller, &measurement, (float)dt, &output);
+    elapsed += dt;
+    block++;
+    if (output.frequency_hold_mode && (hold_time < 0.0)) {
+      hold_time = elapsed;
+    }
+  }
+
+  printf("45k/2x hold settle spikes: hold=%.3fs locked=%u mode=%u\n",
+         hold_time,
+         output.phase_locked ? 1U : 0U,
+         output.frequency_hold_mode ? 1U : 0U);
+  return (!output.phase_locked || !output.frequency_hold_mode ||
+          (hold_time < 0.0) || (hold_time > 0.40))
+             ? 1
+             : 0;
+}
+
 int main(void)
 {
   int failures = 0;
@@ -892,8 +1050,17 @@ int main(void)
   failures += run_band_detector_case(39000.0);
   failures += run_band_detector_case(40000.0);
   failures += run_band_detector_case(41000.0);
+  failures += run_band_detector_case(45000.0);
   failures += run_band_detector_case(60000.0);
+  /*
+   * The alias-safe search rate only has to locate the signal; the first valid
+   * estimate must then move 45 kHz x2 to TIM2's 72 MHz / 33 working rate,
+   * where the tighter phase-accuracy requirement applies.
+   */
+  failures += run_45khz_x2_detector_case(2400000.0, 2.5);
+  failures += run_45khz_x2_detector_case(72000000.0 / 33.0, 1.0);
   failures += run_controller_case();
+  failures += run_exact_band_boundary_case();
   failures += run_100khz_gradient_case();
   failures += run_band_gradient_case(1000.0, 1U);
   failures += run_band_gradient_case(2000.0, 1U);
@@ -911,6 +1078,8 @@ int main(void)
   failures += run_change_tolerance_multiplier_case(2U);
   failures += run_low_frequency_bias_case(1000.0, 2.0);
   failures += run_low_frequency_bias_case(4000.0, 3.0);
+  failures += run_45khz_x2_hold_settle_spike_case();
+  failures += run_high_locked_stability_case(45000.0, 2U);
   failures += run_high_locked_stability_case(60000.0, 1U);
   failures += run_high_locked_stability_case(60000.0, 2U);
   /*

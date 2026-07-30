@@ -242,8 +242,12 @@ static bool PLL_Demo_ChangeRateIfNeeded(uint32_t requested_rate_hz,
   difference = (requested_rate_hz > current)
                    ? (requested_rate_hz - current)
                    : (current - requested_rate_hz);
-  if (((uint64_t)difference * 100ULL) <
-      ((uint64_t)current * 12ULL)) {
+  if (difference == 0U) {
+    return true;
+  }
+  if ((s_status.state != PLL_DEMO_SEARCHING) &&
+      (((uint64_t)difference * 100ULL) <
+       ((uint64_t)current * 12ULL))) {
     return true;
   }
   /*
@@ -409,6 +413,11 @@ static void PLL_Demo_ProcessSearchRate(void)
 static void PLL_Demo_ProcessAcquireWatchdog(void)
 {
   uint32_t now = HAL_GetTick();
+  float reference_frequency_hz =
+      s_context.measurement.reference_frequency_hz;
+  float observed_dds_frequency_hz =
+      reference_frequency_hz *
+      (float)LockController_GetMultiplier(&s_context.controller);
   uint32_t timeout_ms =
       s_context.control.direct_phase_mode
           ? PLL_LOW_ACQUIRE_RESTART_MS
@@ -423,19 +432,20 @@ static void PLL_Demo_ProcessAcquireWatchdog(void)
   bool high_frequency_near_lock =
       s_context.measurement.frequency_valid &&
       s_context.measurement.phase_valid &&
-      (s_context.measurement.reference_frequency_hz >=
-       PLL_HIGH_HOLD_ENTER_HZ) &&
+      ((reference_frequency_hz >= PLL_HIGH_HOLD_ENTER_HZ) ||
+       (observed_dds_frequency_hz >=
+        PLL_HIGH_OUTPUT_HOLD_ENTER_HZ)) &&
       (fabsf(s_context.control.phase_error_rad * PLL_DEG_PER_RAD) <=
        PLL_HIGH_NEAR_LOCK_ERROR_DEG);
 
   /*
-   * At high input frequencies the raw phase estimate is noisier.  Requiring
-   * 50 ms continuously inside the 3-degree lock window can therefore keep a
-   * genuinely converging loop in ACQUIRE until the old one-second watchdog
-   * expires.  A full estimator reset at that point is the large periodic jerk
-   * seen on the board.  If frequency and phase are both valid and the filtered
-   * error is already near lock, keep the PI state and extend only this
-   * watchdog window.  Source-change timeout remains authoritative.
+   * At high reference or DDS-output frequencies, requiring 50 ms continuously
+   * inside the 3-degree lock window can keep a genuinely converging loop in
+   * ACQUIRE until the old one-second watchdog expires.  A full estimator reset
+   * at that point is the large periodic jerk seen on the board.  If frequency
+   * and phase are both valid and the filtered error is already near lock, keep
+   * the PI state and extend only this watchdog window.  Source-change timeout
+   * remains authoritative.
    */
   if (acquire_timed_out && high_frequency_near_lock) {
     s_context.acquire_start_tick = now;

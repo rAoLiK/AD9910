@@ -53,6 +53,7 @@ typedef struct {
   float missing_frequency_time_s;
   float locked_time_s;
   float unlocked_time_s;
+  float hold_settle_time_s;
   float last_frequency_step_hz;
   float last_phase_step_rad;
   bool frequency_initialized;

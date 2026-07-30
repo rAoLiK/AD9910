@@ -101,20 +101,20 @@ static void LockController_UpdateBand(lock_controller_t *controller,
 
   switch (controller->band) {
     case LOCK_BAND_LOW:
-      if (reference_frequency_hz > LOCK_LOW_EXIT_HZ) {
+      if (reference_frequency_hz >= LOCK_LOW_EXIT_HZ) {
         controller->band = LOCK_BAND_MID;
       }
       break;
     case LOCK_BAND_HIGH:
-      if (reference_frequency_hz < LOCK_HIGH_EXIT_HZ) {
+      if (reference_frequency_hz <= LOCK_HIGH_EXIT_HZ) {
         controller->band = LOCK_BAND_MID;
       }
       break;
     case LOCK_BAND_MID:
     default:
-      if (reference_frequency_hz < LOCK_LOW_ENTER_HZ) {
+      if (reference_frequency_hz <= LOCK_LOW_ENTER_HZ) {
         controller->band = LOCK_BAND_LOW;
-      } else if (reference_frequency_hz > LOCK_HIGH_ENTER_HZ) {
+      } else if (reference_frequency_hz >= LOCK_HIGH_ENTER_HZ) {
         controller->band = LOCK_BAND_HIGH;
       }
       break;
@@ -130,6 +130,7 @@ static void LockController_ResetPhaseTracking(
   controller->phase_elapsed_s = 0.0f;
   controller->locked_time_s = 0.0f;
   controller->unlocked_time_s = 0.0f;
+  controller->hold_settle_time_s = 0.0f;
   controller->last_frequency_step_hz = 0.0f;
   controller->last_phase_step_rad = 0.0f;
   controller->filter_initialized = false;
@@ -388,6 +389,7 @@ void LockController_Step(lock_controller_t *controller,
   if (!measurement->phase_valid) {
     controller->locked_time_s = 0.0f;
     controller->unlocked_time_s += elapsed_seconds;
+    controller->hold_settle_time_s = 0.0f;
     if (controller->unlocked_time_s >= LOCK_RELEASE_TIME_S) {
       controller->phase_locked = false;
       controller->frequency_hold_mode = false;
@@ -415,21 +417,36 @@ void LockController_Step(lock_controller_t *controller,
     float step;
     float phase_step = 0.0f;
     float phase_rate_correction_hz = 0.0f;
+    bool high_frequency_enter;
+    bool high_frequency_exit;
     bool high_frequency_hold;
+
+    /*
+     * The reference-side demodulator becomes noise-sensitive above 60 kHz,
+     * while FTW quantization/dithering depends on the actual DDS frequency.
+     * Test both domains so 45 kHz x2 (90 kHz DDS) cannot fall through a gap
+     * that is invisible when only the 45 kHz reference is inspected.
+     */
+    high_frequency_enter =
+        (measurement->reference_frequency_hz >=
+         PLL_HIGH_HOLD_ENTER_HZ) ||
+        (observed_frequency >= PLL_HIGH_OUTPUT_HOLD_ENTER_HZ);
+    high_frequency_exit =
+        (measurement->reference_frequency_hz <
+         PLL_HIGH_HOLD_EXIT_HZ) &&
+        (observed_frequency < PLL_HIGH_OUTPUT_HOLD_EXIT_HZ);
 
     if (controller->frequency_hold_mode) {
       if (!controller->phase_locked ||
           controller->frequency_change_pending ||
-          (measurement->reference_frequency_hz <
-           PLL_HIGH_HOLD_EXIT_HZ)) {
+          high_frequency_exit) {
         controller->frequency_hold_mode = false;
       }
     } else if (controller->phase_locked &&
                !controller->frequency_change_pending &&
-               (controller->locked_time_s >=
+               (controller->hold_settle_time_s >=
                 LOCK_HIGH_HOLD_SETTLE_S) &&
-               (measurement->reference_frequency_hz >=
-                PLL_HIGH_HOLD_ENTER_HZ)) {
+               high_frequency_enter) {
       controller->frequency_hold_mode = true;
     }
     high_frequency_hold = controller->frequency_hold_mode;
@@ -617,6 +634,28 @@ void LockController_Step(lock_controller_t *controller,
       }
     } else {
       controller->locked_time_s = 0.0f;
+    }
+
+    /*
+     * Hold entry must not reuse the 3-degree acquire timer.  Once LOCKED, a
+     * harmless 3..12 degree estimator spike intentionally preserves the lock,
+     * but it resets locked_time_s; at a resonant sampling point that can keep
+     * fixed-FTW hold unreachable forever.  Accumulate a separate settle window
+     * inside the release threshold, without relaxing the lock declaration or
+     * release criteria themselves.
+     */
+    if (!controller->frequency_change_pending &&
+        (high_frequency_enter ||
+         controller->frequency_hold_mode) &&
+        (fabsf(error) < LOCK_RELEASE_THRESHOLD_RAD)) {
+      controller->hold_settle_time_s += phase_dt;
+      if (controller->hold_settle_time_s >
+          LOCK_HIGH_HOLD_SETTLE_S) {
+        controller->hold_settle_time_s =
+            LOCK_HIGH_HOLD_SETTLE_S;
+      }
+    } else {
+      controller->hold_settle_time_s = 0.0f;
     }
   }
 
