@@ -21,6 +21,7 @@ typedef struct {
   bool phase_locked;
   bool fine_mode;
   bool direct_phase_mode;
+  bool frequency_hold_mode;
   /* One-shot event: a confirmed source-frequency change was re-anchored. */
   bool frequency_reanchored;
   /* True while the source is still moving and has not settled for re-lock. */
@@ -60,6 +61,7 @@ typedef struct {
   bool have_previous_phase_error;
   bool fine_mode;
   bool phase_locked;
+  bool frequency_hold_mode;
 } lock_controller_t;
 
 void LockController_Init(lock_controller_t *controller);

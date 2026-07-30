@@ -468,6 +468,7 @@ static int run_high_frequency_jitter_case(void)
          phase * 180.0 / TEST_PI,
          output.phase_locked ? 1U : 0U);
   return (!output.command_valid || !output.phase_locked ||
+          output.frequency_hold_mode ||
           (reanchor_count != 0U) ||
           (fabs((double)output.dds_frequency_hz -
                 input_frequency) > 0.10) ||
@@ -729,9 +730,143 @@ static int run_low_frequency_bias_case(double input_frequency,
          (double)output.dds_frequency_hz,
          phase * 180.0 / TEST_PI, lock_time);
   return (!output.command_valid || !output.phase_locked ||
+          output.frequency_hold_mode ||
           (lock_time < 0.0) || (lock_time > 0.80) ||
           (fabs((double)output.dds_frequency_hz -
                 input_frequency) > 0.10) ||
+          (fabs(phase * 180.0 / TEST_PI) > 3.0))
+              ? 1
+              : 0;
+}
+
+static double quantize_dds_frequency(double frequency_hz)
+{
+  const double sysclk_hz = 1000000000.0;
+  const double ftw_scale = 4294967296.0;
+  double ftw = floor((frequency_hz * ftw_scale / sysclk_hz) + 0.5);
+
+  return ftw * sysclk_hz / ftw_scale;
+}
+
+static int run_high_locked_stability_case(double reference_frequency,
+                                          uint8_t multiplier)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .phase_quality = 0.90f
+  };
+  const double target_frequency =
+      reference_frequency * (double)multiplier;
+  double sample_rate = 24.0 * target_frequency;
+  double dt;
+  double phase = 100.0 * TEST_PI / 180.0;
+  double previous_phase_offset = 0.0;
+  double elapsed = 0.0;
+  double lock_time = -1.0;
+  double hold_time = -1.0;
+  double held_frequency = 0.0;
+  double maximum_frequency_excursion = 0.0;
+  double maximum_locked_step = 0.0;
+  double maximum_phase_step = 0.0;
+  unsigned int hold_drop_count = 0U;
+  bool hold_window_started = false;
+
+  if (sample_rate > 2400000.0) {
+    sample_rate = 2400000.0;
+  }
+  dt = 2048.0 / sample_rate;
+  LockController_Init(&controller);
+  if (!LockController_SetMultiplier(&controller, multiplier)) {
+    return 1;
+  }
+
+  while (elapsed < 3.0) {
+    double phase_noise =
+        (0.90 * sin(2.0 * TEST_PI * 73.0 * elapsed) +
+         0.20 * sin(2.0 * TEST_PI * 181.0 * elapsed)) *
+        TEST_PI / 180.0;
+    double actual_dds_frequency;
+
+    if ((elapsed >= 1.5) && (elapsed < (1.5 + dt))) {
+      phase_noise += 6.0 * TEST_PI / 180.0;
+    }
+    measurement.reference_frequency_hz =
+        (float)(reference_frequency +
+                15.0 * sin(2.0 * TEST_PI * 7.0 * elapsed));
+    measurement.generalized_phase_rad =
+        (float)wrap_radians(phase + phase_noise);
+    LockController_Step(&controller, &measurement, (float)dt, &output);
+
+    actual_dds_frequency = output.frequency_hold_mode
+                               ? quantize_dds_frequency(
+                                     (double)output.dds_frequency_hz)
+                               : (double)output.dds_frequency_hz;
+    phase = wrap_radians(
+        phase +
+        2.0 * TEST_PI *
+            (actual_dds_frequency - target_frequency) * dt +
+        wrap_radians(
+            (double)output.dds_phase_offset_rad -
+            previous_phase_offset));
+    previous_phase_offset = (double)output.dds_phase_offset_rad;
+    elapsed += dt;
+
+    if (output.phase_locked && (lock_time < 0.0)) {
+      lock_time = elapsed;
+    }
+    if (output.frequency_hold_mode && (hold_time < 0.0)) {
+      hold_time = elapsed;
+    }
+    if ((hold_time >= 0.0) && output.phase_locked &&
+        !output.frequency_hold_mode) {
+      hold_drop_count++;
+    }
+    if (output.frequency_hold_mode &&
+        (hold_time >= 0.0) &&
+        (elapsed >= (hold_time + 0.05))) {
+      double step = fabs((double)output.frequency_step_hz);
+      double phase_step = fabs((double)output.phase_step_rad);
+
+      if (!hold_window_started) {
+        held_frequency = (double)output.dds_frequency_hz;
+        hold_window_started = true;
+      }
+      if (fabs((double)output.dds_frequency_hz - held_frequency) >
+          maximum_frequency_excursion) {
+        maximum_frequency_excursion =
+            fabs((double)output.dds_frequency_hz - held_frequency);
+      }
+      if (step > maximum_locked_step) {
+        maximum_locked_step = step;
+      }
+      if (phase_step > maximum_phase_step) {
+        maximum_phase_step = phase_step;
+      }
+    }
+  }
+
+  printf("%.0fk/%ux locked stability: lock=%.3fs hold=%.3fs drops=%u "
+         "freq_excursion=%.4fHz step<=%.4fHz "
+         "phase_step<=%.4fdeg phase=%7.3f locked=%u\n",
+         reference_frequency / 1000.0,
+         (unsigned int)multiplier, lock_time, hold_time,
+         hold_drop_count,
+         maximum_frequency_excursion, maximum_locked_step,
+         maximum_phase_step * 180.0 / TEST_PI,
+         phase * 180.0 / TEST_PI,
+         output.phase_locked ? 1U : 0U);
+  return (!output.command_valid || !output.phase_locked ||
+          !hold_window_started || (lock_time < 0.0) ||
+          (hold_time < 0.0) ||
+          (hold_drop_count != 0U) ||
+          (maximum_frequency_excursion > 0.0001) ||
+          (maximum_locked_step > 0.0001) ||
+          (maximum_phase_step <= 0.0) ||
           (fabs(phase * 180.0 / TEST_PI) > 3.0))
              ? 1
              : 0;
@@ -771,6 +906,14 @@ int main(void)
   failures += run_change_tolerance_multiplier_case(2U);
   failures += run_low_frequency_bias_case(1000.0, 2.0);
   failures += run_low_frequency_bias_case(4000.0, 3.0);
+  /*
+   * These two near-70 kHz values place the target exactly halfway between
+   * adjacent 1 GHz-SYSCLK FTWs, exercising the worst quantization residue.
+   */
+  failures += run_high_locked_stability_case(69999.9509379, 1U);
+  failures += run_high_locked_stability_case(70000.0091456, 2U);
+  failures += run_high_locked_stability_case(100000.0, 1U);
+  failures += run_high_locked_stability_case(100000.0, 2U);
   if (failures != 0) {
     fprintf(stderr, "phase-lock tests failed: %d\n", failures);
     return EXIT_FAILURE;

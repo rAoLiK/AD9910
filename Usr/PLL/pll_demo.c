@@ -91,16 +91,30 @@ static bool PLL_Demo_ApplyDDS(float frequency_hz,
   if ((exact_ftw < 0.0) || (exact_ftw > 4294967295.0)) {
     return false;
   }
-  ftw = (uint32_t)exact_ftw;
-  fractional_ftw = exact_ftw - (double)ftw;
-  if (force) {
+  if (!force && output_enabled &&
+      s_context.control.frequency_hold_mode) {
+    /*
+     * A locked high-frequency output must use one fixed FTW.  The normal
+     * fractional accumulator alternates adjacent words at 1 kHz; that improves
+     * average frequency resolution but is directly visible as output jitter.
+     * Residual sub-FTW phase drift is handled by the controller through POW.
+     */
+    ftw = (exact_ftw >= 4294967294.5)
+              ? UINT32_MAX
+              : (uint32_t)(exact_ftw + 0.5);
     s_context.ftw_fraction_accumulator = 0.0;
-  }
-  s_context.ftw_fraction_accumulator += fractional_ftw;
-  if ((s_context.ftw_fraction_accumulator >= 1.0) &&
-      (ftw != UINT32_MAX)) {
-    ftw++;
-    s_context.ftw_fraction_accumulator -= 1.0;
+  } else {
+    ftw = (uint32_t)exact_ftw;
+    fractional_ftw = exact_ftw - (double)ftw;
+    if (force) {
+      s_context.ftw_fraction_accumulator = 0.0;
+    }
+    s_context.ftw_fraction_accumulator += fractional_ftw;
+    if ((s_context.ftw_fraction_accumulator >= 1.0) &&
+        (ftw != UINT32_MAX)) {
+      ftw++;
+      s_context.ftw_fraction_accumulator -= 1.0;
+    }
   }
 
   /*
@@ -433,6 +447,8 @@ static void PLL_Demo_UpdateStatus(void)
   s_status.fine_mode = s_context.control.fine_mode;
   s_status.direct_phase_mode =
       s_context.control.direct_phase_mode;
+  s_status.frequency_hold_mode =
+      s_context.control.frequency_hold_mode;
   s_status.frequency_change_pending =
       s_context.control.frequency_change_pending;
   s_status.lock_band = (uint8_t)s_context.control.band;

@@ -14,7 +14,7 @@
 #define APP_COMMAND_QUEUE_MASK                 (APP_COMMAND_QUEUE_SIZE - 1U)
 #define APP_BUTTON_DEBOUNCE_MS                 (50UL)
 #define APP_SCOPE_VOLTS_PER_DIV                (0.5f)
-#define APP_DDS_FULL_SCALE_VPP_AFTER_GAIN      (4.2f)
+#define APP_DDS_FULL_SCALE_VPP_AFTER_GAIN      (4.432f)
 #define APP_FEEDBACK_INVERSION_DEG             (180.0f)
 #define APP_TASK1_OUTPUT_PHASE_DEG             (0.0f)
 #define APP_TASK2_OUTPUT_PHASE_DEG             (90.0f)

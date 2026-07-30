@@ -34,6 +34,7 @@ typedef struct {
   float output_scale;
   bool fine_mode;
   bool direct_phase_mode;
+  bool frequency_hold_mode;
   bool frequency_change_pending;
   uint8_t lock_band;
   uint16_t phase_pair_count;

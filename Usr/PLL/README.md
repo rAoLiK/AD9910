@@ -16,6 +16,11 @@
 
 - 相位误差经环形低通和 PI 环路转成 DDS 频率微调，不清相位累加器，
   避免控制过程人为跳相。
+- 参考输入达到约 68 kHz 后，捕获过程仍使用原 PI 环路；确认锁定并继续
+  稳定 150 ms 后固定为单一 FTW，停止相邻 FTW 的分数调制。剩余亚 FTW
+  相位漂移由带 0.2° 死区、单步不超过 0.06° 的 POW 微调维持，从而避免
+  70~100 kHz 锁定后的可见频率抽动。退出锁定或确认输入变频后自动恢复
+  原捕获环路。
 - DDS Profile 0 始终使用 `ASF = 0x3FFF` 满数字幅度（`STOP`/错误安全状态除外）。
 - 采样率自动设置为：
 
@@ -87,6 +92,9 @@ const pll_demo_status_t *PLL_Demo_GetStatus(void);
 状态快照中 `dma_overrun_count/adc_error_count/dds_error_count` 均应
 长期为 0。若 DMA overrun 增长，
 说明主循环来不及消费 DMA 半缓冲，应使用 Release 优化或降低最高采样率。
+高频锁定稳定后 `frequency_hold_mode` 应为 `true`，同时
+`frequency_step_hz` 保持为 0；若它退出，说明系统检测到掉锁、输入变频
+或参考频率已经下降到约 65 kHz 以下。
 
 ## 频率范围
 
@@ -108,6 +116,8 @@ N × Fref < 0.45 × Fs
    确认状态由 `SEARCH -> ACQUIRE -> LOCKED`。
 3. 示波器 XY 模式观察 1× 莉萨如图，改变 `PHASE`，图形应稳定旋转后停止。
 4. 配置 MUL=2，确认 DDS 频率为输入两倍；观察稳定的二倍频莉萨如图。
+   在 70 kHz 和 100 kHz 输入下等待 `frequency_hold_mode=1`，确认锁定后
+   `frequency_step_hz=0` 且频率读数无可视跳动。
 5. 改变输入频率，确认状态快照中采样率随 `24 × N × Fref` 调整，
    且错误计数不增长。
 6. 若稳态仍有可见抖动，先校正两路模拟前端延时/幅度，再微调
