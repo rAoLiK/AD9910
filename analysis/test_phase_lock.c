@@ -1,4 +1,5 @@
 #include "lock_controller.h"
+#include "phase_compensation.h"
 #include "phase_detector.h"
 
 #include <math.h>
@@ -302,6 +303,129 @@ static double wrap_radians(double radians)
     radians += 2.0 * TEST_PI;
   }
   return radians;
+}
+
+static int run_phase_compensation_table_case(void)
+{
+  static const double frequencies[] = {
+      1000.0, 5000.0, 10000.0, 15000.0, 20000.0, 25000.0,
+      30000.0, 35000.0, 40000.0, 45000.0, 50000.0, 55000.0,
+      60000.0, 65000.0, 70000.0, 75000.0, 80000.0, 85000.0,
+      90000.0, 95000.0, 100000.0
+  };
+  static const double expected_1x[] = {
+      -0.13, 0.87, 1.47, 1.76, 2.10, 2.32, 2.40,
+      2.59, 2.66, 2.47, 2.98, 4.03, 4.45, 4.16,
+      3.88, 3.34, 3.44, 3.93, 4.03, 4.15, 5.24
+  };
+  static const double expected_2x[] = {
+      0.10, 1.00, 1.72, 1.77, 1.80, 1.92, 1.99,
+      2.12, 2.28, 2.31, 2.54, 3.17, 3.56, 3.36,
+      3.93, 3.78, 4.10, 4.47, 4.81, 4.88, 4.95
+  };
+  const size_t point_count =
+      sizeof(frequencies) / sizeof(frequencies[0]);
+  double maximum_error = 0.0;
+  size_t index;
+
+  for (index = 0U; index < point_count; ++index) {
+    double actual_1x =
+        (double)PhaseCompensation_GetDeg(
+            (float)frequencies[index], 1U);
+    double actual_2x =
+        (double)PhaseCompensation_GetDeg(
+            (float)frequencies[index], 2U);
+    double error_1x = fabs(actual_1x - expected_1x[index]);
+    double error_2x = fabs(actual_2x - expected_2x[index]);
+
+    if (error_1x > maximum_error) {
+      maximum_error = error_1x;
+    }
+    if (error_2x > maximum_error) {
+      maximum_error = error_2x;
+    }
+    if ((index + 1U) < point_count) {
+      float midpoint =
+          (float)(0.5 *
+                  (frequencies[index] + frequencies[index + 1U]));
+      double midpoint_1x =
+          (double)PhaseCompensation_GetDeg(midpoint, 1U);
+      double midpoint_2x =
+          (double)PhaseCompensation_GetDeg(midpoint, 2U);
+      double expected_midpoint_1x =
+          0.5 * (expected_1x[index] + expected_1x[index + 1U]);
+      double expected_midpoint_2x =
+          0.5 * (expected_2x[index] + expected_2x[index + 1U]);
+
+      if (fabs(midpoint_1x - expected_midpoint_1x) >
+              maximum_error) {
+        maximum_error =
+            fabs(midpoint_1x - expected_midpoint_1x);
+      }
+      if (fabs(midpoint_2x - expected_midpoint_2x) >
+              maximum_error) {
+        maximum_error =
+            fabs(midpoint_2x - expected_midpoint_2x);
+      }
+    }
+  }
+
+  printf("phase compensation: 45k 1x=%.3fdeg 2x=%.3fdeg "
+         "max_error=%.6fdeg\n",
+         (double)PhaseCompensation_GetDeg(45000.0f, 1U),
+         (double)PhaseCompensation_GetDeg(45000.0f, 2U),
+         maximum_error);
+  return ((maximum_error > 0.0001) ||
+          (fabs((double)PhaseCompensation_GetDeg(500.0f, 1U) +
+                0.13) > 0.0001) ||
+          (fabs((double)PhaseCompensation_GetDeg(120000.0f, 2U) -
+                4.95) > 0.0001) ||
+          (PhaseCompensation_GetDeg(45000.0f, 3U) != 0.0f))
+             ? 1
+             : 0;
+}
+
+static int run_tracked_target_case(void)
+{
+  lock_controller_t controller;
+  lock_controller_output_t output = {0};
+  phase_measurement_t measurement = {
+      .signal_valid = true,
+      .frequency_valid = true,
+      .phase_valid = true,
+      .phase_updated = true,
+      .reference_frequency_hz = 45000.0f,
+      .generalized_phase_rad =
+          2.31f * (float)TEST_PI / 180.0f,
+      .phase_quality = 0.95f
+  };
+  unsigned int index;
+
+  LockController_Init(&controller);
+  if (!LockController_SetMultiplier(&controller, 2U)) {
+    return 1;
+  }
+  LockController_TrackTargetPhaseDeg(&controller, 2.31f);
+  for (index = 0U; index < 80U; ++index) {
+    LockController_Step(&controller, &measurement, 0.001f, &output);
+  }
+  if (!output.phase_locked) {
+    return 1;
+  }
+
+  LockController_TrackTargetPhaseDeg(&controller, 2.54f);
+  measurement.generalized_phase_rad =
+      2.54f * (float)TEST_PI / 180.0f;
+  LockController_Step(&controller, &measurement, 0.001f, &output);
+
+  printf("tracked target: target=%.3fdeg locked=%u\n",
+         (double)LockController_GetTargetPhaseDeg(&controller),
+         output.phase_locked ? 1U : 0U);
+  return (!output.phase_locked ||
+          (fabs((double)LockController_GetTargetPhaseDeg(&controller) -
+                2.54) > 0.001))
+             ? 1
+             : 0;
 }
 
 static int run_exact_band_boundary_case(void)
@@ -1059,6 +1183,8 @@ int main(void)
    */
   failures += run_45khz_x2_detector_case(2400000.0, 2.5);
   failures += run_45khz_x2_detector_case(72000000.0 / 33.0, 1.0);
+  failures += run_phase_compensation_table_case();
+  failures += run_tracked_target_case();
   failures += run_controller_case();
   failures += run_exact_band_boundary_case();
   failures += run_100khz_gradient_case();

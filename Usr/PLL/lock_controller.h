@@ -70,6 +70,9 @@ bool LockController_SetMultiplier(lock_controller_t *controller,
                                   uint8_t multiplier);
 void LockController_SetTargetPhaseDeg(lock_controller_t *controller,
                                       float phase_deg);
+/* Update a slowly varying calibrated target without resetting loop state. */
+void LockController_TrackTargetPhaseDeg(lock_controller_t *controller,
+                                        float phase_deg);
 uint8_t LockController_GetMultiplier(const lock_controller_t *controller);
 float LockController_GetTargetPhaseDeg(const lock_controller_t *controller);
 void LockController_ResetLoop(lock_controller_t *controller);

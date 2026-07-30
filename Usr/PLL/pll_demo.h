@@ -22,7 +22,10 @@ typedef enum {
 typedef struct {
   pll_demo_state_t state;
   uint8_t multiplier;
+  /* target_phase_deg is the effective target after calibration. */
   float target_phase_deg;
+  float nominal_target_phase_deg;
+  float phase_compensation_deg;
   float reference_frequency_hz;
   float dds_frequency_hz;
   float measured_phase_deg;

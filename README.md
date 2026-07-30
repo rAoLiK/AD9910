@@ -49,6 +49,7 @@ TIM2 TRGO
   -> DMA2 Stream0 循环双半缓冲
   -> ADC DMA ISR 只发布 half/full-ready
   -> 主循环 PhaseDetector_Process
+  -> 主循环 PhaseCompensation_GetDeg（查表/线性插值）
   -> 主循环 LockController_Step
   -> 主循环 PLL_Demo_ServiceDDS
   -> AD9910 Profile 0（FTW + POW + ASF）
@@ -281,6 +282,59 @@ MID 和 HIGH 当前 PI 数值相同，分频段仍保留，便于后续独立标
 圆旋向、∞ 方向或前端反相错误应在这些目标参数中修正，不要用 PI 参数
 掩盖固定相位偏差。
 
+### 4.6 频率—相位补偿
+
+标定源：[ref/频率偏差.xlsx](ref/频率偏差.xlsx)
+
+计算结果：[outputs/phase-comp-20260730/频率偏差_补偿计算.xlsx](outputs/phase-comp-20260730/频率偏差_补偿计算.xlsx)
+
+固件表和插值：[Usr/PLL/phase_compensation.c](Usr/PLL/phase_compensation.c)
+
+示波器数据采用 CH1 为基准，表中相位定义为：
+
+```text
+scope_phase = N * phi_CH1 - phi_output
+```
+
+因此 1× 理论相位差为 -90°，2× 理论广义相位差为 0°。固件检测量为
+`phi_ADC2 - N * phi_ADC1`，且 ADC2 反馈相对真实输出反相 180°，所以加到
+反馈锁相目标的补偿不是“理论−实际”，而是：
+
+```text
+compensation_deg = measured_scope_phase - theoretical_scope_phase
+effective_feedback_target =
+    nominal_feedback_target + compensation_deg
+```
+
+若符号写反，原偏差会被加倍。代表性标定点：
+
+| 参考频率 | 1×补偿 | 2×补偿 |
+|---:|---:|---:|
+| 1 kHz | -0.13° | +0.10° |
+| 45 kHz | +2.47° | +2.31° |
+| 60 kHz | +4.45° | +3.56° |
+| 100 kHz | +5.24° | +4.95° |
+
+相邻标定点 `(fi, Ci)`、`(fi+1, Ci+1)` 之间采用线性插值：
+
+```text
+C(f) = Ci + (f - fi) / (fi+1 - fi) * (Ci+1 - Ci)
+```
+
+低于 1 kHz 或高于 100 kHz 时钳位到最近端点，不做外推。补偿使用参考
+输入频率查表，1×/2× 各自使用独立列。`PLL_Demo` 仅在判频有效时更新
+补偿，并通过 `LockController_TrackTargetPhaseDeg()` 平滑更新目标，不清空
+PI、频率积分或锁定状态。
+
+`pll_demo_status_t` 中：
+
+- `nominal_target_phase_deg`：应用层配置的未补偿反馈目标；
+- `phase_compensation_deg`：当前频率插值得到的补偿；
+- `target_phase_deg`：角度环绕后的最终有效反馈目标。
+
+例如 45 kHz×2 的名义反馈目标为 180°，加 2.31° 后等价显示为
+-177.69°，不是符号错误。
+
 ## 5. 推荐调参顺序
 
 每次只改一组参数，并同时记录 1×/2×、锁定时间、稳态峰峰相位误差、
@@ -335,7 +389,8 @@ LOCK_HIGH_HOLD_*
 ```powershell
 gcc -std=c11 -Wall -Wextra -Werror -IUsr\PLL `
   analysis\test_phase_lock.c `
-  Usr\PLL\phase_detector.c Usr\PLL\lock_controller.c `
+  Usr\PLL\phase_detector.c Usr\PLL\phase_compensation.c `
+  Usr\PLL\lock_controller.c `
   -lm -o build\host-tests\test_phase_lock.exe
 
 .\build\host-tests\test_phase_lock.exe
@@ -465,3 +520,29 @@ DMA overrun，必须记录读取前后的计数增量，不能把调试暂停引
   `search_restart=0`，ADC/DDS 错误均为 0；未再观察到周期性状态抽动。
 - 本次屏幕串口电气回传仍未重新验证；SWD 仅注入应用层同源命令。低频
   参数与主机回归未退化，但完整低频实板矩阵仍需信号源逐点切换确认。
+
+## 10. 频率—相位补偿验证记录
+
+- 原始工作簿共 21 个标定点，覆盖 1–100 kHz。新增“补偿计算”工作表，
+  以公式给出理论值、`实际−理论`补偿值、有效反馈目标和补偿后预测值；
+  原始 `Sheet1` 保持不变，公式错误扫描为 0。
+- 主机回归逐点核对全部 21 个 1×/2× 补偿值，并检查每个相邻区间中点
+  的线性插值、上下端点钳位和无效倍率；最大数值误差小于 0.0001°。
+- Release ELF 为 35.45 KiB，STM32CubeProgrammer 下载、校验和复位成功。
+- 烧录后仍从默认菜单通过应用命令队列执行
+  `ENTER_TASK14 -> SELECT_TASK3/SELECT_TASK2`，没有绕过应用状态机直接
+  强制启动 PLL。
+- 板上输入最初从约 93.995 kHz 变化到 97.995 kHz；变频期间补偿从
+  4.86594°连续更新到 4.92193°，证明实际运行使用了区间插值。扫频造成
+  的重锚/重搜不能作为固定频率稳定性结论。
+- 输入停在约 97.996 kHz 后，2× 补偿约 4.92195°，有效反馈目标约
+  -175.078°，内部相位误差约 -0.296°；自由运行 30 s，重锚、重搜、
+  掉锁和保持退出计数均未增长。
+- 切换 1× 后，约 97.994 kHz 的补偿约 4.80261°，有效反馈目标约
+  -85.197°，内部相位误差约 +0.221°；自由运行 30 s，同一组业务计数
+  均未增长。
+- 每次 SWD 终点快照使 `dma_overrun_count` 增加 1，属于停核读取副作用；
+  ADC/DDS 错误保持为 0。
+- 上述验证确认补偿查表、插值、角度符号和闭环稳定性。最终真实输出相位
+  是否回到 -90°/0°仍应由示波器按 CH1 基准重新测量；若模拟链路或探头
+  配置改变，应重新生成标定表，不能继续沿用当前补偿。

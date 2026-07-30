@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/AD9910/ad9910.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/dual_adc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/phase_detector.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/phase_compensation.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/lock_controller.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL/pll_demo.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/SCREEN_TJC/tjc_protocol_parser.c

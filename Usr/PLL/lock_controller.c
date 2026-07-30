@@ -216,6 +216,16 @@ void LockController_SetTargetPhaseDeg(lock_controller_t *controller,
   LockController_ResetPhaseTracking(controller);
 }
 
+void LockController_TrackTargetPhaseDeg(lock_controller_t *controller,
+                                        float phase_deg)
+{
+  if (controller == NULL) {
+    return;
+  }
+  controller->target_phase_rad =
+      LockController_Wrap(phase_deg * LOCK_PI_F / 180.0f);
+}
+
 uint8_t LockController_GetMultiplier(const lock_controller_t *controller)
 {
   return (controller == NULL) ? 1U : controller->multiplier;

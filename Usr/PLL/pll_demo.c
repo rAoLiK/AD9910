@@ -3,6 +3,7 @@
 #include "adc.h"
 #include "dual_adc.h"
 #include "lock_controller.h"
+#include "phase_compensation.h"
 #include "phase_detector.h"
 #include "pll_config.h"
 #include "tim.h"
@@ -45,6 +46,8 @@ typedef struct {
   double ftw_fraction_accumulator;
   float dds_frequency_hz;
   float dds_phase_offset_rad;
+  float nominal_target_phase_deg;
+  float phase_compensation_deg;
   float output_scale;
   bool initialized;
   bool running;
@@ -307,6 +310,17 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
       LockController_GetMultiplier(&s_context.controller),
       &s_context.measurement);
 
+  if (s_context.measurement.frequency_valid) {
+    s_context.phase_compensation_deg =
+        PhaseCompensation_GetDeg(
+            s_context.measurement.reference_frequency_hz,
+            LockController_GetMultiplier(&s_context.controller));
+    LockController_TrackTargetPhaseDeg(
+        &s_context.controller,
+        s_context.nominal_target_phase_deg +
+            s_context.phase_compensation_deg);
+  }
+
   elapsed_seconds =
       (float)s_context.active_half_pair_count /
       (float)s_context.actual_sample_rate_hz;
@@ -482,6 +496,10 @@ static void PLL_Demo_UpdateStatus(void)
       LockController_GetMultiplier(&s_context.controller);
   s_status.target_phase_deg =
       LockController_GetTargetPhaseDeg(&s_context.controller);
+  s_status.nominal_target_phase_deg =
+      s_context.nominal_target_phase_deg;
+  s_status.phase_compensation_deg =
+      s_context.phase_compensation_deg;
   s_status.reference_frequency_hz =
       s_context.measurement.reference_frequency_hz;
   s_status.dds_frequency_hz = s_context.dds_frequency_hz;
@@ -569,9 +587,11 @@ HAL_StatusTypeDef PLL_Demo_Configure(uint8_t multiplier,
           &s_context.controller, multiplier)) {
     return HAL_ERROR;
   }
-  if (fabsf(LockController_GetTargetPhaseDeg(
-                &s_context.controller) -
-            target_phase_deg) > 0.0001f) {
+  if ((old_multiplier != multiplier) ||
+      (fabsf(s_context.nominal_target_phase_deg -
+             target_phase_deg) > 0.0001f)) {
+    s_context.nominal_target_phase_deg = target_phase_deg;
+    s_context.phase_compensation_deg = 0.0f;
     LockController_SetTargetPhaseDeg(
         &s_context.controller, target_phase_deg);
   }
