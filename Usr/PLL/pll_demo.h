@@ -47,6 +47,10 @@ typedef struct {
   uint32_t dds_error_count;
   uint32_t frequency_reanchor_count;
   uint32_t search_restart_count;
+  uint32_t lock_loss_count;
+  uint32_t frequency_hold_enter_count;
+  uint32_t frequency_hold_exit_count;
+  uint32_t acquire_restart_suppressed_count;
 } pll_demo_status_t;
 
 HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds);

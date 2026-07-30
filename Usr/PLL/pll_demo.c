@@ -4,6 +4,7 @@
 #include "dual_adc.h"
 #include "lock_controller.h"
 #include "phase_detector.h"
+#include "pll_config.h"
 #include "tim.h"
 
 #include <math.h>
@@ -23,6 +24,7 @@
 #define PLL_ACQUIRE_RESTART_MS        (1000UL)
 #define PLL_LOW_ACQUIRE_RESTART_MS    (3000UL)
 #define PLL_CHANGE_PENDING_RESTART_MS (600UL)
+#define PLL_HIGH_NEAR_LOCK_ERROR_DEG  (30.0f)
 #define PLL_DEG_PER_RAD               (57.29577951308232f)
 
 typedef struct {
@@ -49,6 +51,7 @@ typedef struct {
   bool dds_output_enabled;
   bool have_ftw;
   bool frequency_change_pending_seen;
+  bool frequency_hold_observed;
 } pll_demo_context_t;
 
 static pll_demo_context_t s_context;
@@ -291,6 +294,7 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
 {
   float elapsed_seconds;
   uint32_t now = HAL_GetTick();
+  pll_demo_state_t previous_state = s_status.state;
   pll_demo_state_t next_state;
 
   PhaseDetector_Process(
@@ -307,7 +311,21 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
                       elapsed_seconds,
                       &s_context.control);
 
+  if (s_context.control.frequency_hold_mode !=
+      s_context.frequency_hold_observed) {
+    if (s_context.control.frequency_hold_mode) {
+      s_status.frequency_hold_enter_count++;
+    } else {
+      s_status.frequency_hold_exit_count++;
+    }
+    s_context.frequency_hold_observed =
+        s_context.control.frequency_hold_mode;
+  }
+
   if (!s_context.measurement.frequency_valid) {
+    if (previous_state == PLL_DEMO_LOCKED) {
+      s_status.lock_loss_count++;
+    }
     s_status.state = PLL_DEMO_SEARCHING;
     return;
   }
@@ -337,6 +355,10 @@ static void PLL_Demo_ProcessSamples(const uint32_t *samples)
   next_state = s_context.control.phase_locked
                    ? PLL_DEMO_LOCKED
                    : PLL_DEMO_ACQUIRING;
+  if ((previous_state == PLL_DEMO_LOCKED) &&
+      (next_state != PLL_DEMO_LOCKED)) {
+    s_status.lock_loss_count++;
+  }
   if ((next_state == PLL_DEMO_ACQUIRING) &&
       (s_status.state != PLL_DEMO_ACQUIRING)) {
     s_context.acquire_start_tick = now;
@@ -398,6 +420,28 @@ static void PLL_Demo_ProcessAcquireWatchdog(void)
   bool acquire_timed_out =
       (s_status.state == PLL_DEMO_ACQUIRING) &&
       ((uint32_t)(now - s_context.acquire_start_tick) >= timeout_ms);
+  bool high_frequency_near_lock =
+      s_context.measurement.frequency_valid &&
+      s_context.measurement.phase_valid &&
+      (s_context.measurement.reference_frequency_hz >=
+       PLL_HIGH_HOLD_ENTER_HZ) &&
+      (fabsf(s_context.control.phase_error_rad * PLL_DEG_PER_RAD) <=
+       PLL_HIGH_NEAR_LOCK_ERROR_DEG);
+
+  /*
+   * At high input frequencies the raw phase estimate is noisier.  Requiring
+   * 50 ms continuously inside the 3-degree lock window can therefore keep a
+   * genuinely converging loop in ACQUIRE until the old one-second watchdog
+   * expires.  A full estimator reset at that point is the large periodic jerk
+   * seen on the board.  If frequency and phase are both valid and the filtered
+   * error is already near lock, keep the PI state and extend only this
+   * watchdog window.  Source-change timeout remains authoritative.
+   */
+  if (acquire_timed_out && high_frequency_near_lock) {
+    s_context.acquire_start_tick = now;
+    s_status.acquire_restart_suppressed_count++;
+    acquire_timed_out = false;
+  }
 
   if (!s_context.running ||
       (!change_timed_out && !acquire_timed_out)) {
@@ -528,6 +572,7 @@ HAL_StatusTypeDef PLL_Demo_Configure(uint8_t multiplier,
     memset(&s_context.measurement, 0, sizeof(s_context.measurement));
     memset(&s_context.control, 0, sizeof(s_context.control));
     s_context.frequency_change_pending_seen = false;
+    s_context.frequency_hold_observed = false;
     if (s_context.running &&
         !PLL_Demo_StartSampling(PLL_SEARCH_HIGH_RATE_HZ, false)) {
       PLL_Demo_EnterError("CONFIG_RATE");
@@ -568,6 +613,7 @@ HAL_StatusTypeDef PLL_Demo_Start(void)
   memset(&s_context.control, 0, sizeof(s_context.control));
   s_context.dds_phase_offset_rad = 0.0f;
   s_context.frequency_change_pending_seen = false;
+  s_context.frequency_hold_observed = false;
   if (!PLL_Demo_ApplyDDS(
           (s_context.dds_frequency_hz > 0.0f)
               ? s_context.dds_frequency_hz
@@ -603,6 +649,7 @@ HAL_StatusTypeDef PLL_Demo_Stop(void)
   s_context.actual_sample_rate_hz = 0U;
   s_context.active_half_pair_count = 0U;
   s_context.frequency_change_pending_seen = false;
+  s_context.frequency_hold_observed = false;
   memset(&s_context.measurement, 0, sizeof(s_context.measurement));
   memset(&s_context.control, 0, sizeof(s_context.control));
   dds_ok = PLL_Demo_ApplyDDS(

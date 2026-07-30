@@ -468,7 +468,7 @@ static int run_high_frequency_jitter_case(void)
          phase * 180.0 / TEST_PI,
          output.phase_locked ? 1U : 0U);
   return (!output.command_valid || !output.phase_locked ||
-          output.frequency_hold_mode ||
+          !output.frequency_hold_mode ||
           (reanchor_count != 0U) ||
           (fabs((double)output.dds_frequency_hz -
                 input_frequency) > 0.10) ||
@@ -773,8 +773,10 @@ static int run_high_locked_stability_case(double reference_frequency,
   double maximum_frequency_excursion = 0.0;
   double maximum_locked_step = 0.0;
   double maximum_phase_step = 0.0;
+  double first_hold_drop_time = -1.0;
   unsigned int hold_drop_count = 0U;
   bool hold_window_started = false;
+  bool previous_hold_mode = false;
 
   if (sample_rate > 2400000.0) {
     sample_rate = 2400000.0;
@@ -822,10 +824,13 @@ static int run_high_locked_stability_case(double reference_frequency,
     if (output.frequency_hold_mode && (hold_time < 0.0)) {
       hold_time = elapsed;
     }
-    if ((hold_time >= 0.0) && output.phase_locked &&
-        !output.frequency_hold_mode) {
+    if (previous_hold_mode && !output.frequency_hold_mode) {
       hold_drop_count++;
+      if (first_hold_drop_time < 0.0) {
+        first_hold_drop_time = elapsed;
+      }
     }
+    previous_hold_mode = output.frequency_hold_mode;
     if (output.frequency_hold_mode &&
         (hold_time >= 0.0) &&
         (elapsed >= (hold_time + 0.05))) {
@@ -850,12 +855,12 @@ static int run_high_locked_stability_case(double reference_frequency,
     }
   }
 
-  printf("%.0fk/%ux locked stability: lock=%.3fs hold=%.3fs drops=%u "
+  printf("%.0fk/%ux locked stability: lock=%.3fs hold=%.3fs drops=%u@%.3fs "
          "freq_excursion=%.4fHz step<=%.4fHz "
          "phase_step<=%.4fdeg phase=%7.3f locked=%u\n",
          reference_frequency / 1000.0,
          (unsigned int)multiplier, lock_time, hold_time,
-         hold_drop_count,
+         hold_drop_count, first_hold_drop_time,
          maximum_frequency_excursion, maximum_locked_step,
          maximum_phase_step * 180.0 / TEST_PI,
          phase * 180.0 / TEST_PI,
@@ -906,6 +911,8 @@ int main(void)
   failures += run_change_tolerance_multiplier_case(2U);
   failures += run_low_frequency_bias_case(1000.0, 2.0);
   failures += run_low_frequency_bias_case(4000.0, 3.0);
+  failures += run_high_locked_stability_case(60000.0, 1U);
+  failures += run_high_locked_stability_case(60000.0, 2U);
   /*
    * These two near-70 kHz values place the target exactly halfway between
    * adjacent 1 GHz-SYSCLK FTWs, exercising the worst quantization residue.

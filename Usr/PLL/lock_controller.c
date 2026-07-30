@@ -31,13 +31,11 @@
 #define LOCK_PHASE_RATE_LIMIT_HZ          (500.0f)
 #define LOCK_LOW_RATE_FILTER_TAU_S        (0.020f)
 #define LOCK_LOW_RATE_LEARN_TAU_S         (0.020f)
-#define LOCK_HIGH_HOLD_INPUT_HZ           (68000.0f)
-#define LOCK_HIGH_HOLD_EXIT_HZ            (65000.0f)
 #define LOCK_HIGH_HOLD_SETTLE_S           (0.150f)
 #define LOCK_HIGH_HOLD_FILTER_TAU_S       (0.020f)
 #define LOCK_HIGH_HOLD_PHASE_DEADBAND_RAD (0.20f * LOCK_PI_F / 180.0f)
-#define LOCK_HIGH_HOLD_PHASE_GAIN         (0.25f)
-#define LOCK_HIGH_HOLD_PHASE_STEP_RAD     (0.06f * LOCK_PI_F / 180.0f)
+#define LOCK_HIGH_HOLD_PHASE_GAIN         (0.35f)
+#define LOCK_HIGH_HOLD_PHASE_STEP_RAD     (0.08f * LOCK_PI_F / 180.0f)
 #define LOCK_FREQUENCY_MISSING_RESET_S    (0.100f)
 #define LOCK_MAX_DDS_FREQUENCY_HZ         (400000000.0f)
 #define LOCK_LOW_ENTER_HZ                 (35000.0f)
@@ -423,7 +421,7 @@ void LockController_Step(lock_controller_t *controller,
       if (!controller->phase_locked ||
           controller->frequency_change_pending ||
           (measurement->reference_frequency_hz <
-           LOCK_HIGH_HOLD_EXIT_HZ)) {
+           PLL_HIGH_HOLD_EXIT_HZ)) {
         controller->frequency_hold_mode = false;
       }
     } else if (controller->phase_locked &&
@@ -431,7 +429,7 @@ void LockController_Step(lock_controller_t *controller,
                (controller->locked_time_s >=
                 LOCK_HIGH_HOLD_SETTLE_S) &&
                (measurement->reference_frequency_hz >=
-                LOCK_HIGH_HOLD_INPUT_HZ)) {
+                PLL_HIGH_HOLD_ENTER_HZ)) {
       controller->frequency_hold_mode = true;
     }
     high_frequency_hold = controller->frequency_hold_mode;
