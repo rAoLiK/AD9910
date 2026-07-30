@@ -69,10 +69,11 @@ app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
 Task4 保持最近选择的图形类型：
 
 - 最近是 Task2/Task3：锁相环继续运行，只更新 ASF，不重新判频。
-- 最近是 Task1：物理直通无法调幅，因此切到 DDS 1×同相锁定，再按 ASF
-  生成相同的对角线图形。
+- 最近是 Task1：选择 2/4/6 div 时切到 DDS 1×同相锁定并用 ASF 调幅；
+  选择 8 div 时停止 PLL 并切回物理直通，不使用 DDS 输出。
 - 最近类型跨菜单安全态保留；再次从 page0 b1 进入 Task1-4 后，直接按
-  幅度键会按该类型重新启动锁相。上电后尚无最近类型时仍拒绝幅度命令。
+  幅度键时，Task1 的 8 div 直接恢复物理直通，其余组合按该类型启动锁相。
+  上电后尚无最近类型时仍拒绝幅度命令。
 - 尚未选择 Task1/2/3 时按幅度键会被拒绝并累计
   `rejected_command_count`。
 
@@ -88,7 +89,7 @@ ADC2 反馈与真实 Y 输出固定反相 180°。当前选择：
 
 | 图形 | multiplier | 真实输出目标 | 反馈锁相目标 |
 |---|---:|---:|---:|
-| Task1 DDS 调幅 | 1 | 0° | 180° |
+| Task1 的 2/4/6 div DDS 调幅 | 1 | 0° | 180° |
 | Task2 圆 | 1 | +90° | -90° |
 | Task3 ∞ | 2 | 0°广义相位 | 180° |
 
@@ -220,7 +221,9 @@ RAM:   24,984 bytes
 2. page0 b1 进入 page1，再由 page1 b7 进入 Task1，直通对角线正确。
 3. page1 b1 在 1-100 kHz 任意输入下进入 1×锁定并显示圆。
 4. page1 b2 进入 2×锁定并显示上下左右对称的“∞”。
-5. Task1/2/3 后依次选择 2/4/6/8 div，实测误差不超过 0.2 div。
+5. Task1 后选择 2/4/6 div 时确认走 DDS 且幅度误差不超过 0.2 div；
+   选择 8 div 时确认 PLL 停止、PE5 切到物理直通。Task2/3 的
+   2/4/6/8 div 均保持 DDS 锁相。
 6. 切换输入频率，确认重新捕获且没有长期停留
    `frequency_change_pending`。
 7. page2 中 PA0/PB9/PB8 更新 `t2` 占位状态；其他页面按键无作用。
@@ -233,16 +236,19 @@ Task5 摄像头识别、声光提示和 10 s/5 s 自动流程尚未实现；当�
 
 ## 12. 本次集成验证记录
 
-2026-07-29 已完成：
+2026-07-30 已完成：
 
 - `analysis/test_phase_lock.c` 全部通过，覆盖 1×/2×、分频段检测、切频
   重捕获、倍率一致的输入域变化门限和低频偏差场景。
 - `analysis/test_app_core.c` 全部通过，覆盖 PRESS 映射、Task1 直通、
-  Task1 调幅切换 DDS、Task2 调幅不重启、Task5 按键占位和错误安全收敛。
-- `cmake --build build/cube-release` 成功；最终资源占用为 FLASH 35,216
-  bytes、RAM 24,984 bytes。
+  Task1 的 2 div 切换 DDS 及 8 div 返回物理直通、Task2 的 8 div
+  仍保持 DDS、Task5 按键占位和错误安全收敛。
+- `cmake --build build/cube-release` 成功；最终资源占用为 FLASH 36,336
+  bytes、RAM 25,312 bytes。
 - STM32CubeProgrammer 2.23.0 通过 SWD 将 `AD9910.elf` 写入
-  STM32F42xxx/F43xxx，下载校验成功并完成软件复位；连接电压 3.24 V。
+  STM32F42xxx/F43xxx，下载校验成功并完成软件复位；连接电压 3.25 V。
+- 板上经应用命令队列执行 Task1 `2 div -> 8 div`：前者为
+  `LOCKED`/DDS/采样运行，后者为 `DIRECT`/物理直通/PLL 停止/采样停止。
 
 当前主机没有枚举原自动板测使用的 COM10，因此不能从 PC 注入 TJC
 触摸帧，也不能复用已经移除的 ASCII CLI 读取锁相状态。第 11 节中需要

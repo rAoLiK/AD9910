@@ -60,6 +60,8 @@ TJC UART ISR -> 字节环 -> 主循环协议解析 -> HMI 映射
 
 上电默认状态是 `MENU_SAFE`，不是闭环状态。必须先进入 `TASK14`，再选择：
 
+- Task1：默认和 8 div 均为继电器物理直通，不使用 DDS；仅 2/4/6 div
+  为实现调幅而启动 1×同相 DDS 锁定。
 - Task2：1×、实际输出目标 +90°，反馈目标 -90°。
 - Task3：2×、实际广义相位目标 0°，反馈目标 180°。
 
@@ -273,7 +275,7 @@ MID 和 HIGH 当前 PI 数值相同，分频段仍保留，便于后续独立标
 | 参数 | 当前值 | 含义 |
 |---|---:|---|
 | `APP_FEEDBACK_INVERSION_DEG` | 180° | ADC2 反馈通道相对真实输出的固定反相 |
-| `APP_TASK1_OUTPUT_PHASE_DEG` | 0° | Task1 DDS 调幅时真实输出目标 |
+| `APP_TASK1_OUTPUT_PHASE_DEG` | 0° | Task1 选择 2/4/6 div、使用 DDS 调幅时的真实输出目标；8 div 不使用 DDS |
 | `APP_TASK2_OUTPUT_PHASE_DEG` | 90° | Task2 圆的真实输出目标 |
 | `APP_TASK3_GENERALIZED_PHASE_DEG` | 0° | Task3 二倍频广义相位目标 |
 | `APP_SCOPE_VOLTS_PER_DIV` | 0.5 V/div | 示波器幅度换算 |
@@ -546,3 +548,17 @@ DMA overrun，必须记录读取前后的计数增量，不能把调试暂停引
 - 上述验证确认补偿查表、插值、角度符号和闭环稳定性。最终真实输出相位
   是否回到 -90°/0°仍应由示波器按 CH1 基准重新测量；若模拟链路或探头
   配置改变，应重新生成标定表，不能继续沿用当前补偿。
+
+## 11. Task1 8 div 物理直通验证记录
+
+- `AppCore_SetAmplitude` 在“当前波形为 Task1 且幅度为 8 div”时统一进入
+  `AppCore_RunDirect`；这会经板级端口停止 PLL、停止采样并切换继电器，
+  不是只修改界面状态。
+- 主机测试覆盖 Task1 `2 div -> 8 div`：2 div 启动 DDS 锁相，8 div
+  返回物理直通；另验证 Task2 的 8 div 仍保持 DDS，不受该分支影响。
+- Release 固件构建成功，FLASH 36,336 bytes、RAM 25,312 bytes；
+  STM32CubeProgrammer 下载、校验和复位成功，连接电压 3.25 V。
+- 板上通过屏幕映射同源的应用命令队列执行
+  `SELECT_TASK1 -> SET_2DIV -> SET_8DIV`。2 div 时应用为 `LOCKED`、
+  路径为 DDS、采样运行；8 div 后应用为 `DIRECT`、路径为物理直通、
+  PLL 为 `STOPPED`、采样停止。验证结束后开发板保持 Task1 8 div 直通。

@@ -83,6 +83,8 @@ static void TestHmiMap(void)
   assert(command == APP_COMMAND_SELECT_TASK1);
   assert(AppHmi_MapTouch(1U, 6U, APP_HMI_TOUCH_PRESS, &command));
   assert(command == APP_COMMAND_SET_AMPLITUDE_2DIV);
+  assert(AppHmi_MapTouch(1U, 9U, APP_HMI_TOUCH_PRESS, &command));
+  assert(command == APP_COMMAND_SET_AMPLITUDE_8DIV);
   assert(AppHmi_MapTouch(2U, 2U, APP_HMI_TOUCH_PRESS, &command));
   assert(command == APP_COMMAND_GO_MENU);
   assert(!AppHmi_MapTouch(2U, 3U, APP_HMI_TOUCH_PRESS, &command));
@@ -125,6 +127,15 @@ static void TestAppStateMachine(void)
   assert(fake.lock_count == 1U);
   assert(fake.waveform == APP_WAVEFORM_TASK1_LINE);
 
+  assert(AppCore_HandleCommand(
+      &core, APP_COMMAND_SET_AMPLITUDE_8DIV));
+  AppCore_GetStatus(&core, &status);
+  assert(status.activity == APP_ACTIVITY_DIRECT);
+  assert(status.amplitude_div == 8U);
+  assert(fake.direct_count == 2U);
+  assert(fake.lock_count == 1U);
+  assert(fake.amplitude_count == 0U);
+
   assert(AppCore_HandleCommand(&core, APP_COMMAND_SELECT_TASK2));
   assert(fake.waveform == APP_WAVEFORM_TASK2_CIRCLE);
   assert(fake.amplitude_div == 8U);
@@ -132,6 +143,13 @@ static void TestAppStateMachine(void)
       &core, APP_COMMAND_SET_AMPLITUDE_4DIV));
   assert(fake.amplitude_count == 1U);
   assert(fake.amplitude_div == 4U);
+  assert(AppCore_HandleCommand(
+      &core, APP_COMMAND_SET_AMPLITUDE_8DIV));
+  AppCore_GetStatus(&core, &status);
+  assert(status.activity == APP_ACTIVITY_LOCK_SEARCH);
+  assert(status.amplitude_div == 8U);
+  assert(fake.direct_count == 2U);
+  assert(fake.amplitude_count == 2U);
 
   assert(AppCore_HandleCommand(&core, APP_COMMAND_GO_MENU));
   AppCore_GetStatus(&core, &status);

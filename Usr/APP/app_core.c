@@ -119,10 +119,15 @@ static bool AppCore_SetAmplitude(app_core_t *core, uint8_t amplitude_div)
   }
 
   /*
-   * Task 1 itself is a physical relay bypass. Once an amplitude button is
-   * selected, reproduce the same in-phase line with the DDS so ASF can control
-   * its height. Task 2/3 keep their current lock and only change ASF.
+   * Task 1 at 8 div is the unscaled physical relay bypass. Its 2/4/6 div
+   * choices still use the DDS so ASF can reduce the height. Task 2/3 always
+   * keep their current DDS lock, including at 8 div.
    */
+  if ((core->status.waveform == APP_WAVEFORM_TASK1_LINE) &&
+      (amplitude_div == 8U)) {
+    return AppCore_RunDirect(core);
+  }
+
   if ((core->status.activity == APP_ACTIVITY_DIRECT) ||
       (core->status.activity == APP_ACTIVITY_IDLE)) {
     return AppCore_RunLock(core, core->status.waveform, amplitude_div);
