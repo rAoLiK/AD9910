@@ -5,7 +5,7 @@
 
 #define TASK5_ACK_TIMEOUT_MS             (100UL)
 #define TASK5_ACK_MAX_RETRIES            (3U)
-#define TASK5_COARSE_TIMEOUT_MS          (5000UL)
+#define TASK5_COARSE_REPLAY_MS           (5000UL)
 #define TASK5_DDS_RESULT_TIMEOUT_MS      (2000UL)
 #define TASK5_RESULT_MAX_RETRIES         (3U)
 #define TASK5_DDS_SETTLE_MS              (200UL)
@@ -267,6 +267,31 @@ static bool Task5_ReplayLastCommand(
   return true;
 }
 
+static void Task5_KeepWaitingForCoarseResult(
+    task5_controller_t *controller,
+    uint32_t now_ms)
+{
+  /*
+   * Coarse recognition can legitimately take longer with the 1820-sample
+   * model. Replay the original START periodically so OpenMV can resend a
+   * result frame that was lost, but do not convert recognition time into an
+   * application error. The live Task5 buttons remain the explicit cancel /
+   * reselect path.
+   */
+  if (Task5_SendRaw(
+          controller,
+          controller->pending.type,
+          controller->pending.seq,
+          controller->pending.payload,
+          controller->pending.payload_length)) {
+    if (controller->status.result_retry_count < UINT8_MAX) {
+      controller->status.result_retry_count++;
+    }
+    Task5_Touch(controller);
+  }
+  controller->state_deadline = now_ms + TASK5_COARSE_REPLAY_MS;
+}
+
 static uint8_t Task5_SearchStage(
     const task5_controller_t *controller)
 {
@@ -453,6 +478,26 @@ static void Task5_RememberResult(
   controller->last_result_test = test;
 }
 
+static void Task5_RestartCoarseRecognition(
+    task5_controller_t *controller,
+    uint32_t now_ms)
+{
+  task5_lock_mode_t mode = controller->status.mode;
+  uint32_t saw_frequency_hz =
+      controller->status.saw_frequency_hz;
+
+  /*
+   * Compatibility with an older OpenMV image that may still return
+   * NO_TRACE/TIMEOUT: acknowledge that result, close its Session, and start
+   * a fresh one instead of entering TASK5_ERROR_BAD_RESULT.
+   */
+  if (!Task5_Start(
+          controller, mode, saw_frequency_hz, now_ms) &&
+      (controller->status.state != TASK5_STATE_ERROR)) {
+    Task5_EnterError(controller, TASK5_ERROR_BAD_RESULT);
+  }
+}
+
 static void Task5_HandleAck(task5_controller_t *controller,
                             const openmv_frame_t *frame,
                             uint32_t now_ms)
@@ -483,7 +528,7 @@ static void Task5_HandleAck(task5_controller_t *controller,
   switch (controller->status.state) {
     case TASK5_STATE_WAIT_START_ACK:
       controller->state_deadline =
-          now_ms + TASK5_COARSE_TIMEOUT_MS;
+          now_ms + TASK5_COARSE_REPLAY_MS;
       Task5_SetState(
           controller, TASK5_STATE_WAIT_COARSE_RESULT);
       break;
@@ -591,7 +636,7 @@ static void Task5_HandleCoarseResult(
     Task5_SendAck(controller, frame, TASK5_ACK_STATUS_OK);
     Task5_RememberResult(
         controller, frame, session, 0U);
-    Task5_EnterError(controller, TASK5_ERROR_BAD_RESULT);
+    Task5_RestartCoarseRecognition(controller, now_ms);
     return;
   }
 
@@ -610,7 +655,9 @@ static void Task5_HandleCoarseResult(
       (estimated > TASK5_MAX_DDS_FREQUENCY_HZ)) {
     Task5_SendNack(
         controller, frame, OPENMV_NACK_OUT_OF_RANGE);
-    Task5_EnterError(controller, TASK5_ERROR_BAD_RESULT);
+    controller->status.invalid_frame_count++;
+    Task5_Touch(controller);
+    Task5_RestartCoarseRecognition(controller, now_ms);
     return;
   }
 
@@ -868,12 +915,8 @@ void Task5_Process(task5_controller_t *controller,
   switch (controller->status.state) {
     case TASK5_STATE_WAIT_COARSE_RESULT:
       if (Task5_DeadlineReached(
-              now_ms, controller->state_deadline) &&
-          !Task5_ReplayLastCommand(
-              controller, now_ms,
-              TASK5_COARSE_TIMEOUT_MS)) {
-        Task5_EnterError(
-            controller, TASK5_ERROR_RESULT_TIMEOUT);
+              now_ms, controller->state_deadline)) {
+        Task5_KeepWaitingForCoarseResult(controller, now_ms);
       }
       break;
     case TASK5_STATE_DDS_SETTLING:

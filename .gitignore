@@ -26,6 +26,8 @@ Makefile
 *.lst
 *.su
 
+report/*
+
 # ===== Logs =====
 log/*
 *.log

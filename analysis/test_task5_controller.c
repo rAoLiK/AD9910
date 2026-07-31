@@ -209,6 +209,84 @@ static void test_ack_retry_keeps_sequence(void)
   assert(fake.seq == first_seq);
 }
 
+static void test_coarse_wait_has_no_hard_timeout(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  task5_port_t port = {
+      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_lock, fake_safe, fake_send, &fake};
+  openmv_frame_t frame;
+  uint32_t now_ms;
+
+  assert(Task5_Init(&controller, &port));
+  Task5_Enter(&controller);
+  assert(Task5_Start(
+      &controller, TASK5_MODE_LINE_0_DEG, 10000U, 0U));
+  frame = ack_for(&fake);
+  Task5_OnFrame(&controller, &frame, 20U);
+
+  for (now_ms = 5020U; now_ms <= 30020U; now_ms += 5000U) {
+    Task5_Process(&controller, now_ms);
+  }
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_WAIT_COARSE_RESULT);
+  assert(status.last_error == TASK5_ERROR_NONE);
+  assert(status.result_retry_count == 6U);
+  assert(fake.send_count == 7U);
+  assert(fake.type == OPENMV_MSG_START_TASK);
+  assert(fake.saw_running);
+  assert(fake.saw_frequency_hz == 10000U);
+}
+
+static void test_bad_coarse_result_restarts_instead_of_error(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t before;
+  task5_status_t after;
+  task5_port_t port = {
+      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_lock, fake_safe, fake_send, &fake};
+  openmv_frame_t frame;
+
+  assert(Task5_Init(&controller, &port));
+  Task5_Enter(&controller);
+  assert(Task5_Start(
+      &controller, TASK5_MODE_CIRCLE_NEG_90_DEG,
+      10000U, 0U));
+  frame = ack_for(&fake);
+  Task5_OnFrame(&controller, &frame, 20U);
+  Task5_GetStatus(&controller, &before);
+
+  memset(&frame, 0, sizeof(frame));
+  frame.version = OPENMV_PROTOCOL_VERSION;
+  frame.type = OPENMV_MSG_COARSE_RESULT;
+  frame.seq = 0x31U;
+  frame.length = 10U;
+  OpenMV_WriteU16LE(&frame.payload[0], before.session_id);
+  frame.payload[2] = 2U;
+  OpenMV_WriteU32LE(&frame.payload[3], 0U);
+  Task5_OnFrame(&controller, &frame, 30U);
+
+  Task5_GetStatus(&controller, &after);
+  assert(after.state == TASK5_STATE_WAIT_START_ACK);
+  assert(after.last_error == TASK5_ERROR_NONE);
+  assert(after.session_id != before.session_id);
+  assert(after.mode == TASK5_MODE_CIRCLE_NEG_90_DEG);
+  assert(after.saw_frequency_hz == 10000U);
+  assert(fake.send_count == 4U);
+  assert(fake.sent_types[1] == OPENMV_MSG_ACK);
+  assert(fake.sent_types[2] == OPENMV_MSG_STOP_TASK);
+  assert(fake.sent_types[3] == OPENMV_MSG_START_TASK);
+  assert(fake.last_stop_session == before.session_id);
+  assert(fake.last_stop_reason == 0x04U);
+  assert(fake.saw_running);
+  assert(fake.saw_start_count == 2U);
+}
+
 static void test_ack_timeout_keeps_dac_running(void)
 {
   fake_port_t fake = {0};
@@ -381,6 +459,8 @@ int main(void)
 {
   test_complete_success_flow();
   test_ack_retry_keeps_sequence();
+  test_coarse_wait_has_no_hard_timeout();
+  test_bad_coarse_result_restarts_instead_of_error();
   test_active_session_can_be_reselected();
   test_ack_timeout_keeps_dac_running();
   test_uart_send_failure_becomes_visible_error();

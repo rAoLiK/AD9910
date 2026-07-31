@@ -266,6 +266,13 @@ LEN  = 10
 | 8 | uint8 | `left_peak_count` | 调试计数 |
 | 9 | uint8 | `right_peak_count` | 调试计数 |
 
+当 `START_TASK.saw_freq_hz == 10000` 时，`ratio_x1000` 已包含 OpenMV
+新模型的实测固定偏差补偿：原始估计 20～50 kHz 加 1 kHz，原始估计
+不低于 51 kHz 加 2 kHz，然后限制到 10～100 kHz。补偿在多帧共识之前
+完成，STM32 必须直接使用收到的 `ratio_x1000`，不得再次添加 1 kHz 或
+2 kHz。`saw_freq_hz == 1000` 时不执行该补偿。该变化不改变帧格式、字段
+长度、CRC 或 ACK 行为。
+
 | result | 含义 |
 |---:|---|
 | `0x00` | 成功 |
@@ -277,8 +284,15 @@ LEN  = 10
 | `0x06` | 识别超时 |
 | `0x07` | 任务取消 |
 
-STM32 当前仅对 `0x00`、`0x01` 继续执行；其他结果会被 ACK，随后锁存在
-Task5 错误态，并恢复本次选择的满码域 DAC 锯齿波供现场调试。
+当前 OpenMV 粗识别只发送 `0x00` 或 `0x01`。它不会因为识别耗时、临时
+模型载入失败或单帧相机错误发送 `0x02/ratio=0`；稳定结果形成前持续采集，
+30 秒后有有效候选时返回最佳候选并标记 `0x01`。若完全没有检测到轨迹，
+则继续等待而不是编造倍数。
+
+为兼容旧 OpenMV 程序，STM32 收到 `0x02`～`0x07` 或零倍数时仍会 ACK，
+随后发送旧 Session 的 `STOP_TASK(reason=0x04)` 并以新 Session 自动重启
+相同模式的粗识别，不进入 `TASK5_ERROR_BAD_RESULT`。越界倍数返回 NACK
+后同样自动重启。重启期间保持本次选择的 DAC 锯齿波输出。
 
 STM32 计算：
 
@@ -428,14 +442,16 @@ STM32                                      OpenMV
 |---|---:|
 | 命令 ACK 超时 | 100 ms |
 | ACK 最大重发次数 | 3 次；总发送次数最多 4 次 |
-| COARSE_RESULT 超时 | 5 s |
+| COARSE_RESULT 等待 | 无失败硬超时；每 5 s 重放同一 START_TASK |
 | DDS_TEST_RESULT 超时 | 2 s |
-| 结果等待最大重放次数 | 3 次 |
+| COARSE_RESULT 等待重放 | 不限次数，用户可按模式键取消/重选 |
+| DDS_TEST_RESULT 等待最大重放次数 | 3 次 |
 | DDS 本地稳定等待 | 200 ms |
 | OpenMV 拍摄延迟字段 | 200 ms |
 
-等待结果超时时，STM32 不是创建新命令，而是重放原 START_TASK 或
-DDS_TEST，TYPE、SEQ、Session ID、Test ID 和 Payload 全部保持不变。
+等待粗识别结果期间，STM32 每 5 秒重放原 START_TASK 且不设重放上限；
+等待 DDS 结果超时时则按上表的有限次数重放原 DDS_TEST。两者都保持
+TYPE、SEQ、Session ID、Test ID 和 Payload 不变。
 
 OpenMV 对重复命令的处理：
 

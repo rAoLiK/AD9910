@@ -32,6 +32,12 @@ Task5 的三个模式键在等待、通信、DDS 搜索、本地锁相、已锁�
 迟到的 ACK 或结果不会推进新状态机。只有 Task1–4 状态关闭按键 EXTI；
 其他非 Task5 状态即使产生按键计数，也不会启动 Task5 Session。
 
+粗识别等待不再以 5 秒为失败期限。收到 START ACK 后，STM32 保持 DAC
+输出并持续等待，每 5 秒重放原 START_TASK（TYPE、SEQ、Session 和
+Payload 均不变），使 OpenMV 能重发可能丢失的结果。旧 OpenMV 若返回
+失败结果或零倍数，STM32 会 ACK、发送 STOP 并用新 Session 自动重启
+相同模式，不进入 `OpenMV bad result` 错误；用户可随时按模式键取消重选。
+
 DAC 表固定覆盖全部 12 bit 码域：第一个点为 0，最后一个点为 4095，
 初始化时会校验这两个端点。因此这里的“满幅”指数字码满量程；PA4 的实际
 电压上下限仍取决于 VDDA/VREF+、DAC 缓冲器压降和外部负载。
