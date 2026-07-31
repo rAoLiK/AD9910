@@ -100,7 +100,11 @@ def make_trace(detector_type, side, density, axis_ratio, radial_cv, runs):
         radial_cv,
         runs,
     )
-    if density > 0.30 or density < 0.015:
+    if (
+        density > 0.30
+        or density < 0.015
+        or density > detector_type._max_family_density(axis_ratio)
+    ):
         family = False
     return (
         float(side * side) * density,
@@ -148,8 +152,8 @@ def main():
     assert geometry_detector.screen_patch_rect is not None
 
     # A thin trace passes the line branch even though its ellipse-normalized
-    # radial spread is high. A circle passes the ellipse branch. Dense
-    # multi-strand and non-conic shapes fail independently of bright area.
+    # radial spread is high. A circle passes the ellipse branch. Multi-strand
+    # and non-conic shapes fail independently of bright area.
     line_trace = make_trace(
         base_type, side, 0.09, 0.08, 1.50, 0.10
     )
@@ -157,7 +161,7 @@ def main():
         base_type, side, 0.09, 0.80, 0.20, 0.10
     )
     multi_trace = make_trace(
-        base_type, side, 0.20, 0.50, 0.40, 0.85
+        base_type, side, 0.10, 0.50, 0.40, 0.85
     )
     nonconic_trace = make_trace(
         base_type, side, 0.10, 0.50, 0.90, 0.10
@@ -166,6 +170,30 @@ def main():
     assert ellipse_trace[-1]
     assert not multi_trace[-1]
     assert not nonconic_trace[-1]
+
+    # Fast phase sweep can fill a broad band whose outer envelope is still a
+    # good line or ellipse. Area is only a rejection gate: calibrated thin
+    # traces pass, while the two observed 20%/28% bands cannot vote family.
+    calibrated_line = make_trace(
+        base_type, side, 0.14, 0.05, 1.50, 0.10
+    )
+    calibrated_ellipse = make_trace(
+        base_type, side, 0.11, 0.60, 0.20, 0.10
+    )
+    wide_line = make_trace(
+        base_type, side, 0.16, 0.05, 1.50, 0.10
+    )
+    wide_ellipse_20 = make_trace(
+        base_type, side, 0.20, 0.75, 0.21, 0.12
+    )
+    wide_ellipse_28 = make_trace(
+        base_type, side, 0.28, 0.83, 0.22, 0.16
+    )
+    assert calibrated_line[-1]
+    assert calibrated_ellipse[-1]
+    assert not wide_line[-1]
+    assert not wide_ellipse_20[-1]
+    assert not wide_ellipse_28[-1]
 
     # Boundary samples from the 68-frame real positive set remain accepted,
     # while the two recorded multi-strand captures remain rejected.

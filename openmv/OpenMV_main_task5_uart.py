@@ -77,6 +77,9 @@ DDS_TRACE_GREEN_MINUS_BLUE_MIN = 15
 DDS_TRACE_CLOSE_SIZE = 1
 DDS_MIN_TRACE_DENSITY = 0.015
 DDS_MAX_TRACE_DENSITY = 0.30
+DDS_DENSITY_FULL_LINE_AXIS_RATIO = 0.08
+DDS_LINE_MAX_FAMILY_DENSITY = 0.15
+DDS_ELLIPSE_MAX_FAMILY_DENSITY = 0.12
 DDS_LINE_MAX_AXIS_RATIO = 0.15
 DDS_ELLIPSE_MAX_RADIAL_CV = 0.60
 DDS_MAX_RUN_EXCESS_RATIO = 0.30
@@ -4254,6 +4257,33 @@ class LissajousStabilityDetector:
         )
         return family_error <= 1.0, score
 
+    @staticmethod
+    def _max_family_density(axis_ratio):
+        """Return the calibrated single-curve area limit for this shape."""
+
+        # The real positive set contains slightly thicker traces near its
+        # line phases, so that branch needs a higher calibrated allowance.
+        # Blend through the line/ellipse transition so small covariance noise
+        # near either boundary cannot flip the result abruptly.
+        if axis_ratio <= DDS_DENSITY_FULL_LINE_AXIS_RATIO:
+            return DDS_LINE_MAX_FAMILY_DENSITY
+        if axis_ratio >= DDS_LINE_MAX_AXIS_RATIO:
+            return DDS_ELLIPSE_MAX_FAMILY_DENSITY
+        blend = (
+            axis_ratio - DDS_DENSITY_FULL_LINE_AXIS_RATIO
+        ) / (
+            DDS_LINE_MAX_AXIS_RATIO
+            - DDS_DENSITY_FULL_LINE_AXIS_RATIO
+        )
+        return (
+            DDS_LINE_MAX_FAMILY_DENSITY
+            + blend
+            * (
+                DDS_ELLIPSE_MAX_FAMILY_DENSITY
+                - DDS_LINE_MAX_FAMILY_DENSITY
+            )
+        )
+
     def _analyze_trace_mask(self, mask):
         """Return fixed-cost line/ellipse features for one binary mask."""
 
@@ -4369,10 +4399,15 @@ class LissajousStabilityDetector:
         density = pixels / float(
             DDS_FEATURE_SIDE * DDS_FEATURE_SIDE
         )
+        family_density_limit = self._max_family_density(axis_ratio)
         is_family = (
             is_family
             and density >= DDS_MIN_TRACE_DENSITY
             and density <= DDS_MAX_TRACE_DENSITY
+            # Geometry says what the trace resembles; this calibrated upper
+            # bound rejects a wide swept band that merely has an elliptical
+            # envelope. Density is deliberately never sufficient for success.
+            and density <= family_density_limit
         )
         return (
             pixels,
