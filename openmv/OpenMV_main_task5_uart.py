@@ -59,9 +59,9 @@ COARSE_1K_CLUSTER_RADIUS = 0.4
 COARSE_10K_CLUSTER_RADIUS = 0.3
 COARSE_MIN_CONFIDENCE = 50
 
-# Second-stage Lissajous bright-area detector. The 13% target limit covers
-# all 68 same-frequency calibration captures (4.69% to 12.21%); it must still
-# be checked against correct / +/-100 Hz / +/-200 Hz captures on the setup.
+# Second-stage Lissajous line/ellipse-family detector. Thresholds below cover
+# all 68 same-frequency calibration captures, including lines, ellipses and
+# circles. The short multi-frame vote rejects accidental conic-like snapshots.
 DDS_FEATURE_SIDE = 64
 DDS_SCREEN_DARK_MAX = 125
 DDS_SCREEN_MARGIN_X1000 = 20
@@ -74,15 +74,23 @@ DDS_LOCATOR_MERGE_MARGIN = 8
 DDS_TRACE_GREEN_MIN = 96
 DDS_TRACE_GREEN_MINUS_RED_MIN = 15
 DDS_TRACE_GREEN_MINUS_BLUE_MIN = 15
+DDS_TRACE_CLOSE_SIZE = 1
 DDS_MIN_TRACE_DENSITY = 0.015
 DDS_MAX_TRACE_DENSITY = 0.30
-DDS_TARGET_MAX_TRACE_DENSITY = 0.13
-DDS_MIN_VALID_FRAMES = 8
-DDS_MIN_OBSERVATION_MS = 600
-DDS_OBSERVATION_DEADLINE_MS = 1400
-DDS_MIN_LOW_DENSITY_PERCENT = 75
-DDS_MIN_CONSECUTIVE_LOW_DENSITY = 3
-DDS_TARGET_CONFIDENCE = 75
+DDS_LINE_MAX_AXIS_RATIO = 0.15
+DDS_ELLIPSE_MAX_RADIAL_CV = 0.60
+DDS_MAX_RUN_EXCESS_RATIO = 0.30
+DDS_MIN_VALID_FRAMES = 10
+DDS_MIN_OBSERVATION_MS = 100
+DDS_OBSERVATION_DEADLINE_MS = 320
+DDS_MIN_FAMILY_PERCENT = 80
+DDS_MIN_CONSECUTIVE_FAMILY = 4
+DDS_TARGET_SCORE = 600
+DDS_TARGET_CONFIDENCE = 80
+DDS_EARLY_REJECT_MIN_VALID_FRAMES = 8
+DDS_EARLY_REJECT_MIN_OBSERVATION_MS = 60
+DDS_EARLY_REJECT_MAX_FAMILY_PERCENT = 25
+DDS_EARLY_REJECT_CONSECUTIVE = 6
 
 DDS_RESULT_TARGET_REACHED = 0
 DDS_RESULT_NOT_MATCHED = 3
@@ -3847,21 +3855,25 @@ class PcaRatioClassifier:
 
 
 class LissajousStabilityDetector:
-    """Detect a sparse green XY trace in a fixed oscilloscope ROI.
+    """Detect the 1:1 Lissajous line/ellipse family in a fixed ROI.
 
     The coarse-stage trace rectangle seeds a fixed square screen ROI. If that
     seed is unavailable, a strict bright-green locator is tried before the
     legacy dark-screen locator. The ROI is then held for the session; deriving
-    a new crop from every changing trace would corrupt the area ratio.
+    a new crop from every changing trace would corrupt shape measurements.
 
-    A frequency match is decided only from the bright-trace area divided by
-    the black screen area. Equal frequencies repeatedly draw one curve and
-    therefore have a lower occupied-area ratio than a drifting multi-curve
-    display. Several low-density frames are required so one dark exposure
-    cannot stop the DDS scan.
+    Every equal-frequency frame is a line, ellipse, or circle even when the
+    independent sources slowly change relative phase. A frame is classified
+    using its covariance axis ratio, ellipse-normalized radial spread, and
+    excess row/column runs. These features require only fixed-size reductions
+    on the 64x64 binary trace mask; no contour search or matrix solver is used.
     """
 
     def __init__(self):
+        self.positions = np.array(
+            tuple(range(DDS_FEATURE_SIDE)),
+            dtype=np.float,
+        )
         self.reset_session()
 
     def reset_session(self):
@@ -3888,21 +3900,26 @@ class LissajousStabilityDetector:
         )
         self.first_valid_ms = None
         self.last_valid_ms = None
-        self.first_dense_ms = None
-        self.last_dense_ms = None
         self.sampled_frames = 0
         self.valid_frames = 0
         self.dense_frames = 0
-        self.low_density_frames = 0
-        self.consecutive_low_density = 0
+        self.family_frames = 0
+        self.consecutive_family = 0
+        self.consecutive_nonfamily = 0
         self.density_sum = 0.0
+        self.score_sum = 0.0
         self.last_density = 0.0
         self.last_average_density = 0.0
+        self.last_axis_ratio = 0.0
+        self.last_radial_cv = 0.0
+        self.last_run_excess_ratio = 0.0
+        self.last_frame_score = 0
         self.last_score = 0
         self.last_confidence = 0
 
     def _break_continuity(self):
-        self.consecutive_low_density = 0
+        self.consecutive_family = 0
+        self.consecutive_nonfamily = 0
 
     @staticmethod
     def _blob_rect(blob):
@@ -4205,8 +4222,166 @@ class LissajousStabilityDetector:
         red_difference.b_and(blue_difference)
         red_difference.b_and(green_gate)
 
+        # Close one-pixel refresh gaps before measuring topology. This keeps
+        # genuine line/ellipse branches continuous without merging the much
+        # wider spacing between a mismatched multi-curve trace.
+        red_difference.close(DDS_TRACE_CLOSE_SIZE)
         mask = red_difference.to_ndarray("f") / 255.0
-        return float(np.sum(mask))
+        return self._analyze_trace_mask(mask)
+
+    @staticmethod
+    def _classify_geometry(
+        axis_ratio,
+        radial_cv,
+        run_excess_ratio,
+    ):
+        line_error = axis_ratio / DDS_LINE_MAX_AXIS_RATIO
+        ellipse_error = radial_cv / DDS_ELLIPSE_MAX_RADIAL_CV
+        topology_error = (
+            run_excess_ratio / DDS_MAX_RUN_EXCESS_RATIO
+        )
+        family_error = max(
+            min(line_error, ellipse_error),
+            topology_error,
+        )
+        score = int(
+            _clamp(
+                1000.0 / (1.0 + max(0.0, family_error)),
+                0,
+                1000,
+            )
+            + 0.5
+        )
+        return family_error <= 1.0, score
+
+    def _analyze_trace_mask(self, mask):
+        """Return fixed-cost line/ellipse features for one binary mask."""
+
+        column_counts = np.sum(mask, axis=0)
+        row_counts = np.sum(mask, axis=1)
+        pixels = float(np.sum(column_counts))
+        if pixels <= 0.0:
+            return (0.0, 0.0, 99.0, 99.0, 0, False)
+
+        # Count bright runs along rows and columns. A clean conic has at most
+        # two branches on nearly every scan line; extra runs expose multiple
+        # Lissajous strands even when their total bright area is small.
+        row_starts = np.sum(
+            (mask[:, 1:] - mask[:, :-1]) > 0.5,
+            axis=1,
+        ) + mask[:, 0]
+        column_starts = np.sum(
+            (mask[1:, :] - mask[:-1, :]) > 0.5,
+            axis=0,
+        ) + mask[0, :]
+        row_over = row_starts - 2.0
+        column_over = column_starts - 2.0
+        excess_runs = float(
+            np.sum(row_over * (row_over > 0.0))
+            + np.sum(column_over * (column_over > 0.0))
+        )
+        occupied_lines = float(
+            np.sum(row_counts > 0.0)
+            + np.sum(column_counts > 0.0)
+        )
+        run_excess_ratio = excess_runs / max(
+            1.0,
+            occupied_lines,
+        )
+
+        center_x = float(
+            np.sum(column_counts * self.positions)
+        ) / pixels
+        center_y = float(
+            np.sum(row_counts * self.positions)
+        ) / pixels
+        dx = self.positions - center_x
+        dy = self.positions - center_y
+        dx_squared = dx * dx
+        dy_squared = dy * dy
+        variance_x = float(
+            np.sum(column_counts * dx_squared)
+        ) / pixels
+        variance_y = float(
+            np.sum(row_counts * dy_squared)
+        ) / pixels
+        cross_grid = dy.reshape(
+            (DDS_FEATURE_SIDE, 1)
+        ) * dx
+        covariance_xy = float(
+            np.sum(mask * cross_grid)
+        ) / pixels
+
+        trace = variance_x + variance_y
+        discriminant = (
+            (variance_x - variance_y)
+            * (variance_x - variance_y)
+            + 4.0 * covariance_xy * covariance_xy
+        ) ** 0.5
+        major_variance = 0.5 * (trace + discriminant)
+        minor_variance = max(
+            0.0,
+            0.5 * (trace - discriminant),
+        )
+        axis_ratio = minor_variance / max(
+            0.0001,
+            major_variance,
+        )
+
+        # Whitening maps any non-degenerate ellipse to a circle. Its active
+        # pixels then have nearly constant squared radius. Multi-lobed and
+        # partially filled curves have a much larger normalized spread.
+        determinant = (
+            variance_x * variance_y
+            - covariance_xy * covariance_xy
+        )
+        radial_cv = 99.0
+        if determinant > 0.0001:
+            inverse_xx = variance_y / determinant
+            inverse_xy = -covariance_xy / determinant
+            inverse_yy = variance_x / determinant
+            distance_squared = (
+                inverse_xx * dx_squared
+                + inverse_yy
+                * dy_squared.reshape((DDS_FEATURE_SIDE, 1))
+                + (2.0 * inverse_xy) * cross_grid
+            )
+            active_distance = mask * distance_squared
+            radial_mean = float(
+                np.sum(active_distance)
+            ) / pixels
+            radial_square_mean = float(
+                np.sum(active_distance * distance_squared)
+            ) / pixels
+            radial_variance = max(
+                0.0,
+                radial_square_mean - radial_mean * radial_mean,
+            )
+            radial_cv = (
+                radial_variance ** 0.5
+            ) / max(0.0001, radial_mean)
+
+        is_family, frame_score = self._classify_geometry(
+            axis_ratio,
+            radial_cv,
+            run_excess_ratio,
+        )
+        density = pixels / float(
+            DDS_FEATURE_SIDE * DDS_FEATURE_SIDE
+        )
+        is_family = (
+            is_family
+            and density >= DDS_MIN_TRACE_DENSITY
+            and density <= DDS_MAX_TRACE_DENSITY
+        )
+        return (
+            pixels,
+            axis_ratio,
+            radial_cv,
+            run_excess_ratio,
+            frame_score,
+            is_family,
+        )
 
     def _quality(self):
         if self.valid_frames <= 0:
@@ -4217,23 +4392,17 @@ class LissajousStabilityDetector:
 
         average_density = self.density_sum / float(self.valid_frames)
         self.last_average_density = average_density
-        density_span = max(
-            0.001,
-            DDS_MAX_TRACE_DENSITY - DDS_MIN_TRACE_DENSITY,
-        )
-        density_quality = (
-            DDS_MAX_TRACE_DENSITY - average_density
-        ) / density_span
-        low_density_fraction = (
-            self.low_density_frames / float(self.valid_frames)
+        average_score = self.score_sum / float(self.valid_frames)
+        family_fraction = (
+            self.family_frames / float(self.valid_frames)
         )
         valid_fraction = self.valid_frames / float(
             max(1, self.sampled_frames)
         )
-        score = int(1000.0 * density_quality + 0.5)
+        score = int(average_score + 0.5)
         confidence = int(
             100.0
-            * min(low_density_fraction, valid_fraction)
+            * min(family_fraction, valid_fraction)
             + 0.5
         )
         self.last_score = int(_clamp(score, 0, 1000))
@@ -4249,20 +4418,9 @@ class LissajousStabilityDetector:
             if self.first_valid_ms is None or self.last_valid_ms is None
             else _ticks_diff(self.last_valid_ms, self.first_valid_ms)
         )
-        dense_span_ms = (
-            0
-            if self.first_dense_ms is None or self.last_dense_ms is None
-            else _ticks_diff(self.last_dense_ms, self.first_dense_ms)
-        )
         if (
-            (
-                self.valid_frames >= DDS_MIN_VALID_FRAMES
-                and valid_span_ms >= DDS_MIN_OBSERVATION_MS
-            )
-            or (
-                self.dense_frames >= DDS_MIN_VALID_FRAMES
-                and dense_span_ms >= DDS_MIN_OBSERVATION_MS
-            )
+            self.valid_frames >= DDS_MIN_VALID_FRAMES
+            and valid_span_ms >= DDS_MIN_OBSERVATION_MS
         ):
             return DDS_RESULT_NOT_MATCHED, score, confidence
         return DDS_RESULT_IMAGE_ERROR, score, confidence
@@ -4283,7 +4441,14 @@ class LissajousStabilityDetector:
             self._break_continuity()
             return self._deadline_result(now_ms)
 
-        pixels = trace
+        (
+            pixels,
+            axis_ratio,
+            radial_cv,
+            run_excess_ratio,
+            frame_score,
+            current_family,
+        ) = trace
         density = pixels / float(DDS_FEATURE_SIDE * DDS_FEATURE_SIDE)
         self.last_density = density
         if density < DDS_MIN_TRACE_DENSITY:
@@ -4292,40 +4457,49 @@ class LissajousStabilityDetector:
 
         self.valid_frames += 1
         self.density_sum += density
+        self.score_sum += frame_score
+        self.last_axis_ratio = axis_ratio
+        self.last_radial_cv = radial_cv
+        self.last_run_excess_ratio = run_excess_ratio
+        self.last_frame_score = frame_score
         if self.first_valid_ms is None:
             self.first_valid_ms = now_ms
         self.last_valid_ms = now_ms
 
         if density > DDS_MAX_TRACE_DENSITY:
-            if self.first_dense_ms is None:
-                self.first_dense_ms = now_ms
-            self.last_dense_ms = now_ms
             self.dense_frames += 1
-            self._break_continuity()
-            self._quality()
-            return self._deadline_result(now_ms)
 
-        current_low_density = (
-            density <= DDS_TARGET_MAX_TRACE_DENSITY
-        )
-        if current_low_density:
-            self.low_density_frames += 1
-            self.consecutive_low_density += 1
+        if current_family:
+            self.family_frames += 1
+            self.consecutive_family += 1
+            self.consecutive_nonfamily = 0
         else:
-            self.consecutive_low_density = 0
+            self.consecutive_family = 0
+            self.consecutive_nonfamily += 1
 
         score, confidence = self._quality()
         observed_ms = _ticks_diff(now_ms, self.first_valid_ms)
         if (
+            self.valid_frames
+            >= DDS_EARLY_REJECT_MIN_VALID_FRAMES
+            and observed_ms
+            >= DDS_EARLY_REJECT_MIN_OBSERVATION_MS
+            and self.family_frames * 100
+            <= DDS_EARLY_REJECT_MAX_FAMILY_PERCENT
+            * self.valid_frames
+            and self.consecutive_nonfamily
+            >= DDS_EARLY_REJECT_CONSECUTIVE
+        ):
+            return DDS_RESULT_NOT_MATCHED, score, confidence
+        if (
             self.valid_frames >= DDS_MIN_VALID_FRAMES
             and observed_ms >= DDS_MIN_OBSERVATION_MS
-            and self.last_average_density
-            <= DDS_TARGET_MAX_TRACE_DENSITY
-            and self.low_density_frames * 100
-            >= DDS_MIN_LOW_DENSITY_PERCENT * self.valid_frames
-            and current_low_density
-            and self.consecutive_low_density
-            >= DDS_MIN_CONSECUTIVE_LOW_DENSITY
+            and self.family_frames * 100
+            >= DDS_MIN_FAMILY_PERCENT * self.valid_frames
+            and current_family
+            and self.consecutive_family
+            >= DDS_MIN_CONSECUTIVE_FAMILY
+            and score >= DDS_TARGET_SCORE
             and confidence >= DDS_TARGET_CONFIDENCE
         ):
             return DDS_RESULT_TARGET_REACHED, score, confidence
@@ -5093,11 +5267,18 @@ def annotate(frame, controller, fps):
     )
     if controller.state == STATE_DDS_RECOGNIZING:
         detector = controller.stability_detector
-        information_line = "ROI:%d V:%02d/%02d D:%02d%%" % (
+        information_line = "ROI:%d V:%02d D:%02d X:%02d" % (
             detector.locator_source,
             detector.valid_frames,
-            detector.sampled_frames,
             clamp_int(int(detector.last_density * 100.0 + 0.5), 0, 99),
+            clamp_int(
+                int(
+                    detector.last_run_excess_ratio * 100.0
+                    + 0.5
+                ),
+                0,
+                99,
+            ),
         )
     else:
         information_line = "SCAN:%5dHz  EST:%6dHz" % (
@@ -5112,9 +5293,9 @@ def annotate(frame, controller, fps):
     )
     if controller.state == STATE_DDS_RECOGNIZING:
         detector = controller.stability_detector
-        low_percent = clamp_int(
+        family_percent = clamp_int(
             int(
-                detector.low_density_frames
+                detector.family_frames
                 * 100.0
                 / max(1, detector.valid_frames)
                 + 0.5
@@ -5122,14 +5303,11 @@ def annotate(frame, controller, fps):
             0,
             100,
         )
-        status_line = "DDS:%6d A:%02d%% L:%02d%%" % (
+        status_line = "DDS:%6d S:%3d F:%02d P:%03d" % (
             controller.dds_frequency_hz,
-            clamp_int(
-                int(detector.last_average_density * 100.0 + 0.5),
-                0,
-                99,
-            ),
-            low_percent,
+            controller.dds_match_score,
+            family_percent,
+            clamp_int(int(fps + 0.5), 0, 999),
         )
     else:
         status_line = "RATIO:%4.1fx CONF:%2d%% FPS:%3.1f" % (

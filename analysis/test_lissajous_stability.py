@@ -1,4 +1,4 @@
-"""Host regression tests for the OpenMV Lissajous area-ratio decision.
+"""Host regression tests for the OpenMV line/ellipse-family decision.
 
 The deployed script cannot be imported on CPython because it imports OpenMV
 hardware modules and starts its camera loop at module scope. This test loads
@@ -94,8 +94,22 @@ def load_detector():
     return namespace
 
 
-def pixels_for_density(side, density):
-    return float(side * side) * density
+def make_trace(detector_type, side, density, axis_ratio, radial_cv, runs):
+    family, score = detector_type._classify_geometry(
+        axis_ratio,
+        radial_cv,
+        runs,
+    )
+    if density > 0.30 or density < 0.015:
+        family = False
+    return (
+        float(side * side) * density,
+        axis_ratio,
+        radial_cv,
+        runs,
+        score,
+        family,
+    )
 
 
 def run(detector_type, samples):
@@ -133,73 +147,101 @@ def main():
     assert outline[1] + outline[3] >= 135
     assert geometry_detector.screen_patch_rect is not None
 
-    target_density = 0.10
-    mismatched_density = 0.20
-    target_trace = pixels_for_density(side, target_density)
-    mismatched_trace = pixels_for_density(side, mismatched_density)
+    # A thin trace passes the line branch even though its ellipse-normalized
+    # radial spread is high. A circle passes the ellipse branch. Dense
+    # multi-strand and non-conic shapes fail independently of bright area.
+    line_trace = make_trace(
+        base_type, side, 0.09, 0.08, 1.50, 0.10
+    )
+    ellipse_trace = make_trace(
+        base_type, side, 0.09, 0.80, 0.20, 0.10
+    )
+    multi_trace = make_trace(
+        base_type, side, 0.20, 0.50, 0.40, 0.85
+    )
+    nonconic_trace = make_trace(
+        base_type, side, 0.10, 0.50, 0.90, 0.10
+    )
+    assert line_trace[-1]
+    assert ellipse_trace[-1]
+    assert not multi_trace[-1]
+    assert not nonconic_trace[-1]
 
-    # The 13% threshold covers all 68 same-frequency calibration captures;
-    # their measured maximum was 12.207%.
-    assert namespace["DDS_TARGET_MAX_TRACE_DENSITY"] >= 0.1221
-    assert namespace["DDS_TARGET_MAX_TRACE_DENSITY"] < 0.15
+    # Boundary samples from the 68-frame real positive set remain accepted,
+    # while the two recorded multi-strand captures remain rejected.
+    for measured in (
+        (0.1463, 0.6587, 0.1697),
+        (0.1653, 0.5706, 0.1697),
+        (0.9635, 0.0940, 0.10),
+    ):
+        assert base_type._classify_geometry(*measured)[0]
+    for measured in (
+        (0.5089, 0.6496, 2.3535),
+        (0.5895, 0.4733, 0.8361),
+    ):
+        assert not base_type._classify_geometry(*measured)[0]
 
     decisions = run(
         SyntheticDetector,
-        [(index * 100, target_trace) for index in range(8)],
+        [(index * 10, ellipse_trace) for index in range(12)],
     )
     assert decisions[-1][0] == target
 
-    # Eight frames concentrated into 70 ms are not 600 ms of evidence.
+    # Ten valid frames concentrated into 45 ms are not 100 ms of evidence.
     decisions = run(
         SyntheticDetector,
-        [(index * 10, target_trace) for index in range(8)]
-        + [(1400, None)],
+        [(index * 5, line_trace) for index in range(10)]
+        + [(320, None)],
     )
     assert decisions[-1][0] == image_error
 
-    # A persistent multi-curve area does not match even when it is temporally
-    # stationary; this detector intentionally uses occupied area, not shape.
+    # A persistent multi-curve is rejected in roughly 60 ms instead of
+    # consuming the complete candidate deadline.
     decisions = run(
         SyntheticDetector,
-        [(index * 100, mismatched_trace) for index in range(8)]
-        + [(1400, None)],
+        [(index * 10, multi_trace) for index in range(8)],
     )
     assert decisions[-1][0] == not_matched
 
-    # One briefly dark frame cannot cause a false stop when most observations
-    # remain above the target-area threshold.
+    # One accidental conic-looking frame inside a non-conic run cannot stop
+    # the scan; six subsequent non-family frames trigger early rejection.
     decisions = run(
         SyntheticDetector,
-        [(index * 100, mismatched_trace) for index in range(7)]
-        + [(700, target_trace), (1400, None)],
+        [
+            (0, multi_trace),
+            (10, multi_trace),
+            (20, multi_trace),
+            (30, ellipse_trace),
+            (40, multi_trace),
+            (50, multi_trace),
+            (60, multi_trace),
+            (70, multi_trace),
+            (80, multi_trace),
+            (90, multi_trace),
+        ],
     )
     assert decisions[-1][0] == not_matched
 
-    # Some refresh/exposure outliers are tolerated, but the average area,
-    # low-density vote ratio, and final consecutive run must all agree.
-    samples = [
-        (0, mismatched_trace),
-        (100, mismatched_trace),
-        (200, target_trace),
-        (300, target_trace),
-        (400, target_trace),
-        (500, target_trace),
-        (600, target_trace),
-        (700, target_trace),
+    # Two initial refresh outliers are tolerated once at least 80% of the
+    # window belongs to the family and its average geometry score recovers.
+    samples = [(0, multi_trace), (10, multi_trace)] + [
+        (20 + index * 10, ellipse_trace) for index in range(10)
     ]
     decisions = run(SyntheticDetector, samples)
     assert decisions[-1][0] == target
 
     # No visible green trace remains an image acquisition error, not a
     # business-level NOT_MATCHED result that would advance the DDS scan.
-    no_trace = pixels_for_density(side, 0.005)
+    no_trace = make_trace(
+        base_type, side, 0.005, 0.01, 0.10, 0.0
+    )
     decisions = run(
         SyntheticDetector,
-        [(index * 100, no_trace) for index in range(8)]
-        + [(1400, None)],
+        [(index * 10, no_trace) for index in range(10)]
+        + [(320, None)],
     )
     assert decisions[-1][0] == image_error
-    print("Lissajous area-ratio decision tests passed")
+    print("Lissajous line/ellipse-family decision tests passed")
 
 
 if __name__ == "__main__":
