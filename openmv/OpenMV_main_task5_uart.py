@@ -95,6 +95,8 @@ DDS_EARLY_REJECT_MIN_VALID_FRAMES = 8
 DDS_EARLY_REJECT_MIN_OBSERVATION_MS = 60
 DDS_EARLY_REJECT_MAX_FAMILY_PERCENT = 25
 DDS_EARLY_REJECT_CONSECUTIVE = 6
+DDS_HIGH_SCORE_TOP_FRAMES = 3
+DDS_HIGH_NONFAMILY_SCORE_CAP = 499
 
 DDS_RESULT_TARGET_REACHED = 0
 DDS_RESULT_NOT_MATCHED = 3
@@ -3900,6 +3902,7 @@ class LissajousStabilityDetector:
         self,
         capture_due_ms,
         observation_deadline_ms=DDS_OBSERVATION_DEADLINE_MS,
+        high_frequency_scoring=False,
     ):
         self.capture_due_ms = capture_due_ms
         self.deadline_ms = time.ticks_add(
@@ -3916,6 +3919,10 @@ class LissajousStabilityDetector:
         self.consecutive_nonfamily = 0
         self.density_sum = 0.0
         self.score_sum = 0.0
+        self.high_frequency_scoring = high_frequency_scoring
+        self.high_top_score_1 = 0
+        self.high_top_score_2 = 0
+        self.high_top_score_3 = 0
         self.last_density = 0.0
         self.last_average_density = 0.0
         self.last_axis_ratio = 0.0
@@ -4432,7 +4439,19 @@ class LissajousStabilityDetector:
 
         average_density = self.density_sum / float(self.valid_frames)
         self.last_average_density = average_density
-        average_score = self.score_sum / float(self.valid_frames)
+        if self.high_frequency_scoring:
+            top_count = min(
+                self.valid_frames,
+                DDS_HIGH_SCORE_TOP_FRAMES,
+            )
+            top_sum = self.high_top_score_1
+            if top_count >= 2:
+                top_sum += self.high_top_score_2
+            if top_count >= 3:
+                top_sum += self.high_top_score_3
+            average_score = top_sum / float(top_count)
+        else:
+            average_score = self.score_sum / float(self.valid_frames)
         family_fraction = (
             self.family_frames / float(self.valid_frames)
         )
@@ -4448,6 +4467,28 @@ class LissajousStabilityDetector:
         self.last_score = int(_clamp(score, 0, 1000))
         self.last_confidence = int(_clamp(confidence, 0, 100))
         return self.last_score, self.last_confidence
+
+    def _record_high_frequency_score(self, frame_score, current_family):
+        # Ranking by one maximum frame is too vulnerable to an accidental
+        # conic snapshot.  The best three frames may be non-consecutive, so a
+        # rapidly jittering correct signal remains strong without restoring a
+        # continuity requirement.  Density/topology-rejected frames are
+        # capped below every valid family frame even if their outer envelope
+        # happens to have a high raw geometry score.
+        ranked_score = (
+            frame_score
+            if current_family
+            else min(frame_score, DDS_HIGH_NONFAMILY_SCORE_CAP)
+        )
+        if ranked_score >= self.high_top_score_1:
+            self.high_top_score_3 = self.high_top_score_2
+            self.high_top_score_2 = self.high_top_score_1
+            self.high_top_score_1 = ranked_score
+        elif ranked_score >= self.high_top_score_2:
+            self.high_top_score_3 = self.high_top_score_2
+            self.high_top_score_2 = ranked_score
+        elif ranked_score > self.high_top_score_3:
+            self.high_top_score_3 = ranked_score
 
     def _deadline_result(self, now_ms):
         if _ticks_diff(now_ms, self.deadline_ms) < 0:
@@ -4498,6 +4539,11 @@ class LissajousStabilityDetector:
         self.valid_frames += 1
         self.density_sum += density
         self.score_sum += frame_score
+        if self.high_frequency_scoring:
+            self._record_high_frequency_score(
+                frame_score,
+                current_family,
+            )
         self.last_axis_ratio = axis_ratio
         self.last_radial_cv = radial_cv
         self.last_run_excess_ratio = run_excess_ratio
@@ -5406,6 +5452,7 @@ class Task5Controller:
         self.dds_test_id = 0
         self.dds_frequency_hz = 0
         self.dds_search_stage = 0
+        self.dds_high_frequency_search = False
         self.dds_capture_due_ms = 0
         self.dds_match_score = 0
         self.dds_stability_confidence = 0
@@ -5452,6 +5499,7 @@ class Task5Controller:
         self.dds_test_id = 0
         self.dds_frequency_hz = 0
         self.dds_search_stage = 0
+        self.dds_high_frequency_search = False
         self.dds_capture_due_ms = 0
         self.dds_match_score = 0
         self.dds_stability_confidence = 0
@@ -5570,6 +5618,7 @@ class Task5Controller:
         self.display_ratio = 0.0
         self.last_rect = None
         self.dds_command_key = None
+        self.dds_high_frequency_search = False
         self.stability_detector.reset_session()
         self._clear_result_cache()
         print(
@@ -5628,6 +5677,8 @@ class Task5Controller:
         self.dds_test_id = test_id
         self.dds_frequency_hz = dds_frequency_hz
         self.dds_search_stage = search_stage
+        if search_stage == 1:
+            self.dds_high_frequency_search = True
         self.dds_capture_due_ms = ticks_add(
             ticks_ms(),
             capture_delay_ms,
@@ -5640,6 +5691,7 @@ class Task5Controller:
             DDS_COARSE_OBSERVATION_DEADLINE_MS
             if search_stage == 1
             else DDS_OBSERVATION_DEADLINE_MS,
+            self.dds_high_frequency_search,
         )
         # Previous candidate masks are now unreachable; reclaim them during
         # the requested capture delay rather than during a measured frame.

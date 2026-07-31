@@ -215,6 +215,41 @@ def main():
     ):
         assert not base_type._classify_geometry(*measured)[0]
 
+    # High-frequency ranking keeps the best three non-consecutive family
+    # frames instead of averaging them away among rapidly jittering frames.
+    # A single density/topology-rejected conic envelope remains capped below
+    # the family range and therefore cannot win by accident.
+    peak_trace = ellipse_trace[:4] + (900, True)
+    weak_trace = multi_trace[:4] + (300, False)
+    jitter_samples = [
+        peak_trace,
+        weak_trace,
+        weak_trace,
+        peak_trace,
+        weak_trace,
+        weak_trace,
+        peak_trace,
+        weak_trace,
+        weak_trace,
+        weak_trace,
+    ]
+    average_detector = SyntheticDetector()
+    average_detector.reset_test(0, 320, False)
+    high_detector = SyntheticDetector()
+    high_detector.reset_test(0, 320, True)
+    for index, sample in enumerate(jitter_samples):
+        average_detector.update(sample, index * 10)
+        high_detector.update(sample, index * 10)
+    assert average_detector._quality()[0] == 480
+    assert high_detector._quality()[0] == 900
+
+    rejected_envelope = multi_trace[:4] + (900, False)
+    rejected_detector = SyntheticDetector()
+    rejected_detector.reset_test(0, 320, True)
+    for index in range(3):
+        rejected_detector.update(rejected_envelope, index * 10)
+    assert rejected_detector._quality()[0] == 499
+
     decisions = run(
         SyntheticDetector,
         [(index * 10, ellipse_trace) for index in range(12)],

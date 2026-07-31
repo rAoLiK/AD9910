@@ -13,13 +13,13 @@
 #define TASK5_CONFIRM_CAPTURE_DELAY_MS   (160U)
 #define TASK5_FINE_SEARCH_STEP_HZ        (100UL)
 #define TASK5_HIGH_COARSE_STEP_HZ        (1000UL)
+#define TASK5_HIGH_FINE_HALF_WINDOW_HZ   (500UL)
 #define TASK5_HIGH_SEARCH_THRESHOLD_HZ   (10000UL)
 #define TASK5_HIGH_COARSE_MAX_RADIUS     (8U)
 #define TASK5_LOW_MAX_RADIUS             (20U)
 #define TASK5_TREND_RISE_MARGIN          (50U)
 #define TASK5_TREND_RISE_CONFIRMATIONS   (2U)
 #define TASK5_SUSPICION_MIN_QUALITY      (450U)
-#define TASK5_SUSPICION_MIN_DEPTH        (100U)
 #define TASK5_CONFIRM_MIN_QUALITY        (350U)
 #define TASK5_MIN_DDS_FREQUENCY_HZ       (100UL)
 #define TASK5_MAX_INPUT_FREQUENCY_HZ     (100000UL)
@@ -727,37 +727,32 @@ static bool Task5_BeginFineSearch(
     task5_controller_t *controller,
     uint32_t now_ms)
 {
-  const task5_search_trend_t *negative =
-      &controller->coarse_trend[TASK5_DIRECTION_NEGATIVE];
-  const task5_search_trend_t *positive =
-      &controller->coarse_trend[TASK5_DIRECTION_POSITIVE];
-  const task5_search_trend_t *selected = NULL;
-  uint32_t midpoint;
+  uint32_t center;
 
-  if (negative->best_pair_cost != UINT32_MAX) {
-    selected = negative;
-  }
-  if ((positive->best_pair_cost != UINT32_MAX) &&
-      ((selected == NULL) ||
-       (positive->best_pair_cost < selected->best_pair_cost) ||
-       ((positive->best_pair_cost == selected->best_pair_cost) &&
-        (positive->best_distance < selected->best_distance)))) {
-    selected = positive;
-  }
-  if (selected == NULL) {
+  if (controller->status.best_match_frequency_hz == 0UL) {
     return Task5_RestartHighSearch(
         controller, controller->status.dds_frequency_hz,
         now_ms);
   }
 
-  controller->search_lower_hz = selected->best_pair_lower_hz;
-  controller->search_upper_hz = selected->best_pair_upper_hz;
-  midpoint =
-      controller->search_lower_hz +
-      ((controller->search_upper_hz -
-        controller->search_lower_hz) / 2UL);
-  controller->search_origin_hz =
-      Task5_RoundToGrid(midpoint, TASK5_FINE_SEARCH_STEP_HZ);
+  /* A narrow, visually obvious coarse peak must not lose to a broader but
+   * mediocre adjacent pair.  The nearest 1 kHz coarse point is at most
+   * 500 Hz from the true target, so center the complete 100 Hz scan on the
+   * single best coarse sample. */
+  center = Task5_RoundToGrid(
+      controller->status.best_match_frequency_hz,
+      TASK5_FINE_SEARCH_STEP_HZ);
+  controller->search_origin_hz = center;
+  controller->search_lower_hz =
+      (center > (TASK5_MIN_DDS_FREQUENCY_HZ +
+                 TASK5_HIGH_FINE_HALF_WINDOW_HZ))
+          ? center - TASK5_HIGH_FINE_HALF_WINDOW_HZ
+          : TASK5_MIN_DDS_FREQUENCY_HZ;
+  controller->search_upper_hz =
+      (center <= (TASK5_MAX_DDS_FREQUENCY_HZ -
+                  TASK5_HIGH_FINE_HALF_WINDOW_HZ))
+          ? center + TASK5_HIGH_FINE_HALF_WINDOW_HZ
+          : TASK5_MAX_DDS_FREQUENCY_HZ;
   controller->search_step_hz = TASK5_FINE_SEARCH_STEP_HZ;
   controller->undirected_attempt = 0U;
   controller->fine_best_distance = UINT16_MAX;
@@ -825,21 +820,6 @@ static uint32_t Task5_NextFineFrequency(
     }
   }
   return 0UL;
-}
-
-static bool Task5_BeginSuspicionConfirmation(
-    task5_controller_t *controller,
-    uint32_t now_ms)
-{
-  if (controller->fine_best_frequency_hz == 0UL) {
-    return Task5_RestartHighSearch(
-        controller, controller->status.dds_frequency_hz,
-        now_ms);
-  }
-  controller->confirmation_peak_valid = true;
-  controller->status.search_stage = TASK5_SEARCH_STAGE_CONFIRM;
-  return Task5_SetDDSAndSettle(
-      controller, controller->fine_best_frequency_hz, now_ms);
 }
 
 static bool Task5_IsDuplicateResult(
@@ -1155,15 +1135,21 @@ static void Task5_HandleDDSTestResult(
   controller->status.last_match_confidence = confidence;
   Task5_Touch(controller);
 
-  if (result == TASK5_DDS_TARGET_REACHED) {
+  if ((result == TASK5_DDS_TARGET_REACHED) &&
+      !controller->high_frequency_search) {
     Task5_BeginFrequencyHold(controller, now_ms);
     return;
   }
 
-  if ((result >= TASK5_DDS_TOO_LOW) &&
-      (result <= TASK5_DDS_LOW_CONFIDENCE)) {
+  if (result <= TASK5_DDS_LOW_CONFIDENCE) {
     controller->image_retry_count = 0U;
-    quality = Task5_ResultQuality(match_score, confidence);
+    /* High-frequency figures jitter too quickly for frame-to-frame stability
+     * confidence to be a reliable ranking signal.  Rank that segmented scan
+     * by ellipse-family geometry alone; retain the conservative combined
+     * quality for the low-frequency path. */
+    quality = controller->high_frequency_search
+                  ? match_score
+                  : Task5_ResultQuality(match_score, confidence);
     distance = (uint16_t)(1000U - quality);
 
     if (controller->high_frequency_search) {
@@ -1189,36 +1175,21 @@ static void Task5_HandleDDSTestResult(
           (void)Task5_SetDDSAndSettle(
               controller, next_frequency, now_ms);
         } else {
-          (void)Task5_BeginSuspicionConfirmation(
-              controller, now_ms);
-        }
-        return;
-      }
-
-      if (controller->status.search_stage ==
-          TASK5_SEARCH_STAGE_CONFIRM) {
-        Task5_UpdateBestQuality(
-            controller,
-            controller->status.dds_frequency_hz,
-            distance);
-        /* A direct TARGET result always wins above.  This fallback handles a
-         * missed start/target frame by holding the confirmed minimum of the
-         * complete 1 kHz suspicion interval.  Require absolute quality, a
-         * visible valley relative to the rest of the interval, and a usable
-         * repeat at the minimum so a flat/noisy curve cannot stop the scan. */
-        if (controller->fine_best_distance <=
-            (uint16_t)(1000U -
-                       TASK5_SUSPICION_MIN_QUALITY) &&
-            quality >= TASK5_CONFIRM_MIN_QUALITY &&
-            controller->fine_worst_distance >=
-                (uint16_t)(controller->fine_best_distance +
-                           TASK5_SUSPICION_MIN_DEPTH)) {
-          Task5_BeginFrequencyHold(controller, now_ms);
-        } else {
-          (void)Task5_RestartHighSearch(
-              controller,
-              controller->fine_best_frequency_hz,
-              now_ms);
+          /* High-frequency Lissajous figures can jitter even when the DDS
+           * frequency is correct.  The complete 100 Hz scan already gives
+           * the required evidence: select its most ellipse-like sample and
+           * hold it without demanding another consecutive camera result. */
+          if (controller->fine_best_frequency_hz == 0UL) {
+            (void)Task5_RestartHighSearch(
+                controller,
+                controller->status.dds_frequency_hz,
+                now_ms);
+          } else if (Task5_SetDDSAndSettle(
+                         controller,
+                         controller->fine_best_frequency_hz,
+                         now_ms)) {
+            Task5_BeginFrequencyHold(controller, now_ms);
+          }
         }
         return;
       }
