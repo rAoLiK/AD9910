@@ -59,9 +59,9 @@ COARSE_1K_CLUSTER_RADIUS = 0.4
 COARSE_10K_CLUSTER_RADIUS = 0.3
 COARSE_MIN_CONFIDENCE = 50
 
-# Second-stage Lissajous stability detector. These are initial calibration
-# values for the documented white-paper oscilloscope frame and must be
-# verified with correct / +/-100 Hz / +/-200 Hz captures on the real setup.
+# Second-stage Lissajous bright-area detector. The 13% target limit covers
+# all 68 same-frequency calibration captures (4.69% to 12.21%); it must still
+# be checked against correct / +/-100 Hz / +/-200 Hz captures on the setup.
 DDS_FEATURE_SIDE = 64
 DDS_SCREEN_DARK_MAX = 125
 DDS_SCREEN_MARGIN_X1000 = 20
@@ -74,20 +74,15 @@ DDS_LOCATOR_MERGE_MARGIN = 8
 DDS_TRACE_GREEN_MIN = 96
 DDS_TRACE_GREEN_MINUS_RED_MIN = 15
 DDS_TRACE_GREEN_MINUS_BLUE_MIN = 15
-DDS_TRACE_TOLERANCE_DILATION = 1
 DDS_MIN_TRACE_DENSITY = 0.015
 DDS_MAX_TRACE_DENSITY = 0.30
+DDS_TARGET_MAX_TRACE_DENSITY = 0.13
 DDS_MIN_VALID_FRAMES = 8
 DDS_MIN_OBSERVATION_MS = 600
 DDS_OBSERVATION_DEADLINE_MS = 1400
-DDS_MIN_ANCHOR_OVERLAP = 0.75
-DDS_MIN_PREVIOUS_OVERLAP = 0.82
-DDS_MAX_AREA_CHANGE = 0.15
-DDS_MAX_CENTROID_DRIFT = 2.0
-DDS_MIN_STABLE_PERCENT = 80
-DDS_MIN_CONSECUTIVE_STABLE = 3
-DDS_TARGET_SCORE = 850
-DDS_TARGET_CONFIDENCE = 80
+DDS_MIN_LOW_DENSITY_PERCENT = 75
+DDS_MIN_CONSECUTIVE_LOW_DENSITY = 3
+DDS_TARGET_CONFIDENCE = 75
 
 DDS_RESULT_TARGET_REACHED = 0
 DDS_RESULT_NOT_MATCHED = 3
@@ -3852,19 +3847,21 @@ class PcaRatioClassifier:
 
 
 class LissajousStabilityDetector:
-    """Detect a stationary, sparse green XY trace in a fixed screen ROI.
+    """Detect a sparse green XY trace in a fixed oscilloscope ROI.
 
     The coarse-stage trace rectangle seeds a fixed square screen ROI. If that
     seed is unavailable, a strict bright-green locator is tried before the
     legacy dark-screen locator. The ROI is then held for the session; deriving
-    a new crop from every changing trace would hide real movement.
+    a new crop from every changing trace would corrupt the area ratio.
+
+    A frequency match is decided only from the bright-trace area divided by
+    the black screen area. Equal frequencies repeatedly draw one curve and
+    therefore have a lower occupied-area ratio than a drifting multi-curve
+    display. Several low-density frames are required so one dark exposure
+    cannot stop the DDS scan.
     """
 
     def __init__(self):
-        self.positions = np.array(
-            tuple(range(DDS_FEATURE_SIDE)),
-            dtype=np.float,
-        )
         self.reset_session()
 
     def reset_session(self):
@@ -3896,31 +3893,16 @@ class LissajousStabilityDetector:
         self.sampled_frames = 0
         self.valid_frames = 0
         self.dense_frames = 0
-        self.comparison_count = 0
-        self.stable_votes = 0
-        self.consecutive_stable = 0
-        self.similarity_sum = 0.0
-        self.anchor_raw = None
-        self.anchor_dilated = None
-        self.anchor_pixels = 0.0
-        self.anchor_x = 0.0
-        self.anchor_y = 0.0
-        self.previous_raw = None
-        self.previous_dilated = None
-        self.previous_pixels = 0.0
-        self.previous_x = 0.0
-        self.previous_y = 0.0
+        self.low_density_frames = 0
+        self.consecutive_low_density = 0
+        self.density_sum = 0.0
         self.last_density = 0.0
-        self.last_anchor_overlap = 0.0
-        self.last_previous_overlap = 0.0
+        self.last_average_density = 0.0
         self.last_score = 0
         self.last_confidence = 0
 
     def _break_continuity(self):
-        self.consecutive_stable = 0
-        self.previous_raw = None
-        self.previous_dilated = None
-        self.previous_pixels = 0.0
+        self.consecutive_low_density = 0
 
     @staticmethod
     def _blob_rect(blob):
@@ -4223,63 +4205,36 @@ class LissajousStabilityDetector:
         red_difference.b_and(blue_difference)
         red_difference.b_and(green_gate)
 
-        raw = red_difference.to_ndarray("f").flatten() / 255.0
-        expanded_image = red_difference.copy()
-        expanded_image.dilate(DDS_TRACE_TOLERANCE_DILATION)
-        expanded = (
-            expanded_image.to_ndarray("f").flatten() / 255.0
-        )
-        pixels = float(np.sum(raw))
-        if pixels <= 0.0:
-            return raw, expanded, pixels, 0.0, 0.0
-
-        matrix = raw.reshape(
-            (DDS_FEATURE_SIDE, DDS_FEATURE_SIDE)
-        )
-        columns = np.sum(matrix, axis=0)
-        rows = np.sum(matrix, axis=1)
-        center_x = float(np.sum(columns * self.positions)) / pixels
-        center_y = float(np.sum(rows * self.positions)) / pixels
-        return raw, expanded, pixels, center_x, center_y
-
-    @staticmethod
-    def _tolerant_overlap(
-        first_raw,
-        first_dilated,
-        first_pixels,
-        second_raw,
-        second_dilated,
-        second_pixels,
-    ):
-        if first_pixels <= 0.0 or second_pixels <= 0.0:
-            return 0.0
-        first_in_second = float(
-            np.sum(first_raw * second_dilated)
-        ) / first_pixels
-        second_in_first = float(
-            np.sum(second_raw * first_dilated)
-        ) / second_pixels
-        return min(first_in_second, second_in_first)
+        mask = red_difference.to_ndarray("f") / 255.0
+        return float(np.sum(mask))
 
     def _quality(self):
-        if self.comparison_count <= 0:
+        if self.valid_frames <= 0:
             self.last_score = 0
             self.last_confidence = 0
+            self.last_average_density = 0.0
             return 0, 0
-        stable_fraction = (
-            self.stable_votes / float(self.comparison_count)
+
+        average_density = self.density_sum / float(self.valid_frames)
+        self.last_average_density = average_density
+        density_span = max(
+            0.001,
+            DDS_MAX_TRACE_DENSITY - DDS_MIN_TRACE_DENSITY,
         )
-        similarity = (
-            self.similarity_sum / float(self.comparison_count)
+        density_quality = (
+            DDS_MAX_TRACE_DENSITY - average_density
+        ) / density_span
+        low_density_fraction = (
+            self.low_density_frames / float(self.valid_frames)
         )
         valid_fraction = self.valid_frames / float(
             max(1, self.sampled_frames)
         )
-        score = int(
-            1000.0 * min(stable_fraction, similarity) + 0.5
-        )
+        score = int(1000.0 * density_quality + 0.5)
         confidence = int(
-            100.0 * min(stable_fraction, valid_fraction) + 0.5
+            100.0
+            * min(low_density_fraction, valid_fraction)
+            + 0.5
         )
         self.last_score = int(_clamp(score, 0, 1000))
         self.last_confidence = int(_clamp(confidence, 0, 100))
@@ -4328,117 +4283,49 @@ class LissajousStabilityDetector:
             self._break_continuity()
             return self._deadline_result(now_ms)
 
-        raw, expanded, pixels, center_x, center_y = trace
+        pixels = trace
         density = pixels / float(DDS_FEATURE_SIDE * DDS_FEATURE_SIDE)
         self.last_density = density
+        if density < DDS_MIN_TRACE_DENSITY:
+            self._break_continuity()
+            return self._deadline_result(now_ms)
+
+        self.valid_frames += 1
+        self.density_sum += density
+        if self.first_valid_ms is None:
+            self.first_valid_ms = now_ms
+        self.last_valid_ms = now_ms
+
         if density > DDS_MAX_TRACE_DENSITY:
             if self.first_dense_ms is None:
                 self.first_dense_ms = now_ms
             self.last_dense_ms = now_ms
             self.dense_frames += 1
             self._break_continuity()
-            return self._deadline_result(now_ms)
-        if density < DDS_MIN_TRACE_DENSITY:
-            self._break_continuity()
+            self._quality()
             return self._deadline_result(now_ms)
 
-        self.valid_frames += 1
-        if self.first_valid_ms is None:
-            self.first_valid_ms = now_ms
-        self.last_valid_ms = now_ms
-        if self.anchor_raw is None:
-            self.anchor_raw = raw
-            self.anchor_dilated = expanded
-            self.anchor_pixels = pixels
-            self.anchor_x = center_x
-            self.anchor_y = center_y
-            self.previous_raw = raw
-            self.previous_dilated = expanded
-            self.previous_pixels = pixels
-            self.previous_x = center_x
-            self.previous_y = center_y
-            return self._deadline_result(now_ms)
-        if self.previous_raw is None:
-            # A missing/rejected frame broke continuity. Rebase the adjacent
-            # comparison and require a new run of stable frames.
-            self.previous_raw = raw
-            self.previous_dilated = expanded
-            self.previous_pixels = pixels
-            self.previous_x = center_x
-            self.previous_y = center_y
-            return self._deadline_result(now_ms)
-
-        anchor_overlap = self._tolerant_overlap(
-            self.anchor_raw,
-            self.anchor_dilated,
-            self.anchor_pixels,
-            raw,
-            expanded,
-            pixels,
+        current_low_density = (
+            density <= DDS_TARGET_MAX_TRACE_DENSITY
         )
-        previous_overlap = self._tolerant_overlap(
-            self.previous_raw,
-            self.previous_dilated,
-            self.previous_pixels,
-            raw,
-            expanded,
-            pixels,
-        )
-        anchor_area_change = abs(
-            pixels - self.anchor_pixels
-        ) / max(1.0, self.anchor_pixels)
-        previous_area_change = abs(
-            pixels - self.previous_pixels
-        ) / max(1.0, self.previous_pixels)
-        anchor_centroid_ok = (
-            abs(center_x - self.anchor_x) <= DDS_MAX_CENTROID_DRIFT
-            and abs(center_y - self.anchor_y)
-            <= DDS_MAX_CENTROID_DRIFT
-        )
-        previous_centroid_ok = (
-            abs(center_x - self.previous_x) <= DDS_MAX_CENTROID_DRIFT
-            and abs(center_y - self.previous_y)
-            <= DDS_MAX_CENTROID_DRIFT
-        )
-
-        self.comparison_count += 1
-        self.last_anchor_overlap = anchor_overlap
-        self.last_previous_overlap = previous_overlap
-        self.similarity_sum += min(
-            anchor_overlap,
-            previous_overlap,
-        )
-        current_stable = (
-            anchor_overlap >= DDS_MIN_ANCHOR_OVERLAP
-            and previous_overlap >= DDS_MIN_PREVIOUS_OVERLAP
-            and anchor_area_change <= DDS_MAX_AREA_CHANGE
-            and previous_area_change <= DDS_MAX_AREA_CHANGE
-            and anchor_centroid_ok
-            and previous_centroid_ok
-        )
-        if current_stable:
-            self.stable_votes += 1
-            self.consecutive_stable += 1
+        if current_low_density:
+            self.low_density_frames += 1
+            self.consecutive_low_density += 1
         else:
-            self.consecutive_stable = 0
-
-        self.previous_raw = raw
-        self.previous_dilated = expanded
-        self.previous_pixels = pixels
-        self.previous_x = center_x
-        self.previous_y = center_y
+            self.consecutive_low_density = 0
 
         score, confidence = self._quality()
         observed_ms = _ticks_diff(now_ms, self.first_valid_ms)
         if (
             self.valid_frames >= DDS_MIN_VALID_FRAMES
             and observed_ms >= DDS_MIN_OBSERVATION_MS
-            and self.stable_votes * 100
-            >= DDS_MIN_STABLE_PERCENT * self.comparison_count
-            and current_stable
-            and self.consecutive_stable
-            >= DDS_MIN_CONSECUTIVE_STABLE
-            and score >= DDS_TARGET_SCORE
+            and self.last_average_density
+            <= DDS_TARGET_MAX_TRACE_DENSITY
+            and self.low_density_frames * 100
+            >= DDS_MIN_LOW_DENSITY_PERCENT * self.valid_frames
+            and current_low_density
+            and self.consecutive_low_density
+            >= DDS_MIN_CONSECUTIVE_LOW_DENSITY
             and confidence >= DDS_TARGET_CONFIDENCE
         ):
             return DDS_RESULT_TARGET_REACHED, score, confidence
@@ -5224,10 +5111,25 @@ def annotate(frame, controller, fps):
         scale=1,
     )
     if controller.state == STATE_DDS_RECOGNIZING:
-        status_line = "DDS:%6d S:%3d C:%2d%%" % (
+        detector = controller.stability_detector
+        low_percent = clamp_int(
+            int(
+                detector.low_density_frames
+                * 100.0
+                / max(1, detector.valid_frames)
+                + 0.5
+            ),
+            0,
+            100,
+        )
+        status_line = "DDS:%6d A:%02d%% L:%02d%%" % (
             controller.dds_frequency_hz,
-            controller.dds_match_score,
-            controller.dds_stability_confidence,
+            clamp_int(
+                int(detector.last_average_density * 100.0 + 0.5),
+                0,
+                99,
+            ),
+            low_percent,
         )
     else:
         status_line = "RATIO:%4.1fx CONF:%2d%% FPS:%3.1f" % (

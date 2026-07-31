@@ -1,4 +1,4 @@
-"""Host regression tests for the OpenMV Lissajous decision window.
+"""Host regression tests for the OpenMV Lissajous area-ratio decision.
 
 The deployed script cannot be imported on CPython because it imports OpenMV
 hardware modules and starts its camera loop at module scope. This test loads
@@ -94,12 +94,8 @@ def load_detector():
     return namespace
 
 
-def make_trace(side, first, last, center):
-    raw = Vector([0.0] * (side * side))
-    for y in range(first, last):
-        for x in range(first, last):
-            raw[(y * side) + x] = 1.0
-    return raw, raw.copy(), float(sum(raw)), center, center
+def pixels_for_density(side, density):
+    return float(side * side) * density
 
 
 def run(detector_type, samples):
@@ -137,51 +133,73 @@ def main():
     assert outline[1] + outline[3] >= 135
     assert geometry_detector.screen_patch_rect is not None
 
-    stable = make_trace(side, 28, 36, 31.5)
-    unstable = make_trace(side, 4, 12, 7.5)
+    target_density = 0.10
+    mismatched_density = 0.20
+    target_trace = pixels_for_density(side, target_density)
+    mismatched_trace = pixels_for_density(side, mismatched_density)
+
+    # The 13% threshold covers all 68 same-frequency calibration captures;
+    # their measured maximum was 12.207%.
+    assert namespace["DDS_TARGET_MAX_TRACE_DENSITY"] >= 0.1221
+    assert namespace["DDS_TARGET_MAX_TRACE_DENSITY"] < 0.15
 
     decisions = run(
         SyntheticDetector,
-        [(index * 100, stable) for index in range(8)],
+        [(index * 100, target_trace) for index in range(8)],
     )
     assert decisions[-1][0] == target
 
     # Eight frames concentrated into 70 ms are not 600 ms of evidence.
     decisions = run(
         SyntheticDetector,
-        [(index * 10, stable) for index in range(8)]
+        [(index * 10, target_trace) for index in range(8)]
         + [(1400, None)],
     )
     assert decisions[-1][0] == image_error
 
-    # Historical votes cannot hide an unstable latest frame.
+    # A persistent multi-curve area does not match even when it is temporally
+    # stationary; this detector intentionally uses occupied area, not shape.
     decisions = run(
         SyntheticDetector,
-        [(index * 100, stable) for index in range(7)]
-        + [(700, unstable), (1400, None)],
+        [(index * 100, mismatched_trace) for index in range(8)]
+        + [(1400, None)],
     )
-    assert decisions[7] is None
     assert decisions[-1][0] == not_matched
 
-    # A missing frame breaks continuity; three new adjacent comparisons are
-    # required before the detector may recover to TARGET.
+    # One briefly dark frame cannot cause a false stop when most observations
+    # remain above the target-area threshold.
     decisions = run(
         SyntheticDetector,
-        [
-            (0, stable),
-            (100, stable),
-            (200, stable),
-            (300, None),
-            (400, stable),
-            (500, stable),
-            (600, stable),
-            (700, stable),
-            (800, stable),
-        ],
+        [(index * 100, mismatched_trace) for index in range(7)]
+        + [(700, target_trace), (1400, None)],
     )
-    assert decisions[7] is None
+    assert decisions[-1][0] == not_matched
+
+    # Some refresh/exposure outliers are tolerated, but the average area,
+    # low-density vote ratio, and final consecutive run must all agree.
+    samples = [
+        (0, mismatched_trace),
+        (100, mismatched_trace),
+        (200, target_trace),
+        (300, target_trace),
+        (400, target_trace),
+        (500, target_trace),
+        (600, target_trace),
+        (700, target_trace),
+    ]
+    decisions = run(SyntheticDetector, samples)
     assert decisions[-1][0] == target
-    print("Lissajous stability decision tests passed")
+
+    # No visible green trace remains an image acquisition error, not a
+    # business-level NOT_MATCHED result that would advance the DDS scan.
+    no_trace = pixels_for_density(side, 0.005)
+    decisions = run(
+        SyntheticDetector,
+        [(index * 100, no_trace) for index in range(8)]
+        + [(1400, None)],
+    )
+    assert decisions[-1][0] == image_error
+    print("Lissajous area-ratio decision tests passed")
 
 
 if __name__ == "__main__":
