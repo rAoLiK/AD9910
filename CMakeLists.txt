@@ -77,8 +77,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
-    TJC_UART_HANDLE=huart1
-    TJC_UART_INSTANCE=USART1
+    TJC_UART_HANDLE=huart6
+    TJC_UART_INSTANCE=USART6
     TJC_UART_RX_MODE=TJC_UART_MODE_IT
     TJC_UART_TX_MODE=TJC_UART_MODE_IT
 )

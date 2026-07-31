@@ -128,19 +128,27 @@ static void Task5_SendStopBestEffort(
 static void Task5_EnterError(task5_controller_t *controller,
                              task5_error_t error)
 {
+  task5_state_t origin_state;
+
   if ((controller == NULL) ||
       (controller->status.state == TASK5_STATE_ERROR)) {
     return;
   }
 
-  Task5_SendStopBestEffort(controller, 0x05U);
+  origin_state = controller->status.state;
   controller->pending.active = false;
-  if (controller->port.stop_saw != NULL) {
-    controller->port.stop_saw(controller->port.context);
+  if ((controller->status.saw_frequency_hz != 0UL) &&
+      (controller->port.start_saw != NULL)) {
+    /*
+     * Debug behavior: keep the selected full-scale DAC sawtooth visible
+     * after a Task5 failure. This also restores DAC output when the error
+     * happened after the controller had already switched to DDS.
+     */
+    (void)controller->port.start_saw(
+        controller->port.context,
+        controller->status.saw_frequency_hz);
   }
-  if (controller->port.safe_outputs != NULL) {
-    controller->port.safe_outputs(controller->port.context);
-  }
+  controller->status.error_origin_state = origin_state;
   controller->status.last_error = error;
   controller->status.state = TASK5_STATE_ERROR;
   Task5_Touch(controller);
@@ -174,6 +182,11 @@ static void Task5_ServicePending(task5_controller_t *controller,
   }
 
   if (!controller->pending.sent) {
+    if ((controller->pending.retry_count != 0U) &&
+        !Task5_DeadlineReached(
+            now_ms, controller->pending.ack_deadline)) {
+      return;
+    }
     if (Task5_SendRaw(
             controller,
             controller->pending.type,
@@ -181,6 +194,15 @@ static void Task5_ServicePending(task5_controller_t *controller,
             controller->pending.payload,
             controller->pending.payload_length)) {
       controller->pending.sent = true;
+      controller->pending.retry_count = 0U;
+      controller->pending.ack_deadline =
+          now_ms + TASK5_ACK_TIMEOUT_MS;
+    } else if (controller->pending.retry_count >=
+               TASK5_ACK_MAX_RETRIES) {
+      Task5_EnterError(
+          controller, TASK5_ERROR_UART_SEND);
+    } else {
+      controller->pending.retry_count++;
       controller->pending.ack_deadline =
           now_ms + TASK5_ACK_TIMEOUT_MS;
     }
@@ -209,6 +231,14 @@ static void Task5_ServicePending(task5_controller_t *controller,
     controller->pending.ack_deadline =
         now_ms + TASK5_ACK_TIMEOUT_MS;
     Task5_Touch(controller);
+  } else if ((uint8_t)(controller->pending.retry_count + 1U) >=
+             TASK5_ACK_MAX_RETRIES) {
+    Task5_EnterError(
+        controller, TASK5_ERROR_UART_SEND);
+  } else {
+    controller->pending.retry_count++;
+    controller->pending.ack_deadline =
+        now_ms + TASK5_ACK_TIMEOUT_MS;
   }
 }
 

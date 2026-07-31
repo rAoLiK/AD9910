@@ -57,6 +57,11 @@ HAL_StatusTypeDef AppSaw_Init(void)
         (i * APP_SAW_DAC_MAX_CODE) /
         (APP_SAW_SAMPLE_COUNT - 1U));
   }
+  if ((s_saw_table[0] != 0U) ||
+      (s_saw_table[APP_SAW_SAMPLE_COUNT - 1U] !=
+       APP_SAW_DAC_MAX_CODE)) {
+    return HAL_ERROR;
+  }
   s_saw_initialized = true;
   AppSaw_Stop();
   return HAL_OK;

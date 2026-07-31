@@ -17,6 +17,11 @@ typedef enum {
   APP_BOARD_PATH_DDS
 } app_board_path_t;
 
+typedef enum {
+  APP_BOARD_SIGNAL_DAC = 0,
+  APP_BOARD_SIGNAL_DDS
+} app_board_signal_source_t;
+
 typedef struct {
   uint8_t line;
   uint8_t circle;
@@ -26,8 +31,11 @@ typedef struct {
 void AppBoard_Init(void);
 void AppBoard_SetPath(app_board_path_t path);
 app_board_path_t AppBoard_GetPath(void);
+void AppBoard_SetSignalSource(app_board_signal_source_t source);
+app_board_signal_source_t AppBoard_GetSignalSource(void);
 void AppBoard_EnableTask5Buttons(bool enable);
 void AppBoard_TakeButtonCounts(app_board_button_counts_t *counts);
+bool AppBoard_IsTask5ButtonPressed(uint8_t button_index);
 
 #ifdef __cplusplus
 }

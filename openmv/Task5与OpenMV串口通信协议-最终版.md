@@ -49,30 +49,9 @@ code[i] = floor(i * 4095 / 99), i = 0..99
 
 因此一个周期内没有下降台阶，只有周期边界从 4095 回到 0。
 
-### 1.3 DAC/DDS 总输出选择
-
-STM32 使用 `PE6` 控制 Task5 总输出选择继电器：
-
-| PE6 电平 | 总输出信号 |
-|---|---|
-| 低电平 | `PA4 / DAC_OUT1` 的单增锯齿波 |
-| 高电平 | DDS/Task1–4 输出支路 |
-
-上电初始化、安全初始状态以及 Task1–4 工作期间，PE6 均为高电平。
-Task5 启动粗识别锯齿波之前，STM32 将 PE6 拉低；收到有效
-`COARSE_RESULT` 后先停止 DAC，再配置 DDS，只有 DDS 配置成功后才将
-PE6 拉高。后续 `DDS_TEST` 搜索和本地相位锁定阶段始终保持高电平。
-为便于联调，Task5 通信或运行错误时不会立即退出：STM32 会重新启动本次
-选择的 DAC 锯齿波并将 PE6 拉低。只有用户明确退出 Task5 时，才停止
-DAC 并将 PE6 恢复高电平。
-
-PE6 完全由 STM32 本地状态机控制，OpenMV 不发送任何额外控制字段或
-命令，也不应根据图像自行假定切换已经完成；应以收到的
-`START_TASK`、`DDS_TEST` 和 `STOP_TASK` 协议消息判断当前处理阶段。
-
 ## 2. 实体按键的 Task5 选择规则
 
-三个按键的身份决定锁相模式，同一个按键的按压时长决定锯齿波频率：
+三个按键的身份决定锁相模式，同一个按键的按压次数决定锯齿波频率：
 
 | 按键 | 模式 | 协议 `lock_mode` |
 |---|---|---:|
@@ -82,25 +61,19 @@ PE6 完全由 STM32 本地状态机控制，OpenMV 不发送任何额外控制�
 
 | 同一按键的操作 | 锯齿波频率 |
 |---|---:|
-| 短按，按住时间小于 500 ms | 1000 Hz |
-| 长按，按住时间大于等于 500 ms | 10000 Hz |
+| 单击一次，400 ms 内没有第二次有效按压 | 1000 Hz |
+| 400 ms 内连续按两次 | 10000 Hz |
 
 具体判定规则：
 
-1. 按下事件与释放确认的去抖时间均为 50 ms。
-2. 第一次有效按压后，在主循环中记录按下时刻并持续读取对应 GPIO。
-3. 按键持续按住达到 500 ms 时，立即确认为长按并按 10 kHz 启动。
-4. 按键在 500 ms 前释放且释放电平稳定 50 ms，确认为短按并按
-   1 kHz 启动。
-5. 一个按键正在进行时长判定时，其他按键事件被忽略，避免同时启动两个
-   Task5 Session。
+1. 按键去抖时间为 50 ms。
+2. 第一次有效按压后打开 400 ms 双击窗口。
+3. 同一按键在窗口内第二次有效按压，立即按 10 kHz 启动。
+4. 窗口到期仍只有一次按压，按 1 kHz 启动。
+5. 双击窗口内按下另一个模式键时，旧选择被取消，以最后按下的模式键
+   重新开始 400 ms 窗口。
 6. 一个 Task5 Session 已经启动后，三个按键不再启动第二个 Session。
 7. 三个 EXTI 仅在 Task5 页面/状态中启用。
-8. 按压时长判定仅在 MCU 内部进行，串口屏幕不显示短按、长按或等待
-   判定状态；短按释放确认或长按达到阈值后，直接进入并显示对应运行
-   模式。
-9. 尚未选择模式时，Task5 串口屏幕固定分三行显示 `PA0: diagonal`、
-   `PB9: circle`、`PB8: infinity`，按键次数不会改变此提示。
 
 ## 3. 统一数据帧
 
@@ -247,8 +220,7 @@ CRC 错误和 `LEN > 64` 时直接丢弃，不返回 NACK，因为此时 TYPE/SE
 也不可信。
 
 STM32 收到针对当前可靠命令的 `BUSY(0x05)` 后，延迟 200 ms，再用原
-SEQ 重发。收到其他 NACK 时进入 Task5 锁存错误态，显示 NACK 码，并
-恢复本次选择的 DAC 锯齿波；不会立即退出 Task5。
+SEQ 重发。收到其他 NACK 时终止 Task5、关闭 DAC/DDS、回到安全输出。
 
 ## 8. START_TASK
 
@@ -300,8 +272,8 @@ LEN  = 10
 | `0x06` | 识别超时 |
 | `0x07` | 任务取消 |
 
-STM32 当前仅对 `0x00`、`0x01` 继续执行；其他结果会被 ACK，随后
-锁存在 Task5 错误态并恢复本次选择的 DAC 锯齿波。
+STM32 当前仅对 `0x00`、`0x01` 继续执行；其他结果会被 ACK，随后安全
+终止任务。
 
 STM32 计算：
 
@@ -455,37 +427,6 @@ STM32                                      OpenMV
 等待结果超时时，STM32 不是创建新命令，而是重放原 START_TASK 或
 DDS_TEST，TYPE、SEQ、Session ID、Test ID 和 Payload 全部保持不变。
 
-UART5 发送队列在首次发送或 ACK 重发阶段持续失败时，也按 100 ms 间隔
-有限重试；累计 4 次发送尝试仍失败后进入 `UART5 TX failed` 错误态。
-
-### 14.1 STM32 错误锁存与现场显示
-
-下列故障不会使 STM32 自动离开 Task5 页面：
-
-- UART5 发送持续失败；
-- START_TASK、DDS_TEST 或 STOP_TASK 的 ACK 超时；
-- COARSE_RESULT 或 DDS_TEST_RESULT 超时；
-- OpenMV 返回 NACK、非法/失败结果或 `ERROR_REPORT`；
-- DDS 配置、搜索或本地相位锁定失败。
-
-进入错误态后，STM32 取消当前重试，不主动发送 `STOP_TASK`，重新输出
-本次按键选择的 1 kHz 或 10 kHz DAC 锯齿波，并保持 PE6 为低电平。
-因此 OpenMV 端可能仍保留当前 Session；用户退出 Task5 时 STM32 才会
-尽力发送一次 `STOP_TASK(reason=0x01)`，OpenMV 应据此回到 IDLE。
-
-STM32 屏幕显示三行：
-
-```text
-ERR: <具体错误原因>
-DAC <1000或10000>Hz FULL ON/OFF
-RX<合法帧数> CRC<CRC错误数> U<UART硬件错误数>
-```
-
-`RX=0, CRC=0, U=0` 且出现 START ACK 超时时，通常表示 STM32 没有收到
-任何完整帧，应优先检查 UART5 交叉接线、共地、115200 8N1 以及 OpenMV
-所用 UART 实例。`CRC` 增长表示已有字节到达但帧校验失败；`U` 增长表示
-STM32 UART5 发生硬件错误。
-
 OpenMV 对重复命令的处理：
 
 - 仍在识别：重发 ACK，不得重新启动第二次识别；
@@ -544,16 +485,6 @@ if len(packet) == expected_length:
 ```
 
 因为一次 `uart.read()` 与一帧没有一一对应关系。
-
-OpenMV N6 的 OpenMV v5.0.0 / MicroPython v1.28.0-49 不支持
-`del bytearray[...]`。消费接收缓存前缀时应重新绑定切片：
-
-```python
-rx_buffer = rx_buffer[consumed_length:]
-```
-
-若使用 `del rx_buffer[:consumed_length]`，解析器会在首个完整帧通过 CRC
-校验后抛出 `TypeError`，从而无法返回 ACK。
 
 多字节整数使用：
 
@@ -642,15 +573,9 @@ CRC = 0x3696
 6. COARSE_RESULT 的 ACK 丢失，OpenMV 重发相同结果，STM32只重发 ACK，
    不重复切换输出。
 7. DDS_TEST_RESULT 使用旧 Session 或旧 Test ID，不改变 DDS。
-8. 短按任一模式键得到 1 kHz DAC 锯齿波；长按至少 500 ms 得到
-   10 kHz。
+8. 单击任一模式键得到 1 kHz DAC 锯齿波；双击得到 10 kHz。
 9. 示波器确认 PA4 波形在每周期内单调递增。
-   同时确认 DAC 码表端点为 0/4095；实际模拟电压满幅需结合 VDDA/VREF+
-   和输出负载用示波器测量。
 10. TARGET_REACHED 后 OpenMV 收到 STOP_TASK 并回到 IDLE；STM32 随后
     切入本地相位锁定。
-11. 拔掉 UART 或让 OpenMV 不应答，STM32 在超时后仍停留在 Task5，
-    显示具体错误原因和 `RX/CRC/U` 诊断计数；PE6 保持低电平且所选
-    1 kHz/10 kHz 满码域 DAC 锯齿波继续输出。
-12. 从上述错误态退出 Task5，确认 OpenMV 最终收到尽力发送的 STOP_TASK，
-    STM32 随后停止 DAC 并将 PE6 恢复高电平。
+11. 拔掉 UART 或让 OpenMV 不应答，STM32 在超时后关闭 Task5 输出并
+    回到安全路径。

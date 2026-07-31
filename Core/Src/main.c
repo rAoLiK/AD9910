@@ -114,8 +114,8 @@ int main(void)
   MX_ADC2_Init();
   MX_TIM2_Init();
   MX_TIM6_Init();
-  MX_USART1_UART_Init();
   MX_UART5_Init();
+  MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
   AppBoard_Init();
   if (DDS_Init() != AD9910_STATUS_OK) {

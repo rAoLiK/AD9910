@@ -13,10 +13,12 @@ typedef struct {
   uint32_t saw_frequency_hz;
   uint32_t dds_frequency_hz;
   uint32_t seed_frequency_hz;
+  uint32_t saw_start_count;
   task5_lock_mode_t lock_mode;
   bool saw_running;
   bool safe;
   bool phase_started;
+  bool send_fails;
 } fake_port_t;
 
 static bool fake_start_saw(void *context, uint32_t frequency_hz)
@@ -24,6 +26,7 @@ static bool fake_start_saw(void *context, uint32_t frequency_hz)
   fake_port_t *fake = context;
   fake->saw_frequency_hz = frequency_hz;
   fake->saw_running = true;
+  fake->saw_start_count++;
   return true;
 }
 
@@ -68,7 +71,7 @@ static bool fake_send(void *context,
     memcpy(fake->payload, payload, payload_length);
   }
   fake->send_count++;
-  return true;
+  return !fake->send_fails;
 }
 
 static openmv_frame_t ack_for(const fake_port_t *fake)
@@ -194,10 +197,102 @@ static void test_ack_retry_keeps_sequence(void)
   assert(fake.seq == first_seq);
 }
 
+static void test_ack_timeout_keeps_dac_running(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  task5_port_t port = {
+      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_lock, fake_safe, fake_send, &fake};
+
+  assert(Task5_Init(&controller, &port));
+  Task5_Enter(&controller);
+  assert(Task5_Start(
+      &controller, TASK5_MODE_LINE_0_DEG, 1000U, 0U));
+  Task5_Process(&controller, 100U);
+  Task5_Process(&controller, 200U);
+  Task5_Process(&controller, 300U);
+  Task5_Process(&controller, 400U);
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_ERROR);
+  assert(status.error_origin_state ==
+         TASK5_STATE_WAIT_START_ACK);
+  assert(status.last_error == TASK5_ERROR_ACK_TIMEOUT);
+  assert(fake.saw_running);
+  assert(fake.saw_frequency_hz == 1000U);
+  assert(fake.saw_start_count == 2U);
+  assert(!fake.safe);
+}
+
+static void test_uart_send_failure_becomes_visible_error(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  task5_port_t port = {
+      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_lock, fake_safe, fake_send, &fake};
+
+  fake.send_fails = true;
+  assert(Task5_Init(&controller, &port));
+  Task5_Enter(&controller);
+  assert(Task5_Start(
+      &controller, TASK5_MODE_CIRCLE_NEG_90_DEG,
+      10000U, 0U));
+  Task5_Process(&controller, 100U);
+  Task5_Process(&controller, 200U);
+  Task5_Process(&controller, 300U);
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_ERROR);
+  assert(status.error_origin_state ==
+         TASK5_STATE_WAIT_START_ACK);
+  assert(status.last_error == TASK5_ERROR_UART_SEND);
+  assert(fake.send_count == 4U);
+  assert(fake.saw_running);
+  assert(fake.saw_frequency_hz == 10000U);
+  assert(!fake.safe);
+}
+
+static void test_uart_retry_failure_becomes_visible_error(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  task5_port_t port = {
+      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_lock, fake_safe, fake_send, &fake};
+
+  assert(Task5_Init(&controller, &port));
+  Task5_Enter(&controller);
+  assert(Task5_Start(
+      &controller, TASK5_MODE_INFINITY_2X_0_DEG,
+      1000U, 0U));
+  fake.send_fails = true;
+  Task5_Process(&controller, 100U);
+  Task5_Process(&controller, 200U);
+  Task5_Process(&controller, 300U);
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_ERROR);
+  assert(status.error_origin_state ==
+         TASK5_STATE_WAIT_START_ACK);
+  assert(status.last_error == TASK5_ERROR_UART_SEND);
+  assert(fake.send_count == 4U);
+  assert(fake.saw_running);
+  assert(fake.saw_frequency_hz == 1000U);
+  assert(!fake.safe);
+}
+
 int main(void)
 {
   test_complete_success_flow();
   test_ack_retry_keeps_sequence();
+  test_ack_timeout_keeps_dac_running();
+  test_uart_send_failure_becomes_visible_error();
+  test_uart_retry_failure_becomes_visible_error();
   puts("task5 controller tests passed");
   return 0;
 }

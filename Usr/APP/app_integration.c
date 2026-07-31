@@ -17,7 +17,7 @@
 #define APP_COMMAND_QUEUE_SIZE                 (16U)
 #define APP_COMMAND_QUEUE_MASK                 (APP_COMMAND_QUEUE_SIZE - 1U)
 #define APP_BUTTON_DEBOUNCE_MS                 (50UL)
-#define APP_BUTTON_DOUBLE_CLICK_MS             (400UL)
+#define APP_BUTTON_LONG_PRESS_MS               (500UL)
 #define APP_SCOPE_VOLTS_PER_DIV                (0.5f)
 #define APP_DDS_FULL_SCALE_VPP_AFTER_GAIN      (4.432f)
 #define APP_FEEDBACK_INVERSION_DEG             (180.0f)
@@ -40,10 +40,11 @@ typedef struct {
   uint32_t rendered_task5_revision;
   uint32_t last_button_tick[3];
   bool last_button_tick_valid[3];
-  uint32_t button_click_deadline;
-  uint8_t pending_button_index;
-  bool button_click_pending;
-  bool task5_error_reported;
+  uint32_t button_press_tick;
+  uint32_t button_release_tick;
+  uint8_t active_button_index;
+  bool button_press_pending;
+  bool button_release_pending;
   bool render_forced;
   bool initialized;
 } app_integration_context_t;
@@ -114,6 +115,7 @@ static bool AppIntegration_EnterSafe(void *context)
   (void)context;
   AppSaw_Stop();
   AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
   return PLL_Demo_Stop() == HAL_OK;
 }
 
@@ -122,9 +124,11 @@ static bool AppIntegration_RunDirect(void *context)
   (void)context;
   if (PLL_Demo_Stop() != HAL_OK) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
     return false;
   }
   AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
   return true;
 }
 
@@ -148,12 +152,15 @@ static bool AppIntegration_RunLock(void *context,
                           feedback_phase_deg,
                           scale) != HAL_OK)) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
     return false;
   }
 
   AppBoard_SetPath(APP_BOARD_PATH_DDS);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
   if (PLL_Demo_Start() != HAL_OK) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
     (void)PLL_Demo_Stop();
     return false;
   }
@@ -172,10 +179,14 @@ static bool AppIntegration_SetLockAmplitude(void *context,
           waveform, &multiplier, &feedback_phase_deg)) {
     return false;
   }
-  return PLL_Demo_Configure(
-             multiplier,
-             feedback_phase_deg,
-             AppIntegration_AmplitudeScale(amplitude_div)) == HAL_OK;
+  if (PLL_Demo_Configure(
+          multiplier,
+          feedback_phase_deg,
+          AppIntegration_AmplitudeScale(amplitude_div)) != HAL_OK) {
+    return false;
+  }
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
+  return true;
 }
 
 static void AppIntegration_EnableButtons(void *context, bool enable)
@@ -188,6 +199,8 @@ static bool AppIntegration_Task5StartSaw(
     void *context, uint32_t frequency_hz)
 {
   (void)context;
+  (void)PLL_Demo_Stop();
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DAC);
   return AppSaw_Start(frequency_hz) == HAL_OK;
 }
 
@@ -207,13 +220,14 @@ static bool AppIntegration_Task5SetDDS(
       (PLL_Demo_Stop() != HAL_OK)) {
     return false;
   }
-  AppBoard_SetPath(APP_BOARD_PATH_DDS);
   if (AD9910_SetSingleToneHz(
           app->dds, (double)frequency_hz,
           0.0, 1.0, 1U) != AD9910_STATUS_OK) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
     return false;
   }
+  AppBoard_SetPath(APP_BOARD_PATH_DDS);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
   return true;
 }
 
@@ -246,12 +260,15 @@ static bool AppIntegration_Task5StartPhaseLock(
            multiplier, feedback_phase_deg,
            AppIntegration_AmplitudeScale(8U)) != HAL_OK)) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
     return false;
   }
 
   AppBoard_SetPath(APP_BOARD_PATH_DDS);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
   if (PLL_Demo_Start() != HAL_OK) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
     (void)PLL_Demo_Stop();
     return false;
   }
@@ -384,19 +401,26 @@ static void AppIntegration_StartTask5Selection(
     uint32_t saw_frequency_hz,
     uint32_t now)
 {
+  task5_status_t task5;
+
   if (!AppCore_HandleCommand(
           &s_app.core,
           AppIntegration_Task5CommandForButton(
-              button_index)) ||
-      !Task5_Start(
-          &s_app.task5,
-          AppIntegration_Task5ModeForButton(button_index),
-          saw_frequency_hz, now)) {
+              button_index))) {
     AppCore_ReportError(
         &s_app.core, APP_ERROR_TASK5_RUNTIME);
-    s_app.task5_error_reported = true;
+  } else if (!Task5_Start(
+                 &s_app.task5,
+                 AppIntegration_Task5ModeForButton(button_index),
+                 saw_frequency_hz, now)) {
+    Task5_GetStatus(&s_app.task5, &task5);
+    if (task5.state != TASK5_STATE_ERROR) {
+      AppCore_ReportError(
+          &s_app.core, APP_ERROR_TASK5_RUNTIME);
+    }
   }
-  s_app.button_click_pending = false;
+  s_app.button_press_pending = false;
+  s_app.button_release_pending = false;
 }
 
 static void AppIntegration_HandleButtonPress(
@@ -420,24 +444,14 @@ static void AppIntegration_HandleButtonPress(
     return;
   }
 
-  if (s_app.button_click_pending &&
-      (s_app.pending_button_index == button_index) &&
-      ((int32_t)(now - s_app.button_click_deadline) < 0)) {
-    AppIntegration_StartTask5Selection(
-        button_index, APP_SAW_FREQUENCY_10KHZ, now);
+  if (s_app.button_press_pending) {
     return;
   }
 
-  /*
-   * A different button inside the click window replaces the old selection.
-   * This gives the operator a deterministic way to correct a wrong first
-   * press without launching two Task5 sessions.
-   */
-  s_app.pending_button_index = button_index;
-  s_app.button_click_pending = true;
-  s_app.button_click_deadline =
-      now + APP_BUTTON_DOUBLE_CLICK_MS;
-  s_app.render_forced = true;
+  s_app.active_button_index = button_index;
+  s_app.button_press_tick = now;
+  s_app.button_press_pending = true;
+  s_app.button_release_pending = false;
 }
 
 static void AppIntegration_ProcessButtons(void)
@@ -459,12 +473,41 @@ static void AppIntegration_ProcessButtons(void)
     AppIntegration_HandleButtonPress(2U, now);
   }
 
-  if (s_app.button_click_pending &&
-      ((int32_t)(now - s_app.button_click_deadline) >= 0)) {
-    AppIntegration_StartTask5Selection(
-        s_app.pending_button_index,
-        APP_SAW_FREQUENCY_1KHZ, now);
+  if (!s_app.button_press_pending) {
+    return;
   }
+
+  if (AppBoard_IsTask5ButtonPressed(
+          s_app.active_button_index)) {
+    s_app.button_release_pending = false;
+    if ((uint32_t)(now - s_app.button_press_tick) >=
+        APP_BUTTON_LONG_PRESS_MS) {
+      AppIntegration_StartTask5Selection(
+          s_app.active_button_index,
+          APP_SAW_FREQUENCY_10KHZ, now);
+    }
+    return;
+  }
+
+  if (!s_app.button_release_pending) {
+    s_app.button_release_tick = now;
+    s_app.button_release_pending = true;
+    return;
+  }
+
+  if ((uint32_t)(now - s_app.button_release_tick) <
+      APP_BUTTON_DEBOUNCE_MS) {
+    return;
+  }
+
+  AppIntegration_StartTask5Selection(
+      s_app.active_button_index,
+      ((uint32_t)(s_app.button_release_tick -
+                  s_app.button_press_tick) >=
+       APP_BUTTON_LONG_PRESS_MS)
+          ? APP_SAW_FREQUENCY_10KHZ
+          : APP_SAW_FREQUENCY_1KHZ,
+      now);
 }
 
 static void AppIntegration_UpdateLockActivity(void)
@@ -529,12 +572,8 @@ static void AppIntegration_UpdateTask5Activity(void)
       activity = APP_ACTIVITY_TASK5_LOCKED;
       break;
     case TASK5_STATE_ERROR:
-      if (!s_app.task5_error_reported) {
-        s_app.task5_error_reported = true;
-        AppCore_ReportError(
-            &s_app.core, APP_ERROR_TASK5_RUNTIME);
-      }
-      return;
+      activity = APP_ACTIVITY_ERROR;
+      break;
     case TASK5_STATE_INACTIVE:
     default:
       return;
@@ -552,11 +591,91 @@ static const char *AppIntegration_Task5ModeText(
                    : "infinity";
 }
 
+static void AppIntegration_Task5ErrorText(
+    const task5_status_t *task5,
+    char *reason,
+    size_t reason_size)
+{
+  if ((task5 == NULL) || (reason == NULL) ||
+      (reason_size == 0U)) {
+    return;
+  }
+
+  switch (task5->last_error) {
+    case TASK5_ERROR_BAD_ARGUMENT:
+      (void)snprintf(reason, reason_size, "bad argument");
+      break;
+    case TASK5_ERROR_SAW_START:
+      (void)snprintf(reason, reason_size, "DAC start failed");
+      break;
+    case TASK5_ERROR_UART_SEND:
+      (void)snprintf(reason, reason_size, "UART5 TX failed");
+      break;
+    case TASK5_ERROR_ACK_TIMEOUT:
+      (void)snprintf(
+          reason, reason_size, "%s ACK timeout",
+          (task5->error_origin_state ==
+           TASK5_STATE_WAIT_START_ACK)
+              ? "START"
+              : (task5->error_origin_state ==
+                 TASK5_STATE_WAIT_DDS_ACK)
+                    ? "DDS"
+                    : (task5->error_origin_state ==
+                       TASK5_STATE_WAIT_STOP_ACK)
+                          ? "STOP"
+                          : "OpenMV");
+      break;
+    case TASK5_ERROR_RESULT_TIMEOUT:
+      (void)snprintf(
+          reason, reason_size, "%s result timeout",
+          (task5->error_origin_state ==
+           TASK5_STATE_WAIT_COARSE_RESULT)
+              ? "COARSE"
+              : (task5->error_origin_state ==
+                 TASK5_STATE_WAIT_DDS_RESULT)
+                    ? "DDS"
+                    : "OpenMV");
+      break;
+    case TASK5_ERROR_NACK:
+      (void)snprintf(
+          reason, reason_size, "OpenMV NACK 0x%02X",
+          (unsigned int)task5->last_nack_code);
+      break;
+    case TASK5_ERROR_BAD_RESULT:
+      (void)snprintf(
+          reason, reason_size, "OpenMV bad result");
+      break;
+    case TASK5_ERROR_DDS_OUTPUT:
+      (void)snprintf(reason, reason_size, "DDS output failed");
+      break;
+    case TASK5_ERROR_SEARCH_LIMIT:
+      (void)snprintf(reason, reason_size, "DDS search limit");
+      break;
+    case TASK5_ERROR_PHASE_LOCK:
+      (void)snprintf(reason, reason_size, "phase lock failed");
+      break;
+    case TASK5_ERROR_OPENMV_REPORTED:
+      (void)snprintf(
+          reason, reason_size, "OpenMV reported error");
+      break;
+    case TASK5_ERROR_NONE:
+    default:
+      (void)snprintf(
+          reason, reason_size, "unknown error %u",
+          (unsigned int)task5->last_error);
+      break;
+  }
+}
+
 static void AppIntegration_Task5Text(
     const task5_status_t *task5,
     char *text,
     size_t text_size)
 {
+  app_saw_status_t saw;
+  openmv_uart_diagnostics_t uart;
+  char reason[40];
+
   if ((task5 == NULL) || (text == NULL) ||
       (text_size == 0U)) {
     return;
@@ -564,17 +683,9 @@ static void AppIntegration_Task5Text(
 
   switch (task5->state) {
     case TASK5_STATE_WAIT_SELECTION:
-      if (s_app.button_click_pending) {
-        (void)snprintf(
-            text, text_size, "%s: press again=10k, wait=1k",
-            AppIntegration_Task5ModeText(
-                AppIntegration_Task5ModeForButton(
-                    s_app.pending_button_index)));
-      } else {
-        (void)snprintf(
-            text, text_size,
-            "PA0 line PB9 circle PB8 infinity; 1x=1k 2x=10k");
-      }
+      (void)snprintf(
+          text, text_size,
+          "PA0: diagonal\rPB9: circle\rPB8: infinity");
       break;
     case TASK5_STATE_WAIT_START_ACK:
       (void)snprintf(
@@ -614,9 +725,19 @@ static void AppIntegration_Task5Text(
           (unsigned long)task5->dds_frequency_hz);
       break;
     case TASK5_STATE_ERROR:
+      AppSaw_GetStatus(&saw);
+      OpenMV_UART_GetDiagnostics(&uart);
+      AppIntegration_Task5ErrorText(
+          task5, reason, sizeof(reason));
       (void)snprintf(
-          text, text_size, "Task5 error %u",
-          (unsigned int)task5->last_error);
+          text, text_size,
+          "ERR: %s\rDAC %luHz %s\rRX%lu CRC%lu U%lu",
+          reason,
+          (unsigned long)saw.frequency_hz,
+          saw.running ? "FULL ON" : "OFF",
+          (unsigned long)uart.parser.valid_frame_count,
+          (unsigned long)uart.parser.crc_error_count,
+          (unsigned long)uart.uart_error_count);
       break;
     case TASK5_STATE_INACTIVE:
     default:
@@ -680,14 +801,15 @@ static void AppIntegration_ExecuteCommand(app_command_t command)
        (command == APP_COMMAND_ENTER_TASK1) ||
        (command == APP_COMMAND_ENTER_TASK14))) {
     Task5_Exit(&s_app.task5, 0x01U);
-    s_app.button_click_pending = false;
+    s_app.button_press_pending = false;
+    s_app.button_release_pending = false;
   }
 
   if (command == APP_COMMAND_ENTER_TASK5) {
     if (AppCore_HandleCommand(&s_app.core, command)) {
       Task5_Enter(&s_app.task5);
-      s_app.button_click_pending = false;
-      s_app.task5_error_reported = false;
+      s_app.button_press_pending = false;
+      s_app.button_release_pending = false;
     }
     return;
   }

@@ -306,7 +306,8 @@ void AppCore_SetTask5Activity(app_core_t *core,
        (activity != APP_ACTIVITY_TASK5_COMMUNICATING) &&
        (activity != APP_ACTIVITY_TASK5_SEARCHING) &&
        (activity != APP_ACTIVITY_TASK5_LOCKING) &&
-       (activity != APP_ACTIVITY_TASK5_LOCKED))) {
+       (activity != APP_ACTIVITY_TASK5_LOCKED) &&
+       (activity != APP_ACTIVITY_ERROR))) {
     return;
   }
 

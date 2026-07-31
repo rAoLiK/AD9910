@@ -4,6 +4,8 @@
 
 #define APP_RELAY_PORT             GPIOE
 #define APP_RELAY_PIN              GPIO_PIN_5
+#define APP_SIGNAL_SELECT_PORT     GPIOE
+#define APP_SIGNAL_SELECT_PIN      GPIO_PIN_6
 #define APP_BUTTON_LINE_PORT       GPIOA
 #define APP_BUTTON_LINE_PIN        GPIO_PIN_0
 #define APP_BUTTON_CIRCLE_PORT     GPIOB
@@ -15,6 +17,8 @@
 static volatile app_board_button_counts_t s_button_counts;
 static volatile bool s_buttons_enabled;
 static app_board_path_t s_path = APP_BOARD_PATH_DIRECT;
+static app_board_signal_source_t s_signal_source =
+    APP_BOARD_SIGNAL_DDS;
 
 static GPIO_PinState AppBoard_RelayLevel(app_board_path_t path)
 {
@@ -41,6 +45,14 @@ void AppBoard_Init(void)
   gpio.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(APP_RELAY_PORT, &gpio);
 
+  HAL_GPIO_WritePin(APP_SIGNAL_SELECT_PORT,
+                    APP_SIGNAL_SELECT_PIN, GPIO_PIN_SET);
+  gpio.Pin = APP_SIGNAL_SELECT_PIN;
+  gpio.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(APP_SIGNAL_SELECT_PORT, &gpio);
+
   gpio.Pin = APP_BUTTON_LINE_PIN;
   gpio.Mode = GPIO_MODE_IT_RISING;
   gpio.Pull = GPIO_PULLDOWN;
@@ -55,6 +67,7 @@ void AppBoard_Init(void)
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, APP_BUTTON_IRQ_PRIORITY, 0U);
   AppBoard_EnableTask5Buttons(false);
   AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
 }
 
 void AppBoard_SetPath(app_board_path_t path)
@@ -71,6 +84,25 @@ void AppBoard_SetPath(app_board_path_t path)
 app_board_path_t AppBoard_GetPath(void)
 {
   return s_path;
+}
+
+void AppBoard_SetSignalSource(app_board_signal_source_t source)
+{
+  if ((source != APP_BOARD_SIGNAL_DAC) &&
+      (source != APP_BOARD_SIGNAL_DDS)) {
+    source = APP_BOARD_SIGNAL_DDS;
+  }
+  HAL_GPIO_WritePin(
+      APP_SIGNAL_SELECT_PORT, APP_SIGNAL_SELECT_PIN,
+      (source == APP_BOARD_SIGNAL_DDS)
+          ? GPIO_PIN_SET
+          : GPIO_PIN_RESET);
+  s_signal_source = source;
+}
+
+app_board_signal_source_t AppBoard_GetSignalSource(void)
+{
+  return s_signal_source;
 }
 
 void AppBoard_EnableTask5Buttons(bool enable)
@@ -112,6 +144,23 @@ void AppBoard_TakeButtonCounts(app_board_button_counts_t *counts)
   s_button_counts.infinity = 0U;
   __DMB();
   __set_PRIMASK(primask);
+}
+
+bool AppBoard_IsTask5ButtonPressed(uint8_t button_index)
+{
+  switch (button_index) {
+    case 0U:
+      return HAL_GPIO_ReadPin(APP_BUTTON_LINE_PORT,
+                              APP_BUTTON_LINE_PIN) == GPIO_PIN_SET;
+    case 1U:
+      return HAL_GPIO_ReadPin(APP_BUTTON_CIRCLE_PORT,
+                              APP_BUTTON_CIRCLE_PIN) == GPIO_PIN_RESET;
+    case 2U:
+      return HAL_GPIO_ReadPin(APP_BUTTON_INFINITY_PORT,
+                              APP_BUTTON_INFINITY_PIN) == GPIO_PIN_RESET;
+    default:
+      return false;
+  }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)

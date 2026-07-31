@@ -46,7 +46,7 @@ TIM2 TRGO
 应用状态机逻辑命令 -> PLL_Demo_Configure/Start/Stop -> 更新逻辑配置
 ```
 
-中断中没有浮点分析、字符串格式化、DDS SPI 发送或延时。USART1 已由
+中断中没有浮点分析、字符串格式化、DDS SPI 发送或延时。USART6 已由
 TJC 屏幕传输层独占，PLL 模块不再实现串口协议或 HAL UART 回调。
 
 ## 输入硬件要求

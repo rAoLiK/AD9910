@@ -63,6 +63,7 @@ typedef struct {
 
 typedef struct {
   task5_state_t state;
+  task5_state_t error_origin_state;
   task5_error_t last_error;
   task5_lock_mode_t mode;
   uint16_t session_id;

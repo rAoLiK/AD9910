@@ -3,7 +3,7 @@
 ## 1. 集成结果
 
 本目录把题目任务、串口屏输入、板级继电器/按键和原有锁相模块组合为
-一个非阻塞应用状态机。USART1 只服务 TJC 串口屏，UART5 只服务
+一个非阻塞应用状态机。USART6 只服务 TJC 串口屏，UART5 只服务
 OpenMV；原 `pll_demo.c` 中的 ASCII CLI 已移除。锁相计算与 Task5
 协议状态转换只在主循环执行，ADC/DMA、UART 和按键 ISR 只发布固定
 大小事件或搬运一个字节。
@@ -26,13 +26,13 @@ while (1) {
 | `app_integration.h/.c` | 装配 PLL、TJC、板级端口，调度主循环并集中转发 UART 回调 |
 | `../TASK5/*` | UART5 OpenMV 协议、Task5 状态机及 PA4 DAC 锯齿波 |
 | `../PLL/pll_demo.*` | 非阻塞锁相服务及 ADC ISR 入口 |
-| `../SCREEN_TJC/*` | USART1 传输、协议解析和控件命令 |
+| `../SCREEN_TJC/*` | USART6 传输、协议解析和控件命令 |
 
 依赖方向：
 
 ```text
 TJC UART ISR -> RX 字节环 -> 主循环协议解析 -> HMI 映射 -> 逻辑命令队列
-按键 EXTI ISR -> 饱和计数器 -> 单击/双击判定 ----------^
+按键 EXTI ISR -> 饱和计数器 -> 短按/长按判定 ----------^
 UART5 ISR -> RX 字节环 -> OpenMV 帧解析 -> Task5 状态机
 主循环 -> app_core -> board/PLL 端口 -> PLL_Demo_Process
 ADC DMA ISR -> 半缓冲就绪位 -----------> PLL_Demo_Process
@@ -49,6 +49,7 @@ app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
 | `TASK5` 等待选择/粗识别 | 直通安全位 | PA4 DAC 输出锯齿波 | 启用 |
 | `TASK5` DDS 搜索 | DDS | 相机判频，ADC 停止 | 启用 |
 | `TASK5` 相位锁定 | DDS | ADC/PLL 运行 | 启用 |
+| `TASK5` + `ERROR` | DAC | 保持所选满码域锯齿波，显示错误原因 | 启用 |
 | `ERROR_SAFE` | 直通安全位 | DDS 零幅度、ADC 停止 | 禁用 |
 
 所有状态转换先回安全基线，再进入目标状态。屏幕启动或唤醒只触发当前
@@ -144,18 +145,26 @@ ADC2 在放大器前，因此它只用于频率/相位反馈，不能验证放�
 | 资源 | 配置 |
 |---|---|
 | PE5 | 继电器；默认高电平直通 |
+| PE6 | Task5 总输出选择；高电平选择 DDS/Task1–4 支路，低电平选择 PA4 DAC 锯齿波 |
 | PA0 | Task5 对角线，按下接 3.3 V，内部下拉，EXTI 上升沿 |
 | PB9 | Task5 圆，按下接地，内部上拉，EXTI 下降沿 |
 | PB8 | Task5 ∞，按下接地，内部上拉，EXTI 下降沿 |
-| USART1 PA9/PA10 | TJC，115200 8N1，逐字节 RX/TX 中断 |
+| USART6 PC6/PC7 | TJC，115200 8N1，逐字节 RX/TX 中断 |
 | UART5 PC12/PD2 | OpenMV TX/RX，115200 8N1，逐字节中断和环形缓冲 |
 | PA4 | DAC_OUT1，Task5 单调递增锯齿波 |
 | TIM6/DMA1 Stream5 | 100 点锯齿波触发与循环搬运 |
 | DMA2 Stream0 | ADC1/ADC2 双重模式采样，保持原分配 |
 
-继电器极性由 `APP_RELAY_DIRECT_ACTIVE_HIGH` 控制。三个按键 IRQ 仅在
-`TASK5` 中启用，主循环另做 50 ms 去抖。同一模式键单击选择 1 kHz，
-400 ms 内双击选择 10 kHz。
+PE5 继电器极性由 `APP_RELAY_DIRECT_ACTIVE_HIGH` 控制。PE6 极性固定为
+高电平选择 DDS/Task1–4 支路、低电平选择 DAC 支路：Task1–4 和安全初始
+状态保持高电平；Task5 启动锯齿波前拉低，粗识别结束且 DDS 配置成功后
+重新拉高。Task5 通信或运行错误时重新拉低并保持本次选择的 DAC 锯齿波，
+只有用户退出 Task5 后才恢复高电平。三个按键 IRQ 仅在
+`TASK5` 中启用，主循环另做 50 ms 按键去抖。同一模式键短按（按住时间
+小于 500 ms）选择 1 kHz，长按（按住时间大于等于 500 ms）选择
+10 kHz。按压时长判定仅在后台进行，屏幕不显示短按、长按或等待状态；
+判定完成后直接进入相应模式。Task5 待选择页面固定分三行显示
+`PA0: diagonal`、`PB9: circle`、`PB8: infinity`。
 
 ## 8. TJC 非阻塞规则
 
@@ -217,11 +226,11 @@ gcc -std=c11 -Wall -Wextra -Werror -IUsr\APP `
 cmake --build build\cube-release
 ```
 
-集成时的 Release 基线：
+当前 Release 构建：
 
 ```text
-FLASH: 35,216 bytes
-RAM:   24,984 bytes
+FLASH: 44,096 bytes
+RAM:   27,168 bytes
 ```
 
 ## 11. 上板验收清单
@@ -235,10 +244,12 @@ RAM:   24,984 bytes
    2/4/6/8 div 均保持 DDS 锁相。
 6. 切换输入频率，确认重新捕获且没有长期停留
    `frequency_change_pending`。
-7. page2 中 PA0/PB9/PB8 分别选择直线/圆/∞；单击输出 1 kHz 锯齿波，
-   双击输出 10 kHz，其他页面按键无作用。
-8. 任意页面退出后回到直通安全态，DDS 和 ADC 停止。
-9. 检查 PLL 的 `OVR/ADCERR/DDSERR` 以及 TJC 的 RX/TX/队列诊断计数
+7. page2 中 PA0/PB9/PB8 分别选择直线/圆/∞；短按输出 1 kHz 锯齿波，
+   长按至少 500 ms 输出 10 kHz，其他页面按键无作用。
+8. 断开 UART5 或让 OpenMV 不应答，确认仍停留在 Task5 页面，屏幕显示
+   具体错误以及 `RX/CRC/U` 计数，PE6 为低且所选满码域 DAC 锯齿波持续。
+9. 用户退出 Task5 后回到直通安全态，DAC、DDS 和 ADC 停止。
+10. 检查 PLL 的 `OVR/ADCERR/DDSERR` 以及 TJC 的 RX/TX/队列诊断计数
    不增长。
 
 Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
@@ -254,15 +265,31 @@ Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
   重捕获、倍率一致的输入域变化门限和低频偏差场景。
 - `analysis/test_app_core.c` 全部通过，覆盖 PRESS 映射、Task1 直通、
   Task1 的 2 div 切换 DDS 及 8 div 返回物理直通、Task2 的 8 div
-  仍保持 DDS、Task5 按键入口和错误安全收敛。
-- `cmake --build build/cube-release` 成功；最终资源占用为 FLASH 36,336
-  bytes、RAM 25,312 bytes。
+  仍保持 DDS、Task5 按键入口和错误锁存。
 - STM32CubeProgrammer 2.23.0 通过 SWD 将 `AD9910.elf` 写入
   STM32F42xxx/F43xxx，下载校验成功并完成软件复位；连接电压 3.25 V。
 - 板上经应用命令队列执行 Task1 `2 div -> 8 div`：前者为
   `LOCKED`/DDS/采样运行，后者为 `DIRECT`/物理直通/PLL 停止/采样停止。
 
-当前主机没有枚举原自动板测使用的 COM10，因此不能从 PC 注入 TJC
+2026-07-31 Task5 调试验证：
+
+- 三项主机测试 `test_openmv_protocol`、`test_task5_controller` 和
+  `test_app_core` 全部通过；Task5 测试覆盖 ACK 超时、首次发送失败、
+  ACK 重发阶段发送失败以及错误态保持 DAC。
+- `cmake --build build/cube-release` 成功；资源占用为 FLASH 44,104
+  bytes、RAM 27,168 bytes。
+- CubeProgrammer 2.23.0 通过 SWD 下载、校验并复位成功；目标为
+  STM32F42xxx/F43xxx，Device ID `0x419`，连接电压 3.24 V。
+- 旧固件现场捕获到 `START_TASK ACK timeout`：ACK 已重发 3 次，
+  OpenMV 合法帧、CRC 错误、UART 硬件错误和 TX 队列错误均为 0。
+- 新固件主动发送的 9 字节 HEARTBEAT 已全部离开 UART5 TX 环并完成
+  发送中断，但 OpenMV 未回 ACK；故障边界位于 STM32 UART5_TX 之后、
+  OpenMV 回传之前。
+- 新固件板上复现无 ACK 后保持 `TASK5 + ERROR`；实测 PE6 为低，
+  DAC1/TIM6/DMA1 Stream5 均运行，锯齿表端点为 `0x000/0xFFF`，
+  DAC 启动错误和 DMA 欠载计数均为 0。
+
+本轮未确认 COM12 的 CH340 是否实际连接到 TJC，因此未从 PC 注入 TJC
 触摸帧，也不能复用已经移除的 ASCII CLI 读取锁相状态。第 11 节中需要
 串口屏、信号源和示波器参与的项目仍属于现场验收项；在完成这些实测前，
 不得把倍率/相位/幅度的本轮硬件回归标记为通过。
