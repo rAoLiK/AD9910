@@ -79,6 +79,10 @@ typedef struct {
   uint8_t search_count;
   uint8_t ack_retry_count;
   uint8_t result_retry_count;
+  uint16_t last_match_score;
+  uint8_t last_match_confidence;
+  uint16_t best_match_quality;
+  uint32_t best_match_frequency_hz;
   uint32_t duplicate_result_count;
   uint32_t stale_result_count;
   uint32_t invalid_frame_count;
@@ -98,6 +102,20 @@ typedef struct {
 } task5_pending_tx_t;
 
 typedef struct {
+  bool seeded;
+  bool complete;
+  uint8_t sample_count;
+  uint8_t rise_count;
+  uint16_t previous_distance;
+  uint16_t best_distance;
+  uint32_t previous_frequency_hz;
+  uint32_t best_frequency_hz;
+  uint32_t best_pair_cost;
+  uint32_t best_pair_lower_hz;
+  uint32_t best_pair_upper_hz;
+} task5_search_trend_t;
+
+typedef struct {
   task5_port_t port;
   task5_status_t status;
   task5_pending_tx_t pending;
@@ -110,6 +128,11 @@ typedef struct {
   uint32_t search_upper_hz;
   uint8_t undirected_attempt;
   uint8_t image_retry_count;
+  bool high_frequency_search;
+  task5_search_trend_t coarse_trend[2];
+  uint16_t fine_best_distance;
+  uint16_t fine_worst_distance;
+  uint32_t fine_best_frequency_hz;
   bool last_result_valid;
   uint8_t last_result_type;
   uint8_t last_result_seq;

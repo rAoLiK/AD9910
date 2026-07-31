@@ -174,10 +174,12 @@ static uint32_t begin_frequency_search(
   return 30U;
 }
 
-static void finish_dds_test(
+static void finish_dds_test_with_quality(
     task5_controller_t *controller,
     fake_port_t *fake,
     uint8_t result,
+    uint16_t score,
+    uint8_t confidence,
     uint8_t result_seq,
     uint32_t *now_ms)
 {
@@ -205,10 +207,22 @@ static void finish_dds_test(
   OpenMV_WriteU16LE(&frame.payload[0], status.session_id);
   OpenMV_WriteU16LE(&frame.payload[2], status.test_id);
   frame.payload[4] = result;
-  OpenMV_WriteU16LE(&frame.payload[5], 900U);
-  frame.payload[7] = 95U;
+  OpenMV_WriteU16LE(&frame.payload[5], score);
+  frame.payload[7] = confidence;
   *now_ms += 1U;
   Task5_OnFrame(controller, &frame, *now_ms);
+}
+
+static void finish_dds_test(
+    task5_controller_t *controller,
+    fake_port_t *fake,
+    uint8_t result,
+    uint8_t result_seq,
+    uint32_t *now_ms)
+{
+  finish_dds_test_with_quality(
+      controller, fake, result, 900U, 95U,
+      result_seq, now_ms);
 }
 
 static void assert_frequency_history(
@@ -342,7 +356,7 @@ static void test_boundary_candidates_are_unique_100_hz_grid(void)
       TASK5_MODE_INFINITY_2X_0_DEG, 100000U, 200000U);
 }
 
-static void test_search_limit_stops_before_candidate_42(void)
+static void test_high_search_rejects_flat_quality_curve(void)
 {
   fake_port_t fake = {0};
   task5_controller_t controller;
@@ -353,18 +367,162 @@ static void test_search_limit_stops_before_candidate_42(void)
   now_ms = begin_frequency_search(
       &controller, &fake, TASK5_MODE_LINE_0_DEG,
       1000U, 100000U);
-  for (index = 0U; index < 41U; index++) {
-    finish_dds_test(
+  for (index = 0U; index < 29U; index++) {
+    finish_dds_test_with_quality(
         &controller, &fake, TEST_DDS_NOT_MATCHED,
-        (uint8_t)(0x80U + index), &now_ms);
+        600U, 100U, (uint8_t)(0x80U + index), &now_ms);
   }
 
   Task5_GetStatus(&controller, &status);
   assert(status.state == TASK5_STATE_ERROR);
   assert(status.last_error == TASK5_ERROR_SEARCH_LIMIT);
-  assert(status.search_count == 41U);
-  assert(fake.dds_set_count == 41U);
-  assert_frequency_history_is_unique_grid(&fake);
+  assert(status.search_count == 29U);
+  assert(fake.dds_set_count == 29U);
+}
+
+static void test_fast_settle_and_capture_delay(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+
+  (void)begin_frequency_search(
+      &controller, &fake, TASK5_MODE_LINE_0_DEG,
+      1000U, 5249U);
+  assert(fake.type != OPENMV_MSG_DDS_TEST);
+  Task5_Process(&controller, 49U);
+  assert(fake.type != OPENMV_MSG_DDS_TEST);
+  Task5_Process(&controller, 50U);
+  assert(fake.type == OPENMV_MSG_DDS_TEST);
+  assert(OpenMV_ReadU16LE(&fake.payload[9]) == 80U);
+}
+
+static void test_high_search_threshold_is_inclusive(void)
+{
+  fake_port_t below_fake = {0};
+  fake_port_t high_fake = {0};
+  task5_controller_t below_controller;
+  task5_controller_t high_controller;
+  task5_status_t status;
+
+  (void)begin_frequency_search(
+      &below_controller, &below_fake,
+      TASK5_MODE_LINE_0_DEG, 1000U, 9999U);
+  Task5_GetStatus(&below_controller, &status);
+  assert(status.search_stage == 0x02U);
+
+  (void)begin_frequency_search(
+      &high_controller, &high_fake,
+      TASK5_MODE_LINE_0_DEG, 1000U, 10000U);
+  Task5_GetStatus(&high_controller, &status);
+  assert(status.search_stage == 0x01U);
+  assert(high_fake.dds_frequency_hz == 10000U);
+}
+
+static void test_high_search_uses_trend_pair_midpoint(void)
+{
+  static const uint32_t coarse_frequencies[] = {
+      50000U, 51000U, 49000U, 52000U,
+      48000U, 53000U, 54000U, 55000U};
+  static const uint16_t qualities[] = {
+      300U, 400U, 200U, 700U,
+      100U, 850U, 650U, 400U};
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  uint32_t now_ms;
+  uint32_t index;
+
+  now_ms = begin_frequency_search(
+      &controller, &fake, TASK5_MODE_LINE_0_DEG,
+      1000U, 50000U);
+  for (index = 0U;
+       index <
+       (sizeof(coarse_frequencies) /
+        sizeof(coarse_frequencies[0]));
+       index++) {
+    assert(fake.dds_frequency_hz == coarse_frequencies[index]);
+    finish_dds_test_with_quality(
+        &controller, &fake, TEST_DDS_NOT_MATCHED,
+        qualities[index], 100U,
+        (uint8_t)(0xA0U + index), &now_ms);
+  }
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_DDS_SETTLING);
+  assert(status.search_stage == 0x02U);
+  assert(controller.search_lower_hz == 52000U);
+  assert(controller.search_upper_hz == 53000U);
+  assert(fake.dds_frequency_hz == 52500U);
+  assert(status.best_match_quality == 850U);
+  assert(status.best_match_frequency_hz == 53000U);
+}
+
+static void test_missed_initial_target_returns_to_valley_minimum(void)
+{
+  static const uint32_t coarse_frequencies[] = {
+      50000U, 51000U, 49000U, 52000U, 48000U};
+  static const uint16_t coarse_qualities[] = {
+      800U, 500U, 500U, 200U, 200U};
+  static const uint32_t fine_frequencies[] = {
+      49500U, 49600U, 49400U, 49700U, 49300U, 49800U,
+      49200U, 49900U, 49100U, 50000U, 49000U};
+  static const uint16_t fine_qualities[] = {
+      300U, 350U, 250U, 400U, 200U, 500U,
+      150U, 600U, 100U, 700U, 80U};
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  openmv_frame_t frame;
+  uint32_t now_ms;
+  uint32_t index;
+
+  now_ms = begin_frequency_search(
+      &controller, &fake, TASK5_MODE_LINE_0_DEG,
+      1000U, 50000U);
+  for (index = 0U;
+       index <
+       (sizeof(coarse_frequencies) /
+        sizeof(coarse_frequencies[0]));
+       index++) {
+    assert(fake.dds_frequency_hz == coarse_frequencies[index]);
+    finish_dds_test_with_quality(
+        &controller, &fake, TEST_DDS_NOT_MATCHED,
+        coarse_qualities[index], 100U,
+        (uint8_t)(0xB0U + index), &now_ms);
+  }
+
+  assert(controller.search_lower_hz == 49000U);
+  assert(controller.search_upper_hz == 50000U);
+  for (index = 0U;
+       index <
+       (sizeof(fine_frequencies) /
+        sizeof(fine_frequencies[0]));
+       index++) {
+    assert(fake.dds_frequency_hz == fine_frequencies[index]);
+    finish_dds_test_with_quality(
+        &controller, &fake, TEST_DDS_NOT_MATCHED,
+        fine_qualities[index], 100U,
+        (uint8_t)(0xC0U + index), &now_ms);
+  }
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.search_stage == 0x03U);
+  assert(fake.dds_frequency_hz == 50000U);
+  assert(controller.fine_best_frequency_hz == 50000U);
+
+  finish_dds_test_with_quality(
+      &controller, &fake, TEST_DDS_NOT_MATCHED,
+      650U, 100U, 0xD0U, &now_ms);
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
+  assert(fake.type == OPENMV_MSG_STOP_TASK);
+  assert(fake.dds_frequency_hz == 50000U);
+
+  frame = ack_for(&fake);
+  Task5_OnFrame(&controller, &frame, now_ms + 1U);
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_FREQUENCY_HOLD);
+  assert(status.dds_frequency_hz == 50000U);
 }
 
 static void test_image_retry_does_not_consume_candidate_limit(void)
@@ -808,7 +966,11 @@ int main(void)
   test_coarse_origin_rounds_to_100_hz();
   test_search_order_ignores_openmv_direction_hint();
   test_boundary_candidates_are_unique_100_hz_grid();
-  test_search_limit_stops_before_candidate_42();
+  test_high_search_rejects_flat_quality_curve();
+  test_fast_settle_and_capture_delay();
+  test_high_search_threshold_is_inclusive();
+  test_high_search_uses_trend_pair_midpoint();
+  test_missed_initial_target_returns_to_valley_minimum();
   test_image_retry_does_not_consume_candidate_limit();
   test_complete_success_flow();
   test_lost_stop_ack_still_holds_frequency();

@@ -85,6 +85,7 @@ DDS_ELLIPSE_MAX_RADIAL_CV = 0.60
 DDS_MAX_RUN_EXCESS_RATIO = 0.30
 DDS_MIN_VALID_FRAMES = 10
 DDS_MIN_OBSERVATION_MS = 100
+DDS_COARSE_OBSERVATION_DEADLINE_MS = 180
 DDS_OBSERVATION_DEADLINE_MS = 320
 DDS_MIN_FAMILY_PERCENT = 80
 DDS_MIN_CONSECUTIVE_FAMILY = 4
@@ -3895,11 +3896,15 @@ class LissajousStabilityDetector:
             return
         self.trace_seed_rect = tuple(trace_rect)
 
-    def reset_test(self, capture_due_ms):
+    def reset_test(
+        self,
+        capture_due_ms,
+        observation_deadline_ms=DDS_OBSERVATION_DEADLINE_MS,
+    ):
         self.capture_due_ms = capture_due_ms
         self.deadline_ms = time.ticks_add(
             capture_due_ms,
-            DDS_OBSERVATION_DEADLINE_MS,
+            observation_deadline_ms,
         )
         self.first_valid_ms = None
         self.last_valid_ms = None
@@ -5631,7 +5636,10 @@ class Task5Controller:
         self.dds_stability_confidence = 0
         self.stability_detector.set_trace_seed(self.last_rect)
         self.stability_detector.reset_test(
-            self.dds_capture_due_ms
+            self.dds_capture_due_ms,
+            DDS_COARSE_OBSERVATION_DEADLINE_MS
+            if search_stage == 1
+            else DDS_OBSERVATION_DEADLINE_MS,
         )
         # Previous candidate masks are now unreachable; reclaim them during
         # the requested capture delay rather than during a measured frame.

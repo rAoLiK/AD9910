@@ -137,6 +137,12 @@ def main():
         def _extract_trace(self, frame):
             return frame
 
+    deadline_detector = base_type()
+    deadline_detector.reset_test(100)
+    assert deadline_detector.deadline_ms == 420
+    deadline_detector.reset_test(100, 180)
+    assert deadline_detector.deadline_ms == 280
+
     # The coarse-stage green-trace rectangle must provide a usable fixed
     # square ROI without relying on the connected dark background.
     geometry_detector = base_type()
