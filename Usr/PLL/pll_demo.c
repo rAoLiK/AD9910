@@ -628,6 +628,25 @@ HAL_StatusTypeDef PLL_Demo_Configure(uint8_t multiplier,
   return HAL_OK;
 }
 
+HAL_StatusTypeDef PLL_Demo_SeedFrequency(float frequency_hz)
+{
+  if (!s_context.initialized || s_context.running ||
+      !isfinite(frequency_hz) ||
+      (frequency_hz < 1.0f) ||
+      (frequency_hz > 400000000.0f)) {
+    return HAL_ERROR;
+  }
+
+  if (!PLL_Demo_ApplyDDS(
+          frequency_hz, 0.0f, false, true)) {
+    PLL_Demo_EnterError("SEED_DDS");
+    PLL_Demo_UpdateStatus();
+    return HAL_ERROR;
+  }
+  PLL_Demo_UpdateStatus();
+  return HAL_OK;
+}
+
 HAL_StatusTypeDef PLL_Demo_Start(void)
 {
   if (!s_context.initialized) {

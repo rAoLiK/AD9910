@@ -60,6 +60,12 @@ HAL_StatusTypeDef PLL_Demo_Init(ad9910_t *dds);
 HAL_StatusTypeDef PLL_Demo_Configure(uint8_t multiplier,
                                      float target_phase_deg,
                                      float output_scale);
+/*
+ * Prime the DDS frequency used by the next Start(). This is only accepted
+ * while stopped and lets Task5 hand its camera-assisted result to the
+ * phase-lock loop without resetting the DDS to the default 10 kHz.
+ */
+HAL_StatusTypeDef PLL_Demo_SeedFrequency(float frequency_hz);
 HAL_StatusTypeDef PLL_Demo_Start(void);
 HAL_StatusTypeDef PLL_Demo_Stop(void);
 void PLL_Demo_Process(void);

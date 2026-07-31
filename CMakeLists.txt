@@ -58,6 +58,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_hmi_map.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_board.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP/app_integration.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/openmv_protocol.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/openmv_uart.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/app_saw.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/task5_controller.c
 )
 
 # Add include paths
@@ -67,6 +71,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/PLL
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/SCREEN_TJC
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/APP
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5
 )
 
 # Add project symbols (macros)

@@ -172,7 +172,7 @@ static void TestAppStateMachine(void)
   assert(fake.buttons_enabled);
   assert(AppCore_HandleCommand(&core, APP_COMMAND_TASK5_INFINITY));
   AppCore_GetStatus(&core, &status);
-  assert(status.state == APP_STATE_TASK5_PLACEHOLDER);
+  assert(status.state == APP_STATE_TASK5);
   assert(status.waveform == APP_WAVEFORM_TASK3_INFINITY);
 
   assert(AppCore_HandleCommand(&core, APP_COMMAND_GO_MENU));

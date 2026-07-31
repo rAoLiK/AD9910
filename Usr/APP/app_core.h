@@ -11,7 +11,7 @@ extern "C" {
 typedef enum {
   APP_STATE_MENU_SAFE = 0,
   APP_STATE_TASK14,
-  APP_STATE_TASK5_PLACEHOLDER,
+  APP_STATE_TASK5,
   APP_STATE_ERROR_SAFE
 } app_state_t;
 
@@ -28,7 +28,12 @@ typedef enum {
   APP_ACTIVITY_LOCK_SEARCH,
   APP_ACTIVITY_LOCK_ACQUIRE,
   APP_ACTIVITY_LOCKED,
-  APP_ACTIVITY_TASK5_WAITING,
+  APP_ACTIVITY_TASK5_WAIT_SELECTION,
+  APP_ACTIVITY_TASK5_WAITING = APP_ACTIVITY_TASK5_WAIT_SELECTION,
+  APP_ACTIVITY_TASK5_COMMUNICATING,
+  APP_ACTIVITY_TASK5_SEARCHING,
+  APP_ACTIVITY_TASK5_LOCKING,
+  APP_ACTIVITY_TASK5_LOCKED,
   APP_ACTIVITY_ERROR
 } app_activity_t;
 
@@ -54,7 +59,8 @@ typedef enum {
   APP_ERROR_SAFE_OUTPUT,
   APP_ERROR_DIRECT_OUTPUT,
   APP_ERROR_LOCK_START,
-  APP_ERROR_LOCK_RUNTIME
+  APP_ERROR_LOCK_RUNTIME,
+  APP_ERROR_TASK5_RUNTIME
 } app_error_t;
 
 typedef struct {
@@ -90,6 +96,8 @@ typedef struct {
 bool AppCore_Init(app_core_t *core, const app_port_t *port);
 bool AppCore_HandleCommand(app_core_t *core, app_command_t command);
 void AppCore_SetLockActivity(app_core_t *core, app_activity_t activity);
+void AppCore_SetTask5Activity(app_core_t *core,
+                              app_activity_t activity);
 void AppCore_ReportError(app_core_t *core, app_error_t error);
 void AppCore_GetStatus(const app_core_t *core, app_status_t *status);
 

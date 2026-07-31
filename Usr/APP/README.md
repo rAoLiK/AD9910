@@ -3,9 +3,10 @@
 ## 1. 集成结果
 
 本目录把题目任务、串口屏输入、板级继电器/按键和原有锁相模块组合为
-一个非阻塞应用状态机。USART1 只服务 TJC 串口屏；原 `pll_demo.c` 中的
-ASCII CLI 已移除。锁相计算仍然只在主循环执行，ADC/DMA、UART 和按键
-ISR 只发布固定大小事件或搬运一个字节。
+一个非阻塞应用状态机。USART1 只服务 TJC 串口屏，UART5 只服务
+OpenMV；原 `pll_demo.c` 中的 ASCII CLI 已移除。锁相计算与 Task5
+协议状态转换只在主循环执行，ADC/DMA、UART 和按键 ISR 只发布固定
+大小事件或搬运一个字节。
 
 主循环入口：
 
@@ -23,6 +24,7 @@ while (1) {
 | `app_hmi_map.h/.c` | 页面/控件/触发沿到逻辑命令的表驱动映射 |
 | `app_board.h/.c` | PE5 继电器、PA0/PB9/PB8 按键、EXTI 和安全输出 |
 | `app_integration.h/.c` | 装配 PLL、TJC、板级端口，调度主循环并集中转发 UART 回调 |
+| `../TASK5/*` | UART5 OpenMV 协议、Task5 状态机及 PA4 DAC 锯齿波 |
 | `../PLL/pll_demo.*` | 非阻塞锁相服务及 ADC ISR 入口 |
 | `../SCREEN_TJC/*` | USART1 传输、协议解析和控件命令 |
 
@@ -30,7 +32,8 @@ while (1) {
 
 ```text
 TJC UART ISR -> RX 字节环 -> 主循环协议解析 -> HMI 映射 -> 逻辑命令队列
-按键 EXTI ISR -> 事件位 -------------------------------^
+按键 EXTI ISR -> 饱和计数器 -> 单击/双击判定 ----------^
+UART5 ISR -> RX 字节环 -> OpenMV 帧解析 -> Task5 状态机
 主循环 -> app_core -> board/PLL 端口 -> PLL_Demo_Process
 ADC DMA ISR -> 半缓冲就绪位 -----------> PLL_Demo_Process
 app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
@@ -43,7 +46,9 @@ app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
 | `MENU_SAFE` | 直通安全位 | DDS 零幅度、ADC 停止 | 禁用 |
 | `TASK14` + `DIRECT` | 直通 | DDS 零幅度、ADC 停止 | 禁用 |
 | `TASK14` + `LOCK_*` | DDS | 搜索/捕获/锁定 | 禁用 |
-| `TASK5_PLACEHOLDER` | 直通安全位 | DDS 零幅度、ADC 停止 | 启用 |
+| `TASK5` 等待选择/粗识别 | 直通安全位 | PA4 DAC 输出锯齿波 | 启用 |
+| `TASK5` DDS 搜索 | DDS | 相机判频，ADC 停止 | 启用 |
+| `TASK5` 相位锁定 | DDS | ADC/PLL 运行 | 启用 |
 | `ERROR_SAFE` | 直通安全位 | DDS 零幅度、ADC 停止 | 禁用 |
 
 所有状态转换先回安全基线，再进入目标状态。屏幕启动或唤醒只触发当前
@@ -58,7 +63,7 @@ app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
 | 页面 | component ID | 逻辑命令 |
 |---:|---:|---|
 | 0 | 2 | 进入 Task1-4 页面安全空闲态 |
-| 0 | 3 | 进入 Task5 占位状态 |
+| 0 | 3 | 进入 Task5，等待实体按键选择 |
 | 1 | 2 | 返回菜单安全态 |
 | 1 | 3 | Task2：1×、实际输出 +90° |
 | 1 | 4 | Task3：2×、实际广义相位 0° |
@@ -143,10 +148,14 @@ ADC2 在放大器前，因此它只用于频率/相位反馈，不能验证放�
 | PB9 | Task5 圆，按下接地，内部上拉，EXTI 下降沿 |
 | PB8 | Task5 ∞，按下接地，内部上拉，EXTI 下降沿 |
 | USART1 PA9/PA10 | TJC，115200 8N1，逐字节 RX/TX 中断 |
+| UART5 PC12/PD2 | OpenMV TX/RX，115200 8N1，逐字节中断和环形缓冲 |
+| PA4 | DAC_OUT1，Task5 单调递增锯齿波 |
+| TIM6/DMA1 Stream5 | 100 点锯齿波触发与循环搬运 |
 | DMA2 Stream0 | ADC1/ADC2 双重模式采样，保持原分配 |
 
 继电器极性由 `APP_RELAY_DIRECT_ACTIVE_HIGH` 控制。三个按键 IRQ 仅在
-`TASK5_PLACEHOLDER` 中启用，主循环另做 50 ms 去抖。
+`TASK5` 中启用，主循环另做 50 ms 去抖。同一模式键单击选择 1 kHz，
+400 ms 内双击选择 10 kHz。
 
 ## 8. TJC 非阻塞规则
 
@@ -226,13 +235,16 @@ RAM:   24,984 bytes
    2/4/6/8 div 均保持 DDS 锁相。
 6. 切换输入频率，确认重新捕获且没有长期停留
    `frequency_change_pending`。
-7. page2 中 PA0/PB9/PB8 更新 `t2` 占位状态；其他页面按键无作用。
+7. page2 中 PA0/PB9/PB8 分别选择直线/圆/∞；单击输出 1 kHz 锯齿波，
+   双击输出 10 kHz，其他页面按键无作用。
 8. 任意页面退出后回到直通安全态，DDS 和 ADC 停止。
 9. 检查 PLL 的 `OVR/ADCERR/DDSERR` 以及 TJC 的 RX/TX/队列诊断计数
    不增长。
 
-Task5 摄像头识别、声光提示和 10 s/5 s 自动流程尚未实现；当前仅保留
-三个模式的稳定逻辑入口、按键资源和屏幕状态显示。
+Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
+去重、粗识别、DDS 测试搜索以及命中后向本地相位锁定的交接。OpenMV
+端必须按 `ref/Task5与OpenMV串口通信协议-最终版.md` 实现对应状态机。
+声光提示不在本工程现有硬件范围内。
 
 ## 12. 本次集成验证记录
 
@@ -242,7 +254,7 @@ Task5 摄像头识别、声光提示和 10 s/5 s 自动流程尚未实现；当�
   重捕获、倍率一致的输入域变化门限和低频偏差场景。
 - `analysis/test_app_core.c` 全部通过，覆盖 PRESS 映射、Task1 直通、
   Task1 的 2 div 切换 DDS 及 8 div 返回物理直通、Task2 的 8 div
-  仍保持 DDS、Task5 按键占位和错误安全收敛。
+  仍保持 DDS、Task5 按键入口和错误安全收敛。
 - `cmake --build build/cube-release` 成功；最终资源占用为 FLASH 36,336
   bytes、RAM 25,312 bytes。
 - STM32CubeProgrammer 2.23.0 通过 SWD 将 `AD9910.elf` 写入

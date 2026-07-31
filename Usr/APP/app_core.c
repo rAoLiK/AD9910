@@ -229,9 +229,10 @@ bool AppCore_HandleCommand(app_core_t *core, app_command_t command)
       if (core->port.enable_task5_buttons != NULL) {
         core->port.enable_task5_buttons(core->port.context, true);
       }
-      core->status.state = APP_STATE_TASK5_PLACEHOLDER;
+      core->status.state = APP_STATE_TASK5;
       core->status.waveform = APP_WAVEFORM_NONE;
-      core->status.activity = APP_ACTIVITY_TASK5_WAITING;
+      core->status.activity =
+          APP_ACTIVITY_TASK5_WAIT_SELECTION;
       core->status.last_error = APP_ERROR_NONE;
       core->status.transition_count++;
       AppCore_Touch(core);
@@ -252,14 +253,15 @@ bool AppCore_HandleCommand(app_core_t *core, app_command_t command)
     case APP_COMMAND_TASK5_LINE:
     case APP_COMMAND_TASK5_CIRCLE:
     case APP_COMMAND_TASK5_INFINITY:
-      if (core->status.state == APP_STATE_TASK5_PLACEHOLDER) {
+      if (core->status.state == APP_STATE_TASK5) {
         core->status.waveform =
             (command == APP_COMMAND_TASK5_LINE)
                 ? APP_WAVEFORM_TASK1_LINE
                 : (command == APP_COMMAND_TASK5_CIRCLE)
                       ? APP_WAVEFORM_TASK2_CIRCLE
                       : APP_WAVEFORM_TASK3_INFINITY;
-        core->status.activity = APP_ACTIVITY_TASK5_WAITING;
+        core->status.activity =
+            APP_ACTIVITY_TASK5_COMMUNICATING;
         core->status.transition_count++;
         AppCore_Touch(core);
         return true;
@@ -286,6 +288,25 @@ void AppCore_SetLockActivity(app_core_t *core, app_activity_t activity)
       ((activity != APP_ACTIVITY_LOCK_SEARCH) &&
        (activity != APP_ACTIVITY_LOCK_ACQUIRE) &&
        (activity != APP_ACTIVITY_LOCKED))) {
+    return;
+  }
+
+  if (core->status.activity != activity) {
+    core->status.activity = activity;
+    AppCore_Touch(core);
+  }
+}
+
+void AppCore_SetTask5Activity(app_core_t *core,
+                              app_activity_t activity)
+{
+  if ((core == NULL) ||
+      (core->status.state != APP_STATE_TASK5) ||
+      ((activity != APP_ACTIVITY_TASK5_WAIT_SELECTION) &&
+       (activity != APP_ACTIVITY_TASK5_COMMUNICATING) &&
+       (activity != APP_ACTIVITY_TASK5_SEARCHING) &&
+       (activity != APP_ACTIVITY_TASK5_LOCKING) &&
+       (activity != APP_ACTIVITY_TASK5_LOCKED))) {
     return;
   }
 

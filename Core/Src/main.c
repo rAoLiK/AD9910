@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
+#include "dac.h"
 #include "dma.h"
 #include "tim.h"
 #include "usart.h"
@@ -108,10 +109,13 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
+  MX_DAC_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_TIM2_Init();
+  MX_TIM6_Init();
   MX_USART1_UART_Init();
+  MX_UART5_Init();
   /* USER CODE BEGIN 2 */
   AppBoard_Init();
   if (DDS_Init() != AD9910_STATUS_OK) {
@@ -120,7 +124,7 @@ int main(void)
   if (PLL_Demo_Init(&g_ad9910) != HAL_OK) {
     Error_Handler();
   }
-  if (AppIntegration_Init() != HAL_OK) {
+  if (AppIntegration_Init(&g_ad9910) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE END 2 */

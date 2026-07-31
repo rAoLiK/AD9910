@@ -12,7 +12,7 @@
 #define APP_BUTTON_INFINITY_PIN    GPIO_PIN_8
 #define APP_BUTTON_IRQ_PRIORITY    (5U)
 
-static volatile uint32_t s_button_events;
+static volatile app_board_button_counts_t s_button_counts;
 static volatile bool s_buttons_enabled;
 static app_board_path_t s_path = APP_BOARD_PATH_DIRECT;
 
@@ -78,7 +78,9 @@ void AppBoard_EnableTask5Buttons(bool enable)
   uint32_t primask = __get_PRIMASK();
 
   __disable_irq();
-  s_button_events = 0U;
+  s_button_counts.line = 0U;
+  s_button_counts.circle = 0U;
+  s_button_counts.infinity = 0U;
   __HAL_GPIO_EXTI_CLEAR_IT(APP_BUTTON_LINE_PIN);
   __HAL_GPIO_EXTI_CLEAR_IT(APP_BUTTON_CIRCLE_PIN);
   __HAL_GPIO_EXTI_CLEAR_IT(APP_BUTTON_INFINITY_PIN);
@@ -94,17 +96,22 @@ void AppBoard_EnableTask5Buttons(bool enable)
   __set_PRIMASK(primask);
 }
 
-uint32_t AppBoard_TakeButtonEvents(void)
+void AppBoard_TakeButtonCounts(app_board_button_counts_t *counts)
 {
-  uint32_t events;
   uint32_t primask = __get_PRIMASK();
 
+  if (counts == NULL) {
+    return;
+  }
   __disable_irq();
-  events = s_button_events;
-  s_button_events = 0U;
+  counts->line = s_button_counts.line;
+  counts->circle = s_button_counts.circle;
+  counts->infinity = s_button_counts.infinity;
+  s_button_counts.line = 0U;
+  s_button_counts.circle = 0U;
+  s_button_counts.infinity = 0U;
   __DMB();
   __set_PRIMASK(primask);
-  return events;
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)
@@ -116,15 +123,21 @@ void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)
   if ((gpio_pin == APP_BUTTON_LINE_PIN) &&
       (HAL_GPIO_ReadPin(APP_BUTTON_LINE_PORT,
                         APP_BUTTON_LINE_PIN) == GPIO_PIN_SET)) {
-    s_button_events |= APP_BUTTON_EVENT_LINE;
+    if (s_button_counts.line != UINT8_MAX) {
+      s_button_counts.line++;
+    }
   } else if ((gpio_pin == APP_BUTTON_CIRCLE_PIN) &&
              (HAL_GPIO_ReadPin(APP_BUTTON_CIRCLE_PORT,
                                APP_BUTTON_CIRCLE_PIN) == GPIO_PIN_RESET)) {
-    s_button_events |= APP_BUTTON_EVENT_CIRCLE;
+    if (s_button_counts.circle != UINT8_MAX) {
+      s_button_counts.circle++;
+    }
   } else if ((gpio_pin == APP_BUTTON_INFINITY_PIN) &&
              (HAL_GPIO_ReadPin(APP_BUTTON_INFINITY_PORT,
                                APP_BUTTON_INFINITY_PIN) == GPIO_PIN_RESET)) {
-    s_button_events |= APP_BUTTON_EVENT_INFINITY;
+    if (s_button_counts.infinity != UINT8_MAX) {
+      s_button_counts.infinity++;
+    }
   }
   __DMB();
 }
