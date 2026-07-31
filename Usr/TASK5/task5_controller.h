@@ -83,6 +83,8 @@ typedef struct {
   uint8_t last_match_confidence;
   uint16_t best_match_quality;
   uint32_t best_match_frequency_hz;
+  uint32_t image_recovery_count;
+  uint32_t search_restart_count;
   uint32_t duplicate_result_count;
   uint32_t stale_result_count;
   uint32_t invalid_frame_count;
@@ -133,6 +135,7 @@ typedef struct {
   uint16_t fine_best_distance;
   uint16_t fine_worst_distance;
   uint32_t fine_best_frequency_hz;
+  bool confirmation_peak_valid;
   bool last_result_valid;
   uint8_t last_result_type;
   uint8_t last_result_seq;

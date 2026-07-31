@@ -356,7 +356,7 @@ static void test_boundary_candidates_are_unique_100_hz_grid(void)
       TASK5_MODE_INFINITY_2X_0_DEG, 100000U, 200000U);
 }
 
-static void test_high_search_rejects_flat_quality_curve(void)
+static void test_high_search_restarts_flat_quality_curve(void)
 {
   fake_port_t fake = {0};
   task5_controller_t controller;
@@ -374,10 +374,80 @@ static void test_high_search_rejects_flat_quality_curve(void)
   }
 
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_ERROR);
-  assert(status.last_error == TASK5_ERROR_SEARCH_LIMIT);
-  assert(status.search_count == 29U);
-  assert(fake.dds_set_count == 29U);
+  assert(status.state == TASK5_STATE_DDS_SETTLING);
+  assert(status.last_error == TASK5_ERROR_NONE);
+  assert(status.search_stage == 0x01U);
+  assert(status.search_restart_count == 1U);
+  assert(status.search_count == 30U);
+  assert(fake.dds_set_count == 30U);
+  assert(!fake.saw_running);
+}
+
+static void test_search_count_saturates_without_limit_error(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  uint32_t now_ms;
+  uint32_t index;
+
+  now_ms = begin_frequency_search(
+      &controller, &fake, TASK5_MODE_LINE_0_DEG,
+      1000U, 100000U);
+  for (index = 0U; index < 320U; index++) {
+    finish_dds_test_with_quality(
+        &controller, &fake, TEST_DDS_NOT_MATCHED,
+        600U, 100U, (uint8_t)index, &now_ms);
+  }
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_DDS_SETTLING);
+  assert(status.last_error == TASK5_ERROR_NONE);
+  assert(status.search_count == UINT8_MAX);
+  assert(status.search_restart_count >= 10U);
+  assert(fake.dds_set_count > 255U);
+  assert(!fake.saw_running);
+}
+
+static void test_low_search_holds_local_quality_peak(void)
+{
+  static const uint32_t frequencies[] = {
+      5200U, 5300U, 5100U, 5400U, 5000U, 5500U};
+  static const uint16_t qualities[] = {
+      500U, 850U, 300U, 600U, 100U, 300U};
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  uint32_t now_ms;
+  uint32_t index;
+
+  now_ms = begin_frequency_search(
+      &controller, &fake, TASK5_MODE_LINE_0_DEG,
+      1000U, 5249U);
+  for (index = 0U;
+       index < (sizeof(frequencies) / sizeof(frequencies[0]));
+       index++) {
+    assert(fake.dds_frequency_hz == frequencies[index]);
+    finish_dds_test_with_quality(
+        &controller, &fake, TEST_DDS_NOT_MATCHED,
+        qualities[index], 100U,
+        (uint8_t)(0x60U + index), &now_ms);
+  }
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.search_stage == 0x03U);
+  assert(fake.dds_frequency_hz == 5300U);
+  assert(controller.confirmation_peak_valid);
+  assert(controller.fine_best_frequency_hz == 5300U);
+
+  finish_dds_test_with_quality(
+      &controller, &fake, TEST_DDS_NOT_MATCHED,
+      700U, 100U, 0x70U, &now_ms);
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
+  assert(fake.type == OPENMV_MSG_STOP_TASK);
+  assert(fake.dds_frequency_hz == 5300U);
+  assert(!fake.saw_running);
 }
 
 static void test_fast_settle_and_capture_delay(void)
@@ -525,7 +595,7 @@ static void test_missed_initial_target_returns_to_valley_minimum(void)
   assert(status.dds_frequency_hz == 50000U);
 }
 
-static void test_image_retry_does_not_consume_candidate_limit(void)
+static void test_image_error_retries_forever_without_output_change(void)
 {
   fake_port_t fake = {0};
   task5_controller_t controller;
@@ -553,12 +623,14 @@ static void test_image_retry_does_not_consume_candidate_limit(void)
       0x73U, &now_ms);
 
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_ERROR);
-  assert(status.last_error == TASK5_ERROR_IMAGE_RECOGNITION);
+  assert(status.state == TASK5_STATE_DDS_SETTLING);
+  assert(status.last_error == TASK5_ERROR_NONE);
   assert(status.last_openmv_result == TEST_DDS_IMAGE_ERROR);
+  assert(status.image_recovery_count == 3U);
   assert(status.search_count == 1U);
   assert(fake.dds_frequency_hz == 5200U);
   assert(fake.dds_set_count == 1U);
+  assert(!fake.saw_running);
 }
 
 static void test_complete_success_flow(void)
@@ -966,12 +1038,14 @@ int main(void)
   test_coarse_origin_rounds_to_100_hz();
   test_search_order_ignores_openmv_direction_hint();
   test_boundary_candidates_are_unique_100_hz_grid();
-  test_high_search_rejects_flat_quality_curve();
+  test_high_search_restarts_flat_quality_curve();
+  test_search_count_saturates_without_limit_error();
+  test_low_search_holds_local_quality_peak();
   test_fast_settle_and_capture_delay();
   test_high_search_threshold_is_inclusive();
   test_high_search_uses_trend_pair_midpoint();
   test_missed_initial_target_returns_to_valley_minimum();
-  test_image_retry_does_not_consume_candidate_limit();
+  test_image_error_retries_forever_without_output_change();
   test_complete_success_flow();
   test_lost_stop_ack_still_holds_frequency();
   test_ack_retry_keeps_sequence();

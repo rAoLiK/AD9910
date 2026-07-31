@@ -11,17 +11,16 @@
 #define TASK5_DDS_SETTLE_MS              (20UL)
 #define TASK5_CAPTURE_DELAY_MS           (80U)
 #define TASK5_CONFIRM_CAPTURE_DELAY_MS   (160U)
-#define TASK5_IMAGE_MAX_RETRIES          (2U)
 #define TASK5_FINE_SEARCH_STEP_HZ        (100UL)
 #define TASK5_HIGH_COARSE_STEP_HZ        (1000UL)
 #define TASK5_HIGH_SEARCH_THRESHOLD_HZ   (10000UL)
 #define TASK5_HIGH_COARSE_MAX_RADIUS     (8U)
+#define TASK5_LOW_MAX_RADIUS             (20U)
 #define TASK5_TREND_RISE_MARGIN          (50U)
 #define TASK5_TREND_RISE_CONFIRMATIONS   (2U)
 #define TASK5_SUSPICION_MIN_QUALITY      (450U)
 #define TASK5_SUSPICION_MIN_DEPTH        (100U)
 #define TASK5_CONFIRM_MIN_QUALITY        (350U)
-#define TASK5_SEARCH_MAX_TESTS           (41U)
 #define TASK5_MIN_DDS_FREQUENCY_HZ       (100UL)
 #define TASK5_MAX_INPUT_FREQUENCY_HZ     (100000UL)
 #define TASK5_MAX_DDS_FREQUENCY_HZ       (200000UL)
@@ -360,12 +359,6 @@ static bool Task5_SetDDSAndSettle(
       (controller->status.search_count == 0U) ||
       (frequency_hz != controller->status.dds_frequency_hz);
 
-  if (new_candidate &&
-      (controller->status.search_count >=
-       TASK5_SEARCH_MAX_TESTS)) {
-    Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
-    return false;
-  }
   if ((frequency_hz == 0UL) ||
       (frequency_hz > TASK5_MAX_DDS_FREQUENCY_HZ) ||
       (controller->port.set_dds_frequency == NULL) ||
@@ -375,7 +368,8 @@ static bool Task5_SetDDSAndSettle(
     return false;
   }
 
-  if (new_candidate) {
+  if (new_candidate &&
+      (controller->status.search_count < UINT8_MAX)) {
     controller->status.search_count++;
   }
   controller->status.dds_frequency_hz = frequency_hz;
@@ -514,7 +508,7 @@ static void Task5_AddTrendSample(task5_search_trend_t *trend,
   }
 }
 
-static void Task5_RecordHighCoarseSample(
+static void Task5_RecordDirectionalSample(
     task5_controller_t *controller,
     uint16_t distance)
 {
@@ -539,6 +533,51 @@ static void Task5_RecordHighCoarseSample(
   Task5_AddTrendSample(
       &controller->coarse_trend[direction],
       frequency_hz, distance);
+}
+
+static void Task5_ResetSearchWindow(
+    task5_controller_t *controller,
+    uint32_t origin_hz,
+    uint32_t step_hz,
+    uint8_t search_stage)
+{
+  controller->search_origin_hz =
+      Task5_RoundToGrid(origin_hz, step_hz);
+  controller->search_step_hz = step_hz;
+  controller->search_lower_hz = 0UL;
+  controller->search_upper_hz = 0UL;
+  controller->undirected_attempt = 0U;
+  controller->image_retry_count = 0U;
+  memset(
+      controller->coarse_trend, 0,
+      sizeof(controller->coarse_trend));
+  controller->fine_best_distance = UINT16_MAX;
+  controller->fine_worst_distance = 0U;
+  controller->fine_best_frequency_hz = 0UL;
+  controller->confirmation_peak_valid = false;
+  controller->status.best_match_quality = 0U;
+  controller->status.best_match_frequency_hz = 0UL;
+  controller->status.search_stage = search_stage;
+}
+
+static const task5_search_trend_t *
+Task5_SelectBestDirectionalTrend(
+    const task5_controller_t *controller)
+{
+  const task5_search_trend_t *negative =
+      &controller->coarse_trend[TASK5_DIRECTION_NEGATIVE];
+  const task5_search_trend_t *positive =
+      &controller->coarse_trend[TASK5_DIRECTION_POSITIVE];
+
+  if (!negative->seeded) {
+    return positive->seeded ? positive : NULL;
+  }
+  if (!positive->seeded) {
+    return negative;
+  }
+  return (positive->best_distance < negative->best_distance)
+             ? positive
+             : negative;
 }
 
 static uint32_t Task5_NextHighCoarseFrequency(
@@ -580,6 +619,110 @@ static uint32_t Task5_NextHighCoarseFrequency(
   return 0UL;
 }
 
+static uint32_t Task5_NextLowFrequency(
+    task5_controller_t *controller)
+{
+  uint32_t radius;
+  uint32_t multiplier;
+  uint8_t direction;
+  task5_search_trend_t *trend;
+
+  while (controller->undirected_attempt <
+         (uint8_t)(2U * TASK5_LOW_MAX_RADIUS)) {
+    controller->undirected_attempt++;
+    multiplier =
+        (uint32_t)((controller->undirected_attempt + 1U) / 2U);
+    direction =
+        ((controller->undirected_attempt & 1U) != 0U)
+            ? TASK5_DIRECTION_POSITIVE
+            : TASK5_DIRECTION_NEGATIVE;
+    trend = &controller->coarse_trend[direction];
+    if (trend->complete) {
+      continue;
+    }
+
+    radius = TASK5_FINE_SEARCH_STEP_HZ * multiplier;
+    if (direction == TASK5_DIRECTION_POSITIVE) {
+      if (radius <=
+          TASK5_MAX_DDS_FREQUENCY_HZ -
+              controller->search_origin_hz) {
+        return controller->search_origin_hz + radius;
+      }
+    } else if (radius <=
+               controller->search_origin_hz -
+                   TASK5_MIN_DDS_FREQUENCY_HZ) {
+      return controller->search_origin_hz - radius;
+    }
+    trend->complete = true;
+  }
+  return 0UL;
+}
+
+static bool Task5_RestartHighSearch(
+    task5_controller_t *controller,
+    uint32_t preferred_frequency_hz,
+    uint32_t now_ms)
+{
+  uint32_t origin_hz = preferred_frequency_hz;
+
+  if (origin_hz == 0UL) {
+    origin_hz = controller->status.best_match_frequency_hz;
+  }
+  if (origin_hz == 0UL) {
+    origin_hz = controller->status.dds_frequency_hz;
+  }
+  controller->status.search_restart_count++;
+  Task5_ResetSearchWindow(
+      controller, origin_hz,
+      TASK5_HIGH_COARSE_STEP_HZ,
+      TASK5_SEARCH_STAGE_COARSE_1KHZ);
+  return Task5_SetDDSAndSettle(
+      controller, controller->search_origin_hz, now_ms);
+}
+
+static bool Task5_RestartLowSearch(
+    task5_controller_t *controller,
+    uint32_t preferred_frequency_hz,
+    uint32_t now_ms)
+{
+  uint32_t origin_hz = preferred_frequency_hz;
+
+  if (origin_hz == 0UL) {
+    origin_hz = controller->status.best_match_frequency_hz;
+  }
+  if (origin_hz == 0UL) {
+    origin_hz = controller->status.dds_frequency_hz;
+  }
+  controller->status.search_restart_count++;
+  Task5_ResetSearchWindow(
+      controller, origin_hz,
+      TASK5_FINE_SEARCH_STEP_HZ,
+      TASK5_SEARCH_STAGE_FINE_100HZ);
+  return Task5_SetDDSAndSettle(
+      controller, controller->search_origin_hz, now_ms);
+}
+
+static bool Task5_BeginLowConfirmation(
+    task5_controller_t *controller,
+    uint32_t now_ms)
+{
+  const task5_search_trend_t *selected =
+      Task5_SelectBestDirectionalTrend(controller);
+
+  if (selected == NULL) {
+    return Task5_RestartLowSearch(
+        controller, controller->status.dds_frequency_hz,
+        now_ms);
+  }
+  controller->fine_best_frequency_hz =
+      selected->best_frequency_hz;
+  controller->fine_best_distance = selected->best_distance;
+  controller->confirmation_peak_valid = selected->complete;
+  controller->status.search_stage = TASK5_SEARCH_STAGE_CONFIRM;
+  return Task5_SetDDSAndSettle(
+      controller, controller->fine_best_frequency_hz, now_ms);
+}
+
 static bool Task5_BeginFineSearch(
     task5_controller_t *controller,
     uint32_t now_ms)
@@ -602,8 +745,9 @@ static bool Task5_BeginFineSearch(
     selected = positive;
   }
   if (selected == NULL) {
-    Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
-    return false;
+    return Task5_RestartHighSearch(
+        controller, controller->status.dds_frequency_hz,
+        now_ms);
   }
 
   controller->search_lower_hz = selected->best_pair_lower_hz;
@@ -619,6 +763,7 @@ static bool Task5_BeginFineSearch(
   controller->fine_best_distance = UINT16_MAX;
   controller->fine_worst_distance = 0U;
   controller->fine_best_frequency_hz = 0UL;
+  controller->confirmation_peak_valid = false;
   controller->status.search_stage =
       TASK5_SEARCH_STAGE_FINE_100HZ;
   return Task5_SetDDSAndSettle(
@@ -687,46 +832,14 @@ static bool Task5_BeginSuspicionConfirmation(
     uint32_t now_ms)
 {
   if (controller->fine_best_frequency_hz == 0UL) {
-    Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
-    return false;
+    return Task5_RestartHighSearch(
+        controller, controller->status.dds_frequency_hz,
+        now_ms);
   }
+  controller->confirmation_peak_valid = true;
   controller->status.search_stage = TASK5_SEARCH_STAGE_CONFIRM;
   return Task5_SetDDSAndSettle(
       controller, controller->fine_best_frequency_hz, now_ms);
-}
-
-static uint32_t Task5_NextAlternatingFrequency(
-    task5_controller_t *controller)
-{
-  uint32_t radius;
-  uint32_t multiplier;
-  bool positive;
-
-  /*
-   * Test origin, +step, -step, +2*step, -2*step, ... .  At either legal
-   * frequency boundary, skip the out-of-range side rather than saturating
-   * to 1 Hz / 200 kHz and testing a duplicate or leaving the 100 Hz grid.
-   */
-  while (controller->undirected_attempt < UINT8_MAX) {
-    controller->undirected_attempt++;
-    multiplier =
-        (uint32_t)((controller->undirected_attempt + 1U) / 2U);
-    positive = (controller->undirected_attempt & 1U) != 0U;
-    radius = controller->search_step_hz * multiplier;
-
-    if (positive) {
-      if (radius <=
-          TASK5_MAX_DDS_FREQUENCY_HZ -
-              controller->search_origin_hz) {
-        return controller->search_origin_hz + radius;
-      }
-    } else if ((radius < controller->search_origin_hz) &&
-               ((controller->search_origin_hz - radius) >=
-                TASK5_MIN_DDS_FREQUENCY_HZ)) {
-      return controller->search_origin_hz - radius;
-    }
-  }
-  return 0UL;
 }
 
 static bool Task5_IsDuplicateResult(
@@ -940,32 +1053,16 @@ static void Task5_HandleCoarseResult(
       (uint32_t)estimated_input;
   controller->high_frequency_search =
       estimated >= TASK5_HIGH_SEARCH_THRESHOLD_HZ;
-  controller->search_step_hz =
-      controller->high_frequency_search
-          ? TASK5_HIGH_COARSE_STEP_HZ
-          : TASK5_FINE_SEARCH_STEP_HZ;
-  controller->search_origin_hz =
-      Task5_RoundToGrid(
-          (uint32_t)estimated,
-          controller->search_step_hz);
-  controller->search_lower_hz = 0UL;
-  controller->search_upper_hz = 0UL;
-  controller->undirected_attempt = 0U;
-  controller->image_retry_count = 0U;
-  memset(
-      controller->coarse_trend, 0,
-      sizeof(controller->coarse_trend));
-  controller->fine_best_distance = UINT16_MAX;
-  controller->fine_worst_distance = 0U;
-  controller->fine_best_frequency_hz = 0UL;
   controller->status.last_match_score = 0U;
   controller->status.last_match_confidence = 0U;
-  controller->status.best_match_quality = 0U;
-  controller->status.best_match_frequency_hz = 0UL;
-  controller->status.search_stage =
+  Task5_ResetSearchWindow(
+      controller, (uint32_t)estimated,
+      controller->high_frequency_search
+          ? TASK5_HIGH_COARSE_STEP_HZ
+          : TASK5_FINE_SEARCH_STEP_HZ,
       controller->high_frequency_search
           ? TASK5_SEARCH_STAGE_COARSE_1KHZ
-          : TASK5_SEARCH_STAGE_FINE_100HZ;
+          : TASK5_SEARCH_STAGE_FINE_100HZ);
   if (controller->port.stop_saw != NULL) {
     controller->port.stop_saw(controller->port.context);
   }
@@ -1072,7 +1169,7 @@ static void Task5_HandleDDSTestResult(
     if (controller->high_frequency_search) {
       if (controller->status.search_stage ==
           TASK5_SEARCH_STAGE_COARSE_1KHZ) {
-        Task5_RecordHighCoarseSample(controller, distance);
+        Task5_RecordDirectionalSample(controller, distance);
         next_frequency =
             Task5_NextHighCoarseFrequency(controller);
         if (next_frequency != 0UL) {
@@ -1118,36 +1215,67 @@ static void Task5_HandleDDSTestResult(
                            TASK5_SUSPICION_MIN_DEPTH)) {
           Task5_BeginFrequencyHold(controller, now_ms);
         } else {
-          Task5_EnterError(
-              controller, TASK5_ERROR_SEARCH_LIMIT);
+          (void)Task5_RestartHighSearch(
+              controller,
+              controller->fine_best_frequency_hz,
+              now_ms);
         }
         return;
       }
     }
 
-    next_frequency = Task5_NextAlternatingFrequency(controller);
-    if (next_frequency == 0UL) {
-      Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
+    if (controller->status.search_stage ==
+        TASK5_SEARCH_STAGE_FINE_100HZ) {
+      Task5_RecordDirectionalSample(controller, distance);
+      next_frequency = Task5_NextLowFrequency(controller);
+      if (next_frequency != 0UL) {
+        (void)Task5_SetDDSAndSettle(
+            controller, next_frequency, now_ms);
+      } else {
+        (void)Task5_BeginLowConfirmation(
+            controller, now_ms);
+      }
       return;
     }
-    (void)Task5_SetDDSAndSettle(
-        controller, next_frequency, now_ms);
+
+    if (controller->status.search_stage ==
+        TASK5_SEARCH_STAGE_CONFIRM) {
+      Task5_UpdateBestQuality(
+          controller,
+          controller->status.dds_frequency_hz,
+          distance);
+      if (controller->confirmation_peak_valid &&
+          (controller->fine_best_distance <=
+           (uint16_t)(1000U -
+                      TASK5_SUSPICION_MIN_QUALITY)) &&
+          (quality >= TASK5_CONFIRM_MIN_QUALITY)) {
+        Task5_BeginFrequencyHold(controller, now_ms);
+      } else {
+        (void)Task5_RestartLowSearch(
+            controller,
+            controller->fine_best_frequency_hz,
+            now_ms);
+      }
+      return;
+    }
+
+    (void)Task5_RestartLowSearch(
+        controller, controller->status.dds_frequency_hz,
+        now_ms);
     return;
   }
 
-  if (controller->image_retry_count <
-      TASK5_IMAGE_MAX_RETRIES) {
+  /* IMAGE_ERROR/TIMEOUT are acquisition failures, not evidence that the
+   * candidate frequency is wrong.  Keep the DDS output untouched and let
+   * OpenMV rebuild its ROI on every non-blocking retry. */
+  if (controller->image_retry_count < UINT8_MAX) {
     controller->image_retry_count++;
-    controller->state_deadline =
-        now_ms + TASK5_DDS_SETTLE_MS;
-    Task5_SetState(controller, TASK5_STATE_DDS_SETTLING);
-    return;
   }
-  Task5_EnterError(
-      controller,
-      (result == TASK5_DDS_IMAGE_ERROR)
-          ? TASK5_ERROR_IMAGE_RECOGNITION
-          : TASK5_ERROR_BAD_RESULT);
+  controller->status.image_recovery_count++;
+  controller->state_deadline =
+      now_ms + TASK5_DDS_SETTLE_MS;
+  Task5_SetState(controller, TASK5_STATE_DDS_SETTLING);
+  Task5_Touch(controller);
 }
 
 bool Task5_Init(task5_controller_t *controller,
