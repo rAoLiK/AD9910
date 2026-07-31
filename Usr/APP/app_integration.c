@@ -17,7 +17,7 @@
 #define APP_COMMAND_QUEUE_SIZE                 (16U)
 #define APP_COMMAND_QUEUE_MASK                 (APP_COMMAND_QUEUE_SIZE - 1U)
 #define APP_BUTTON_DEBOUNCE_MS                 (50UL)
-#define APP_BUTTON_LONG_PRESS_MS               (500UL)
+#define APP_BUTTON_LONG_PRESS_MS               (400UL)
 #define APP_SCOPE_VOLTS_PER_DIV                (0.5f)
 #define APP_DDS_FULL_SCALE_VPP_AFTER_GAIN      (4.432f)
 #define APP_FEEDBACK_INVERSION_DEG             (180.0f)
@@ -440,7 +440,7 @@ static void AppIntegration_HandleButtonPress(
   s_app.last_button_tick_valid[button_index] = true;
 
   Task5_GetStatus(&s_app.task5, &task5);
-  if (task5.state != TASK5_STATE_WAIT_SELECTION) {
+  if (task5.state == TASK5_STATE_INACTIVE) {
     return;
   }
 
@@ -689,15 +689,13 @@ static void AppIntegration_Task5Text(
       break;
     case TASK5_STATE_WAIT_START_ACK:
       (void)snprintf(
-          text, text_size, "%s %luHz: wait camera ACK",
-          AppIntegration_Task5ModeText(task5->mode),
-          (unsigned long)task5->saw_frequency_hz);
+          text, text_size, "%s: wait camera ACK",
+          AppIntegration_Task5ModeText(task5->mode));
       break;
     case TASK5_STATE_WAIT_COARSE_RESULT:
       (void)snprintf(
-          text, text_size, "%s %luHz: coarse recognize",
-          AppIntegration_Task5ModeText(task5->mode),
-          (unsigned long)task5->saw_frequency_hz);
+          text, text_size, "%s: coarse recognize",
+          AppIntegration_Task5ModeText(task5->mode));
       break;
     case TASK5_STATE_DDS_SETTLING:
     case TASK5_STATE_WAIT_DDS_ACK:
@@ -731,10 +729,9 @@ static void AppIntegration_Task5Text(
           task5, reason, sizeof(reason));
       (void)snprintf(
           text, text_size,
-          "ERR: %s\rDAC %luHz %s\rRX%lu CRC%lu U%lu",
+          "ERR: %s\rOUTPUT %s\rRX%lu CRC%lu U%lu",
           reason,
-          (unsigned long)saw.frequency_hz,
-          saw.running ? "FULL ON" : "OFF",
+          saw.running ? "ACTIVE" : "OFF",
           (unsigned long)uart.parser.valid_frame_count,
           (unsigned long)uart.parser.crc_error_count,
           (unsigned long)uart.uart_error_count);

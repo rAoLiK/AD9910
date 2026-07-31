@@ -110,7 +110,7 @@ static void TestAppStateMachine(void)
   AppCore_GetStatus(&core, &status);
   assert(status.state == APP_STATE_MENU_SAFE);
   assert(fake.safe_count == 1U);
-  assert(!fake.buttons_enabled);
+  assert(fake.buttons_enabled);
 
   assert(AppCore_HandleCommand(&core, APP_COMMAND_ENTER_TASK1));
   AppCore_GetStatus(&core, &status);
@@ -118,6 +118,7 @@ static void TestAppStateMachine(void)
   assert(status.waveform == APP_WAVEFORM_TASK1_LINE);
   assert(status.activity == APP_ACTIVITY_DIRECT);
   assert(fake.direct_count == 1U);
+  assert(!fake.buttons_enabled);
 
   assert(AppCore_HandleCommand(
       &core, APP_COMMAND_SET_AMPLITUDE_2DIV));
@@ -126,6 +127,7 @@ static void TestAppStateMachine(void)
   assert(status.amplitude_div == 2U);
   assert(fake.lock_count == 1U);
   assert(fake.waveform == APP_WAVEFORM_TASK1_LINE);
+  assert(!fake.buttons_enabled);
 
   assert(AppCore_HandleCommand(
       &core, APP_COMMAND_SET_AMPLITUDE_8DIV));
@@ -154,6 +156,7 @@ static void TestAppStateMachine(void)
   assert(AppCore_HandleCommand(&core, APP_COMMAND_GO_MENU));
   AppCore_GetStatus(&core, &status);
   assert(status.state == APP_STATE_MENU_SAFE);
+  assert(fake.buttons_enabled);
   assert(!AppCore_HandleCommand(&core, APP_COMMAND_SELECT_TASK3));
   AppCore_GetStatus(&core, &status);
   assert(status.rejected_command_count == 1U);
@@ -162,6 +165,7 @@ static void TestAppStateMachine(void)
   AppCore_GetStatus(&core, &status);
   assert(status.waveform == APP_WAVEFORM_TASK2_CIRCLE);
   assert(status.activity == APP_ACTIVITY_IDLE);
+  assert(!fake.buttons_enabled);
   assert(AppCore_HandleCommand(
       &core, APP_COMMAND_SET_AMPLITUDE_6DIV));
   assert(fake.lock_count == 3U);
@@ -179,14 +183,21 @@ static void TestAppStateMachine(void)
   assert(status.state == APP_STATE_TASK5);
   assert(status.activity == APP_ACTIVITY_ERROR);
 
+  assert(AppCore_HandleCommand(&core, APP_COMMAND_TASK5_LINE));
+  AppCore_GetStatus(&core, &status);
+  assert(status.waveform == APP_WAVEFORM_TASK1_LINE);
+  assert(status.activity == APP_ACTIVITY_TASK5_COMMUNICATING);
+  assert(fake.buttons_enabled);
+
   assert(AppCore_HandleCommand(&core, APP_COMMAND_GO_MENU));
-  assert(!fake.buttons_enabled);
+  assert(fake.buttons_enabled);
 
   fake.fail_next = true;
   assert(!AppCore_HandleCommand(&core, APP_COMMAND_ENTER_TASK1));
   AppCore_GetStatus(&core, &status);
   assert(status.state == APP_STATE_ERROR_SAFE);
   assert(status.last_error == APP_ERROR_SAFE_OUTPUT);
+  assert(fake.buttons_enabled);
 }
 
 int main(void)

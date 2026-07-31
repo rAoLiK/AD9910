@@ -10,6 +10,9 @@ typedef struct {
   uint16_t length;
   uint8_t payload[OPENMV_PROTOCOL_MAX_PAYLOAD];
   uint32_t send_count;
+  uint8_t sent_types[16];
+  uint8_t last_stop_reason;
+  uint16_t last_stop_session;
   uint32_t saw_frequency_hz;
   uint32_t dds_frequency_hz;
   uint32_t seed_frequency_hz;
@@ -71,6 +74,15 @@ static bool fake_send(void *context,
     memcpy(fake->payload, payload, payload_length);
   }
   fake->send_count++;
+  if (fake->send_count <=
+      (sizeof(fake->sent_types) / sizeof(fake->sent_types[0]))) {
+    fake->sent_types[fake->send_count - 1U] = type;
+  }
+  if ((type == OPENMV_MSG_STOP_TASK) &&
+      (payload_length == 3U)) {
+    fake->last_stop_session = OpenMV_ReadU16LE(payload);
+    fake->last_stop_reason = payload[2];
+  }
   return !fake->send_fails;
 }
 
@@ -226,6 +238,85 @@ static void test_ack_timeout_keeps_dac_running(void)
   assert(!fake.safe);
 }
 
+static void test_active_session_can_be_reselected(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t before;
+  task5_status_t after;
+  openmv_frame_t frame = {0};
+  uint8_t old_start_seq;
+  uint16_t old_session_id;
+  task5_port_t port = {
+      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_lock, fake_safe, fake_send, &fake};
+
+  assert(Task5_Init(&controller, &port));
+  Task5_Enter(&controller);
+  assert(Task5_Start(
+      &controller, TASK5_MODE_LINE_0_DEG, 1000U, 10U));
+  old_start_seq = fake.seq;
+  Task5_GetStatus(&controller, &before);
+  old_session_id = before.session_id;
+
+  assert(Task5_Start(
+      &controller, TASK5_MODE_CIRCLE_NEG_90_DEG,
+      10000U, 20U));
+  Task5_GetStatus(&controller, &after);
+
+  assert(fake.send_count == 3U);
+  assert(fake.sent_types[0] == OPENMV_MSG_START_TASK);
+  assert(fake.sent_types[1] == OPENMV_MSG_STOP_TASK);
+  assert(fake.sent_types[2] == OPENMV_MSG_START_TASK);
+  assert(fake.last_stop_session == old_session_id);
+  assert(fake.last_stop_reason == 0x04U);
+  assert(after.session_id != before.session_id);
+  assert(after.mode == TASK5_MODE_CIRCLE_NEG_90_DEG);
+  assert(after.saw_frequency_hz == 10000U);
+  assert(after.state == TASK5_STATE_WAIT_START_ACK);
+  assert(fake.safe);
+  assert(fake.saw_running);
+  assert(fake.saw_frequency_hz == 10000U);
+  assert(fake.saw_start_count == 2U);
+
+  /* Invalid re-selection must leave the active session untouched. */
+  before = after;
+  assert(!Task5_Start(
+      &controller, TASK5_MODE_LINE_0_DEG, 500U, 30U));
+  Task5_GetStatus(&controller, &after);
+  assert(after.session_id == before.session_id);
+  assert(after.state == before.state);
+  assert(fake.send_count == 3U);
+
+  /* Late traffic from the cancelled session cannot advance the new one. */
+  frame.version = OPENMV_PROTOCOL_VERSION;
+  frame.type = OPENMV_MSG_ACK;
+  frame.seq = 0x90U;
+  frame.length = 3U;
+  frame.payload[0] = OPENMV_MSG_START_TASK;
+  frame.payload[1] = old_start_seq;
+  frame.payload[2] = 0U;
+  Task5_OnFrame(&controller, &frame, 40U);
+  Task5_GetStatus(&controller, &after);
+  assert(after.state == TASK5_STATE_WAIT_START_ACK);
+  assert(fake.send_count == 3U);
+
+  memset(&frame, 0, sizeof(frame));
+  frame.version = OPENMV_PROTOCOL_VERSION;
+  frame.type = OPENMV_MSG_COARSE_RESULT;
+  frame.seq = 0x91U;
+  frame.length = 10U;
+  OpenMV_WriteU16LE(&frame.payload[0], old_session_id);
+  frame.payload[2] = 0U;
+  OpenMV_WriteU32LE(&frame.payload[3], 5000U);
+  frame.payload[7] = 90U;
+  Task5_OnFrame(&controller, &frame, 50U);
+  Task5_GetStatus(&controller, &after);
+  assert(after.state == TASK5_STATE_WAIT_START_ACK);
+  assert(after.stale_result_count == 1U);
+  assert(fake.type == OPENMV_MSG_NACK);
+}
+
 static void test_uart_send_failure_becomes_visible_error(void)
 {
   fake_port_t fake = {0};
@@ -290,6 +381,7 @@ int main(void)
 {
   test_complete_success_flow();
   test_ack_retry_keeps_sequence();
+  test_active_session_can_be_reselected();
   test_ack_timeout_keeps_dac_running();
   test_uart_send_failure_becomes_visible_error();
   test_uart_retry_failure_becomes_visible_error();

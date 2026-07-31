@@ -15,7 +15,7 @@ static bool AppCore_EnterError(app_core_t *core, app_error_t error)
   }
 
   if (core->port.enable_task5_buttons != NULL) {
-    core->port.enable_task5_buttons(core->port.context, false);
+    core->port.enable_task5_buttons(core->port.context, true);
   }
   if (core->port.enter_safe != NULL) {
     (void)core->port.enter_safe(core->port.context);
@@ -42,6 +42,13 @@ static void AppCore_DisableTask5Buttons(app_core_t *core)
 {
   if (core->port.enable_task5_buttons != NULL) {
     core->port.enable_task5_buttons(core->port.context, false);
+  }
+}
+
+static void AppCore_EnableTask5Buttons(app_core_t *core)
+{
+  if (core->port.enable_task5_buttons != NULL) {
+    core->port.enable_task5_buttons(core->port.context, true);
   }
 }
 
@@ -164,7 +171,7 @@ bool AppCore_Init(app_core_t *core, const app_port_t *port)
   core->status.amplitude_div = 8U;
   core->last_task14_waveform = APP_WAVEFORM_NONE;
 
-  AppCore_DisableTask5Buttons(core);
+  AppCore_EnableTask5Buttons(core);
   if (!AppCore_EnterSafeBaseline(core)) {
     return false;
   }
@@ -187,10 +194,10 @@ bool AppCore_HandleCommand(app_core_t *core, app_command_t command)
 
   switch (command) {
     case APP_COMMAND_GO_MENU:
-      AppCore_DisableTask5Buttons(core);
       if (!AppCore_EnterSafeBaseline(core)) {
         return false;
       }
+      AppCore_EnableTask5Buttons(core);
       core->status.state = APP_STATE_MENU_SAFE;
       core->status.waveform = APP_WAVEFORM_NONE;
       core->status.activity = APP_ACTIVITY_IDLE;
@@ -226,9 +233,7 @@ bool AppCore_HandleCommand(app_core_t *core, app_command_t command)
       if (!AppCore_EnterSafeBaseline(core)) {
         return false;
       }
-      if (core->port.enable_task5_buttons != NULL) {
-        core->port.enable_task5_buttons(core->port.context, true);
-      }
+      AppCore_EnableTask5Buttons(core);
       core->status.state = APP_STATE_TASK5;
       core->status.waveform = APP_WAVEFORM_NONE;
       core->status.activity =
@@ -254,6 +259,7 @@ bool AppCore_HandleCommand(app_core_t *core, app_command_t command)
     case APP_COMMAND_TASK5_CIRCLE:
     case APP_COMMAND_TASK5_INFINITY:
       if (core->status.state == APP_STATE_TASK5) {
+        AppCore_EnableTask5Buttons(core);
         core->status.waveform =
             (command == APP_COMMAND_TASK5_LINE)
                 ? APP_WAVEFORM_TASK1_LINE

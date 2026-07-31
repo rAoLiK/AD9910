@@ -21,6 +21,8 @@ OpenMV 固件：OpenMV v5.0.0 / MicroPython v1.28.0-49
 
 F407 必须明确告诉 OpenMV 当前锯齿波是 1 kHz 还是 10 kHz。
 OpenMV 不会根据画面自行猜测扫描档位。
+该档位仅通过 `START_TASK.saw_freq_hz` 在设备间传输，不会显示在 F407
+串口屏上；OpenMV 端也不应依赖串口屏文本判断扫描档位。
 
 目前真正经过图像数据训练和验证的是“锯齿扫描粗识别”。第二阶段 DDS
 李萨如图的视觉高低方向判断还没有训练完成。现有 `DDS_TEST_RESULT`
@@ -570,6 +572,12 @@ Payload = session_id:uint16
 OpenMV 收到当前 Session 的合法 STOP 后立即 ACK、释放当前模型并返回
 IDLE。STOP 的重复包会收到 DUPLICATE ACK，不会再次改变状态。
 
+如果用户在 Task5 已经通信、搜索或锁相时再次按模式键，F407 会把旧
+Session 的 `STOP_TASK(reason=0x04)` 与新 Session 的 `START_TASK` 按此
+顺序连续发送，不等待 STOP ACK。OpenMV 当前实现会在一次 `poll_uart()`
+中按帧顺序处理所有已收完整帧，因此必须先清理旧 Session 回到 IDLE，
+再接受新的 Session；旧 Session 的迟到结果不得污染新 Session。
+
 ---
 
 ## 16. 超时与重发
@@ -675,13 +683,11 @@ SET_DDS_AND_WAIT       SEND_STOP
                        IDLE
 ```
 
-任何无法恢复的通信错误都应：
-
-1. 关闭 DAC/DDS 或切到安全输出；
-2. 尽量发送 `STOP_TASK(reason=0x05)`；
-3. 清空本地 Task5 状态；
-4. 给 OLED/上位机明确错误提示；
-5. 返回 IDLE，等待用户重新开始。
+当前 F407 为现场调试采用错误锁存策略。任何无法恢复的 Task5 通信或运行
+错误都会取消协议重试、停在 Task5 错误态、显示具体错误原因，并恢复本次
+选择的 1 kHz 或 10 kHz 满码域 DAC 锯齿波；进入错误态本身不发送
+STOP。用户退出时 F407 尽力发送 `STOP_TASK(reason=0x01)`；用户重新选择
+模式时发送 `STOP_TASK(reason=0x04)`，随后以新 Session 重新开始。
 
 ---
 

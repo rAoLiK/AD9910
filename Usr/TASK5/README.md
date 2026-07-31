@@ -15,7 +15,7 @@
 UART5 ISR -> RX byte ring -> OpenMV_UART_Service -> frame parser
            -> Task5_OnFrame -> fixed-size Task5 state
 
-button EXTI -> press counters -> 50 ms release debounce / 500 ms hold timer
+button EXTI -> press counters -> 50 ms release debounce / 400 ms hold timer
             -> Task5_Start
 
 main loop -> Task5_Process -> UART TX ring / DAC / DDS / PLL port
@@ -24,6 +24,13 @@ main loop -> Task5_Process -> UART TX ring / DAC / DDS / PLL port
 
 UART ISR 不解析协议、不执行 SPI、不做浮点搜索。DAC DMA 使用无完成中断
 的循环搬运，避免 10 kHz 锯齿波产生 10 kHz 的周期完成中断。
+
+Task5 的三个模式键在等待、通信、DDS 搜索、本地锁相、已锁定和错误状态
+下都可重新选择。重新选择时 `Task5_Start()` 先把旧 Session 的
+`STOP_TASK(reason=0x04)` 放入 UART5 TX 环，再以递增的新 Session ID
+排入 `START_TASK`；随后停止旧输出并按新选择重新启动 DAC。旧 Session
+迟到的 ACK 或结果不会推进新状态机。只有 Task1–4 状态关闭按键 EXTI；
+其他非 Task5 状态即使产生按键计数，也不会启动 Task5 Session。
 
 DAC 表固定覆盖全部 12 bit 码域：第一个点为 0，最后一个点为 4095，
 初始化时会校验这两个端点。因此这里的“满幅”指数字码满量程；PA4 的实际
@@ -36,13 +43,15 @@ DAC。屏幕固定显示：
 
 ```text
 ERR: <具体原因>
-DAC <频率>Hz FULL ON/OFF
+OUTPUT ACTIVE/OFF
 RX<合法帧数> CRC<CRC错误数> U<UART硬件错误数>
 ```
 
-其中 `FULL ON` 表示 TIM6、DMA 和 DAC 的运行状态已建立，不代表已经用
-示波器测得模拟电压。用户明确退出 Task5 时才会尽力发送 `STOP_TASK`、
-停止 DAC，并恢复 PE6 高电平的安全/DDS路径。
+其中 `OUTPUT ACTIVE` 表示错误后调试输出仍在运行；屏幕不会显示所选
+DAC 锯齿波频率。用户明确退出 Task5 时会尽力发送
+`STOP_TASK(reason=0x01)`、停止 DAC，并恢复 PE6 高电平的安全/DDS
+路径；错误态重新选择模式时则发送 `STOP_TASK(reason=0x04)` 并立即开始
+新 Session。
 
 OpenMV 端联调协议见：
 

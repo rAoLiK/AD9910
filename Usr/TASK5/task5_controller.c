@@ -789,12 +789,22 @@ bool Task5_Start(task5_controller_t *controller,
   uint8_t payload[7];
 
   if ((controller == NULL) ||
-      (controller->status.state !=
-       TASK5_STATE_WAIT_SELECTION) ||
+      (controller->status.state == TASK5_STATE_INACTIVE) ||
       (mode > TASK5_MODE_INFINITY_2X_0_DEG) ||
       ((saw_frequency_hz != TASK5_SAW_FREQUENCY_1KHZ) &&
        (saw_frequency_hz != TASK5_SAW_FREQUENCY_10KHZ))) {
     return false;
+  }
+
+  /*
+   * Task5 mode keys stay live for the complete Task5 lifetime.  Cancel the
+   * previous OpenMV session before starting the newly selected mode.  STOP
+   * and START are queued in this order, while the new session id prevents a
+   * late response from the old session from advancing the new workflow.
+   */
+  if (controller->status.state != TASK5_STATE_WAIT_SELECTION) {
+    Task5_Exit(controller, 0x04U);
+    Task5_Enter(controller);
   }
 
   controller->status.mode = mode;

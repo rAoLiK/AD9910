@@ -82,23 +82,28 @@ PE6 完全由 STM32 本地状态机控制，OpenMV 不发送任何额外控制�
 
 | 同一按键的操作 | 锯齿波频率 |
 |---|---:|
-| 短按，按住时间小于 500 ms | 1000 Hz |
-| 长按，按住时间大于等于 500 ms | 10000 Hz |
+| 短按，按住时间小于 400 ms | 1000 Hz |
+| 长按，按住时间大于等于 400 ms | 10000 Hz |
 
 具体判定规则：
 
 1. 按下事件与释放确认的去抖时间均为 50 ms。
 2. 第一次有效按压后，在主循环中记录按下时刻并持续读取对应 GPIO。
-3. 按键持续按住达到 500 ms 时，立即确认为长按并按 10 kHz 启动。
-4. 按键在 500 ms 前释放且释放电平稳定 50 ms，确认为短按并按
+3. 按键持续按住达到 400 ms 时，立即确认为长按并按 10 kHz 启动。
+4. 按键在 400 ms 前释放且释放电平稳定 50 ms，确认为短按并按
    1 kHz 启动。
 5. 一个按键正在进行时长判定时，其他按键事件被忽略，避免同时启动两个
    Task5 Session。
-6. 一个 Task5 Session 已经启动后，三个按键不再启动第二个 Session。
-7. 三个 EXTI 仅在 Task5 页面/状态中启用。
+6. 一个 Task5 Session 已经启动后，任一模式键仍可再次选择。确认新的
+   短按/长按后，STM32 先终止旧 Session，再以新的 Session ID 启动所选
+   模式；同一按键也可以重新开始同一模式。
+7. 三个 EXTI 在 Task5 的等待、通信、DDS 搜索、锁相、已锁定和错误状态
+   中持续有效，仅在 Task1–4 状态下关闭。非 Task5 状态不会用这些事件
+   启动 Session。
 8. 按压时长判定仅在 MCU 内部进行，串口屏幕不显示短按、长按或等待
    判定状态；短按释放确认或长按达到阈值后，直接进入并显示对应运行
-   模式。
+   模式。任一 Task5 运行或错误画面都不得显示 DAC 锯齿波频率，尤其
+   不得显示 1000 Hz、10000 Hz 或 `saw_frequency_hz`。
 9. 尚未选择模式时，Task5 串口屏幕固定分三行显示 `PA0: diagonal`、
    `PB9: circle`、`PB8: infinity`，按键次数不会改变此提示。
 
@@ -413,6 +418,13 @@ OpenMV 收到后应停止当前识别、清除本 Session 的运行态、返回 
 进入 IDLE。正常完成时，STM32 等到 STOP_TASK 的 ACK 后才启动本地相位
 锁定。
 
+用户在 Task5 运行中重新选择模式时，STM32 将旧 Session 的
+`STOP_TASK(reason=0x04)` 作为尽力发送帧排入 UART5 TX 环，随后立即用
+递增的新 Session ID 排入 `START_TASK`，不等待旧 STOP 的 ACK。UART5
+保证两个完整帧按 STOP、START 的顺序发出。OpenMV 必须按接收顺序处理：
+先 ACK STOP、清理旧 Session 并回到 IDLE，再 ACK START 并启动新
+Session。STM32 会忽略旧 Session 迟到的 ACK、NACK 和识别结果。
+
 ## 13. 正常时序
 
 ```text
@@ -470,14 +482,16 @@ UART5 发送队列在首次发送或 ACK 重发阶段持续失败时，也按 10
 
 进入错误态后，STM32 取消当前重试，不主动发送 `STOP_TASK`，重新输出
 本次按键选择的 1 kHz 或 10 kHz DAC 锯齿波，并保持 PE6 为低电平。
-因此 OpenMV 端可能仍保留当前 Session；用户退出 Task5 时 STM32 才会
-尽力发送一次 `STOP_TASK(reason=0x01)`，OpenMV 应据此回到 IDLE。
+因此 OpenMV 端可能仍保留当前 Session。用户退出 Task5 时 STM32 会尽力
+发送一次 `STOP_TASK(reason=0x01)`；用户从错误态重新选择模式时会发送
+`STOP_TASK(reason=0x04)`，随后启动新 Session。OpenMV 应在任一 STOP
+后清除对应旧 Session 并回到 IDLE。
 
 STM32 屏幕显示三行：
 
 ```text
 ERR: <具体错误原因>
-DAC <1000或10000>Hz FULL ON/OFF
+OUTPUT ACTIVE/OFF
 RX<合法帧数> CRC<CRC错误数> U<UART硬件错误数>
 ```
 
@@ -642,7 +656,7 @@ CRC = 0x3696
 6. COARSE_RESULT 的 ACK 丢失，OpenMV 重发相同结果，STM32只重发 ACK，
    不重复切换输出。
 7. DDS_TEST_RESULT 使用旧 Session 或旧 Test ID，不改变 DDS。
-8. 短按任一模式键得到 1 kHz DAC 锯齿波；长按至少 500 ms 得到
+8. 短按任一模式键得到 1 kHz DAC 锯齿波；长按至少 400 ms 得到
    10 kHz。
 9. 示波器确认 PA4 波形在每周期内单调递增。
    同时确认 DAC 码表端点为 0/4095；实际模拟电压满幅需结合 VDDA/VREF+
@@ -654,3 +668,6 @@ CRC = 0x3696
     1 kHz/10 kHz 满码域 DAC 锯齿波继续输出。
 12. 从上述错误态退出 Task5，确认 OpenMV 最终收到尽力发送的 STOP_TASK，
     STM32 随后停止 DAC 并将 PE6 恢复高电平。
+13. 在通信、DDS 搜索、本地锁相、已锁定和错误状态分别重选模式，确认
+    OpenMV 依次收到旧 Session 的 `STOP_TASK(reason=0x04)` 与新 Session
+    的 `START_TASK`，且旧 Session 的迟到结果不改变新 Session。
