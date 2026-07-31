@@ -20,10 +20,12 @@
 #define APP_BUTTON_LONG_PRESS_MS               (400UL)
 #define APP_SCOPE_VOLTS_PER_DIV                (0.5f)
 #define APP_DDS_FULL_SCALE_VPP_AFTER_GAIN      (4.432f)
+#define APP_TASK5_OUTPUT_DIVS                  (8U)
 #define APP_FEEDBACK_INVERSION_DEG             (180.0f)
 #define APP_TASK1_OUTPUT_PHASE_DEG             (0.0f)
 #define APP_TASK2_OUTPUT_PHASE_DEG             (90.0f)
 #define APP_TASK3_GENERALIZED_PHASE_DEG        (0.0f)
+#define APP_TASK5_FOUND_BEEP_MS                 (500U)
 
 typedef struct {
   app_core_t core;
@@ -38,6 +40,7 @@ typedef struct {
   app_state_t rendered_state;
   app_waveform_t rendered_task5_waveform;
   uint32_t rendered_task5_revision;
+  uint16_t task5_beeped_session;
   uint32_t last_button_tick[3];
   bool last_button_tick_valid[3];
   uint32_t button_press_tick;
@@ -222,7 +225,10 @@ static bool AppIntegration_Task5SetDDS(
   }
   if (AD9910_SetSingleToneHz(
           app->dds, (double)frequency_hz,
-          0.0, 1.0, 1U) != AD9910_STATUS_OK) {
+          0.0,
+          (double)AppIntegration_AmplitudeScale(
+              APP_TASK5_OUTPUT_DIVS),
+          1U) != AD9910_STATUS_OK) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
     return false;
   }
@@ -258,7 +264,8 @@ static bool AppIntegration_Task5StartPhaseLock(
            (float)seed_frequency_hz) != HAL_OK) ||
       (PLL_Demo_Configure(
            multiplier, feedback_phase_deg,
-           AppIntegration_AmplitudeScale(8U)) != HAL_OK)) {
+           AppIntegration_AmplitudeScale(
+               APP_TASK5_OUTPUT_DIVS)) != HAL_OK)) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
     AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
     return false;
@@ -562,8 +569,16 @@ static void AppIntegration_UpdateTask5Activity(void)
     case TASK5_STATE_DDS_SETTLING:
     case TASK5_STATE_WAIT_DDS_ACK:
     case TASK5_STATE_WAIT_DDS_RESULT:
-    case TASK5_STATE_WAIT_STOP_ACK:
       activity = APP_ACTIVITY_TASK5_SEARCHING;
+      break;
+    case TASK5_STATE_WAIT_STOP_ACK:
+    case TASK5_STATE_FREQUENCY_HOLD:
+      activity = APP_ACTIVITY_TASK5_LOCKED;
+      if ((task5.session_id != 0U) &&
+          (task5.session_id != s_app.task5_beeped_session) &&
+          (TJC_SystemBeep(APP_TASK5_FOUND_BEEP_MS) == HAL_OK)) {
+        s_app.task5_beeped_session = task5.session_id;
+      }
       break;
     case TASK5_STATE_PHASE_LOCKING:
       activity = APP_ACTIVITY_TASK5_LOCKING;
@@ -658,6 +673,11 @@ static void AppIntegration_Task5ErrorText(
       (void)snprintf(
           reason, reason_size, "OpenMV reported error");
       break;
+    case TASK5_ERROR_IMAGE_RECOGNITION:
+      (void)snprintf(
+          reason, reason_size, "OpenMV image error 0x%02X",
+          (unsigned int)task5->last_openmv_result);
+      break;
     case TASK5_ERROR_NONE:
     default:
       (void)snprintf(
@@ -708,7 +728,14 @@ static void AppIntegration_Task5Text(
       break;
     case TASK5_STATE_WAIT_STOP_ACK:
       (void)snprintf(
-          text, text_size, "frequency found: %luHz",
+          text, text_size, "FOUND %s %luHz\rDDS HOLD / camera stop",
+          AppIntegration_Task5ModeText(task5->mode),
+          (unsigned long)task5->dds_frequency_hz);
+      break;
+    case TASK5_STATE_FREQUENCY_HOLD:
+      (void)snprintf(
+          text, text_size, "FOUND %s %luHz\rDDS HOLD",
+          AppIntegration_Task5ModeText(task5->mode),
           (unsigned long)task5->dds_frequency_hz);
       break;
     case TASK5_STATE_PHASE_LOCKING:

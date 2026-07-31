@@ -233,6 +233,28 @@ HAL_StatusTypeDef TJC_CtrlSendCommand(const char *command)
 }
 
 /**
+ * @brief  Request a supported TJC display to sound its buzzer.
+ * @param  durationMs Buzzer duration in milliseconds, 1-65535.
+ * @retval HAL status value.
+ */
+HAL_StatusTypeDef TJC_SystemBeep(uint16_t durationMs)
+{
+  char command[TJC_CTRL_CMD_MAX_LEN];
+  int written;
+
+  if (durationMs == 0U) {
+    return HAL_ERROR;
+  }
+  written = snprintf(
+      command, sizeof(command), "beep %u",
+      (unsigned int)durationMs);
+  if ((written < 0) || ((size_t)written >= sizeof(command))) {
+    return HAL_ERROR;
+  }
+  return TJC_CtrlSendFormatted(command);
+}
+
+/**
  * @brief  向目标属性写入数值。
  * @param  target 控件名称或跨页面全路径。
  * @param  attribute 属性名。

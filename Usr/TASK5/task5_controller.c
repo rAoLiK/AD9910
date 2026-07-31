@@ -6,12 +6,14 @@
 #define TASK5_ACK_TIMEOUT_MS             (100UL)
 #define TASK5_ACK_MAX_RETRIES            (3U)
 #define TASK5_COARSE_REPLAY_MS           (5000UL)
-#define TASK5_DDS_RESULT_TIMEOUT_MS      (2000UL)
+#define TASK5_DDS_RESULT_TIMEOUT_MS      (3000UL)
 #define TASK5_RESULT_MAX_RETRIES         (3U)
 #define TASK5_DDS_SETTLE_MS              (200UL)
 #define TASK5_CAPTURE_DELAY_MS           (200U)
 #define TASK5_IMAGE_MAX_RETRIES          (2U)
-#define TASK5_SEARCH_MAX_TESTS           (40U)
+#define TASK5_SEARCH_STEP_HZ             (100UL)
+#define TASK5_SEARCH_MAX_TESTS           (41U)
+#define TASK5_MIN_DDS_FREQUENCY_HZ       (100UL)
 #define TASK5_MAX_INPUT_FREQUENCY_HZ     (100000UL)
 #define TASK5_MAX_DDS_FREQUENCY_HZ       (200000UL)
 #define TASK5_SAW_FREQUENCY_1KHZ          (1000UL)
@@ -174,6 +176,22 @@ static void Task5_BeginReliable(
   Task5_SetState(controller, wait_state);
 }
 
+static bool Task5_FinishStopCleanupWithoutAck(
+    task5_controller_t *controller)
+{
+  if ((controller->status.state != TASK5_STATE_WAIT_STOP_ACK) ||
+      (controller->pending.type != OPENMV_MSG_STOP_TASK)) {
+    return false;
+  }
+
+  /* TARGET_REACHED already established success.  A lost STOP ACK must not
+   * replace the held DDS tone with the diagnostic sawtooth/error output. */
+  controller->pending.active = false;
+  controller->pending.sent = false;
+  Task5_SetState(controller, TASK5_STATE_FREQUENCY_HOLD);
+  return true;
+}
+
 static void Task5_ServicePending(task5_controller_t *controller,
                                  uint32_t now_ms)
 {
@@ -199,8 +217,10 @@ static void Task5_ServicePending(task5_controller_t *controller,
           now_ms + TASK5_ACK_TIMEOUT_MS;
     } else if (controller->pending.retry_count >=
                TASK5_ACK_MAX_RETRIES) {
-      Task5_EnterError(
-          controller, TASK5_ERROR_UART_SEND);
+      if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+        Task5_EnterError(
+            controller, TASK5_ERROR_UART_SEND);
+      }
     } else {
       controller->pending.retry_count++;
       controller->pending.ack_deadline =
@@ -215,7 +235,9 @@ static void Task5_ServicePending(task5_controller_t *controller,
   }
   if (controller->pending.retry_count >=
       TASK5_ACK_MAX_RETRIES) {
-    Task5_EnterError(controller, TASK5_ERROR_ACK_TIMEOUT);
+    if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+      Task5_EnterError(controller, TASK5_ERROR_ACK_TIMEOUT);
+    }
     return;
   }
 
@@ -233,8 +255,10 @@ static void Task5_ServicePending(task5_controller_t *controller,
     Task5_Touch(controller);
   } else if ((uint8_t)(controller->pending.retry_count + 1U) >=
              TASK5_ACK_MAX_RETRIES) {
-    Task5_EnterError(
-        controller, TASK5_ERROR_UART_SEND);
+    if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+      Task5_EnterError(
+          controller, TASK5_ERROR_UART_SEND);
+    }
   } else {
     controller->pending.retry_count++;
     controller->pending.ack_deadline =
@@ -292,31 +316,23 @@ static void Task5_KeepWaitingForCoarseResult(
   controller->state_deadline = now_ms + TASK5_COARSE_REPLAY_MS;
 }
 
-static uint8_t Task5_SearchStage(
-    const task5_controller_t *controller)
+static uint32_t Task5_RoundToSearchGrid(uint32_t frequency_hz)
 {
-  uint32_t width;
-  uint64_t scaled_width;
+  uint32_t rounded;
 
-  if ((controller->search_lower_hz == 0UL) ||
-      (controller->search_upper_hz <=
-       controller->search_lower_hz)) {
-    return 0x00U;
+  if (frequency_hz >=
+      (TASK5_MAX_DDS_FREQUENCY_HZ -
+       (TASK5_SEARCH_STEP_HZ / 2UL))) {
+    return TASK5_MAX_DDS_FREQUENCY_HZ;
   }
-
-  width = controller->search_upper_hz -
-          controller->search_lower_hz;
-  scaled_width = (uint64_t)width * 1000ULL;
-  if (scaled_width > (uint64_t)
-                         controller->status.dds_frequency_hz *
-                         10ULL) {
-    return 0x00U;
+  rounded =
+      ((frequency_hz + (TASK5_SEARCH_STEP_HZ / 2UL)) /
+       TASK5_SEARCH_STEP_HZ) *
+      TASK5_SEARCH_STEP_HZ;
+  if (rounded < TASK5_MIN_DDS_FREQUENCY_HZ) {
+    rounded = TASK5_MIN_DDS_FREQUENCY_HZ;
   }
-  if (scaled_width >
-      (uint64_t)controller->status.dds_frequency_hz) {
-    return 0x01U;
-  }
-  return 0x02U;
+  return rounded;
 }
 
 static bool Task5_SetDDSAndSettle(
@@ -324,6 +340,16 @@ static bool Task5_SetDDSAndSettle(
     uint32_t frequency_hz,
     uint32_t now_ms)
 {
+  bool new_candidate =
+      (controller->status.search_count == 0U) ||
+      (frequency_hz != controller->status.dds_frequency_hz);
+
+  if (new_candidate &&
+      (controller->status.search_count >=
+       TASK5_SEARCH_MAX_TESTS)) {
+    Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
+    return false;
+  }
   if ((frequency_hz == 0UL) ||
       (frequency_hz > TASK5_MAX_DDS_FREQUENCY_HZ) ||
       (controller->port.set_dds_frequency == NULL) ||
@@ -333,9 +359,12 @@ static bool Task5_SetDDSAndSettle(
     return false;
   }
 
+  if (new_candidate) {
+    controller->status.search_count++;
+  }
   controller->status.dds_frequency_hz = frequency_hz;
-  controller->status.search_stage =
-      Task5_SearchStage(controller);
+  /* Every candidate is already on the final 100 Hz search grid. */
+  controller->status.search_stage = 0x02U;
   controller->state_deadline = now_ms + TASK5_DDS_SETTLE_MS;
   Task5_SetState(controller, TASK5_STATE_DDS_SETTLING);
   Task5_Touch(controller);
@@ -347,17 +376,10 @@ static void Task5_SendDDSTest(task5_controller_t *controller,
 {
   uint8_t payload[11];
 
-  if (controller->status.search_count >=
-      TASK5_SEARCH_MAX_TESTS) {
-    Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
-    return;
-  }
-
   controller->status.test_id++;
   if (controller->status.test_id == 0U) {
     controller->status.test_id = 1U;
   }
-  controller->status.search_count++;
   controller->status.result_retry_count = 0U;
 
   OpenMV_WriteU16LE(&payload[0],
@@ -375,81 +397,38 @@ static void Task5_SendDDSTest(task5_controller_t *controller,
   Task5_ServicePending(controller, now_ms);
 }
 
-static uint32_t Task5_NextUndirectedFrequency(
+static uint32_t Task5_NextAlternatingFrequency(
     task5_controller_t *controller)
 {
   uint32_t radius;
   uint32_t multiplier;
   bool positive;
 
-  controller->undirected_attempt++;
-  multiplier =
-      (uint32_t)((controller->undirected_attempt + 1U) / 2U);
-  positive = (controller->undirected_attempt & 1U) != 0U;
-  radius = controller->search_step_hz * multiplier;
+  /*
+   * Test origin, +100, -100, +200, -200, ... .  At either legal
+   * frequency boundary, skip the out-of-range side rather than saturating
+   * to 1 Hz / 200 kHz and testing a duplicate or leaving the 100 Hz grid.
+   */
+  while (controller->undirected_attempt < UINT8_MAX) {
+    controller->undirected_attempt++;
+    multiplier =
+        (uint32_t)((controller->undirected_attempt + 1U) / 2U);
+    positive = (controller->undirected_attempt & 1U) != 0U;
+    radius = TASK5_SEARCH_STEP_HZ * multiplier;
 
-  if (positive) {
-    if (radius >
-        TASK5_MAX_DDS_FREQUENCY_HZ -
-            controller->search_origin_hz) {
-      return TASK5_MAX_DDS_FREQUENCY_HZ;
-    }
-    return controller->search_origin_hz + radius;
-  }
-  return (radius >= controller->search_origin_hz)
-             ? 1UL
-             : controller->search_origin_hz - radius;
-}
-
-static uint32_t Task5_NextDirectedFrequency(
-    task5_controller_t *controller,
-    uint8_t result)
-{
-  uint32_t current = controller->status.dds_frequency_hz;
-  uint32_t next;
-
-  if (result == TASK5_DDS_TOO_LOW) {
-    controller->search_lower_hz = current;
-    if (controller->search_upper_hz > current) {
-      next = current +
-             (controller->search_upper_hz - current) / 2UL;
-    } else {
-      next = (controller->search_step_hz >
-              TASK5_MAX_DDS_FREQUENCY_HZ - current)
-                 ? TASK5_MAX_DDS_FREQUENCY_HZ
-                 : current + controller->search_step_hz;
-      if (controller->search_step_hz <
-          TASK5_MAX_DDS_FREQUENCY_HZ / 2UL) {
-        controller->search_step_hz *= 2UL;
+    if (positive) {
+      if (radius <=
+          TASK5_MAX_DDS_FREQUENCY_HZ -
+              controller->search_origin_hz) {
+        return controller->search_origin_hz + radius;
       }
-    }
-  } else {
-    controller->search_upper_hz = current;
-    if ((controller->search_lower_hz != 0UL) &&
-        (controller->search_lower_hz < current)) {
-      next = controller->search_lower_hz +
-             (current - controller->search_lower_hz) / 2UL;
-    } else {
-      next = (controller->search_step_hz >= current)
-                 ? 1UL
-                 : current - controller->search_step_hz;
-      if (controller->search_step_hz <
-          TASK5_MAX_DDS_FREQUENCY_HZ / 2UL) {
-        controller->search_step_hz *= 2UL;
-      }
+    } else if ((radius < controller->search_origin_hz) &&
+               ((controller->search_origin_hz - radius) >=
+                TASK5_MIN_DDS_FREQUENCY_HZ)) {
+      return controller->search_origin_hz - radius;
     }
   }
-
-  if (next == current) {
-    if ((result == TASK5_DDS_TOO_LOW) &&
-        (current < TASK5_MAX_DDS_FREQUENCY_HZ)) {
-      next++;
-    } else if ((result == TASK5_DDS_TOO_HIGH) &&
-               (current > 1UL)) {
-      next--;
-    }
-  }
-  return next;
+  return 0UL;
 }
 
 static bool Task5_IsDuplicateResult(
@@ -539,17 +518,10 @@ static void Task5_HandleAck(task5_controller_t *controller,
           controller, TASK5_STATE_WAIT_DDS_RESULT);
       break;
     case TASK5_STATE_WAIT_STOP_ACK:
-      if (controller->port.start_phase_lock == NULL ||
-          !controller->port.start_phase_lock(
-              controller->port.context,
-              controller->status.mode,
-              controller->status.dds_frequency_hz)) {
-        Task5_EnterError(
-            controller, TASK5_ERROR_PHASE_LOCK);
-        return;
-      }
+      /* Frequency search is complete.  Keep the last AD9910 tone unchanged;
+       * the optional local phase loop is deliberately not started here. */
       Task5_SetState(
-          controller, TASK5_STATE_PHASE_LOCKING);
+          controller, TASK5_STATE_FREQUENCY_HOLD);
       break;
     default:
       break;
@@ -577,7 +549,9 @@ static void Task5_HandleNack(task5_controller_t *controller,
     controller->pending.ack_deadline = now_ms + 200UL;
     return;
   }
-  Task5_EnterError(controller, TASK5_ERROR_NACK);
+  if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+    Task5_EnterError(controller, TASK5_ERROR_NACK);
+  }
 }
 
 static void Task5_HandleCoarseResult(
@@ -666,12 +640,9 @@ static void Task5_HandleCoarseResult(
   controller->status.last_openmv_result = result;
   controller->status.estimated_input_frequency_hz =
       (uint32_t)estimated_input;
-  controller->search_origin_hz = (uint32_t)estimated;
-  controller->search_step_hz =
-      controller->search_origin_hz / 20UL;
-  if (controller->search_step_hz == 0UL) {
-    controller->search_step_hz = 1UL;
-  }
+  controller->search_origin_hz =
+      Task5_RoundToSearchGrid((uint32_t)estimated);
+  controller->search_step_hz = TASK5_SEARCH_STEP_HZ;
   controller->search_lower_hz = 0UL;
   controller->search_upper_hz = 0UL;
   controller->undirected_attempt = 0U;
@@ -758,19 +729,19 @@ static void Task5_HandleDDSTestResult(
   }
 
   if ((result == TASK5_DDS_TOO_LOW) ||
-      (result == TASK5_DDS_TOO_HIGH)) {
+      (result == TASK5_DDS_TOO_HIGH) ||
+      (result == TASK5_DDS_NOT_MATCHED)) {
     controller->image_retry_count = 0U;
-    next_frequency = Task5_NextDirectedFrequency(
-        controller, result);
-    (void)Task5_SetDDSAndSettle(
-        controller, next_frequency, now_ms);
-    return;
-  }
-
-  if (result == TASK5_DDS_NOT_MATCHED) {
-    controller->image_retry_count = 0U;
-    next_frequency =
-        Task5_NextUndirectedFrequency(controller);
+    if (controller->status.search_count >=
+        TASK5_SEARCH_MAX_TESTS) {
+      Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
+      return;
+    }
+    next_frequency = Task5_NextAlternatingFrequency(controller);
+    if (next_frequency == 0UL) {
+      Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
+      return;
+    }
     (void)Task5_SetDDSAndSettle(
         controller, next_frequency, now_ms);
     return;
@@ -784,7 +755,11 @@ static void Task5_HandleDDSTestResult(
     Task5_SetState(controller, TASK5_STATE_DDS_SETTLING);
     return;
   }
-  Task5_EnterError(controller, TASK5_ERROR_BAD_RESULT);
+  Task5_EnterError(
+      controller,
+      (result == TASK5_DDS_IMAGE_ERROR)
+          ? TASK5_ERROR_IMAGE_RECOGNITION
+          : TASK5_ERROR_BAD_RESULT);
 }
 
 bool Task5_Init(task5_controller_t *controller,

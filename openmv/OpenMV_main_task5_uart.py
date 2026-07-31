@@ -59,10 +59,39 @@ COARSE_1K_CLUSTER_RADIUS = 0.4
 COARSE_10K_CLUSTER_RADIUS = 0.3
 COARSE_MIN_CONFIDENCE = 50
 
-# Until the second-stage Lissajous dataset/model is available, DDS_TEST
-# direction is compared with the accepted coarse estimate. This validates
-# the complete UART state machine but is not the final visual fine search.
-DDS_NUMERIC_FALLBACK = True
+# Second-stage Lissajous stability detector. These are initial calibration
+# values for the documented white-paper oscilloscope frame and must be
+# verified with correct / +/-100 Hz / +/-200 Hz captures on the real setup.
+DDS_FEATURE_SIDE = 64
+DDS_SCREEN_DARK_MAX = 125
+DDS_SCREEN_MARGIN_X1000 = 20
+DDS_SCREEN_TRACE_EXPAND_X1000 = 1120
+DDS_SCREEN_TRACE_MIN_SIDE = 48
+DDS_LOCATOR_GREEN_MIN = 112
+DDS_LOCATOR_GREEN_MINUS_RED_MIN = 20
+DDS_LOCATOR_GREEN_MINUS_BLUE_MIN = 20
+DDS_LOCATOR_MERGE_MARGIN = 8
+DDS_TRACE_GREEN_MIN = 96
+DDS_TRACE_GREEN_MINUS_RED_MIN = 15
+DDS_TRACE_GREEN_MINUS_BLUE_MIN = 15
+DDS_TRACE_TOLERANCE_DILATION = 1
+DDS_MIN_TRACE_DENSITY = 0.015
+DDS_MAX_TRACE_DENSITY = 0.30
+DDS_MIN_VALID_FRAMES = 8
+DDS_MIN_OBSERVATION_MS = 600
+DDS_OBSERVATION_DEADLINE_MS = 1400
+DDS_MIN_ANCHOR_OVERLAP = 0.75
+DDS_MIN_PREVIOUS_OVERLAP = 0.82
+DDS_MAX_AREA_CHANGE = 0.15
+DDS_MAX_CENTROID_DRIFT = 2.0
+DDS_MIN_STABLE_PERCENT = 80
+DDS_MIN_CONSECUTIVE_STABLE = 3
+DDS_TARGET_SCORE = 850
+DDS_TARGET_CONFIDENCE = 80
+
+DDS_RESULT_TARGET_REACHED = 0
+DDS_RESULT_NOT_MATCHED = 3
+DDS_RESULT_IMAGE_ERROR = 6
 
 CONSOLE_DEBUG = False
 
@@ -3821,6 +3850,600 @@ class PcaRatioClassifier:
         result.analysis_ms = _ticks_diff(_ticks_ms(), started)
         return result
 
+
+class LissajousStabilityDetector:
+    """Detect a stationary, sparse green XY trace in a fixed screen ROI.
+
+    The coarse-stage trace rectangle seeds a fixed square screen ROI. If that
+    seed is unavailable, a strict bright-green locator is tried before the
+    legacy dark-screen locator. The ROI is then held for the session; deriving
+    a new crop from every changing trace would hide real movement.
+    """
+
+    def __init__(self):
+        self.positions = np.array(
+            tuple(range(DDS_FEATURE_SIDE)),
+            dtype=np.float,
+        )
+        self.reset_session()
+
+    def reset_session(self):
+        self.screen_outline_rect = None
+        self.screen_patch_rect = None
+        self.trace_seed_rect = None
+        self.locator_source = 0
+        self.reset_test(0)
+
+    def set_trace_seed(self, trace_rect):
+        if (
+            self.screen_patch_rect is not None
+            or trace_rect is None
+            or len(trace_rect) != 4
+        ):
+            return
+        self.trace_seed_rect = tuple(trace_rect)
+
+    def reset_test(self, capture_due_ms):
+        self.capture_due_ms = capture_due_ms
+        self.deadline_ms = time.ticks_add(
+            capture_due_ms,
+            DDS_OBSERVATION_DEADLINE_MS,
+        )
+        self.first_valid_ms = None
+        self.last_valid_ms = None
+        self.first_dense_ms = None
+        self.last_dense_ms = None
+        self.sampled_frames = 0
+        self.valid_frames = 0
+        self.dense_frames = 0
+        self.comparison_count = 0
+        self.stable_votes = 0
+        self.consecutive_stable = 0
+        self.similarity_sum = 0.0
+        self.anchor_raw = None
+        self.anchor_dilated = None
+        self.anchor_pixels = 0.0
+        self.anchor_x = 0.0
+        self.anchor_y = 0.0
+        self.previous_raw = None
+        self.previous_dilated = None
+        self.previous_pixels = 0.0
+        self.previous_x = 0.0
+        self.previous_y = 0.0
+        self.last_density = 0.0
+        self.last_anchor_overlap = 0.0
+        self.last_previous_overlap = 0.0
+        self.last_score = 0
+        self.last_confidence = 0
+
+    def _break_continuity(self):
+        self.consecutive_stable = 0
+        self.previous_raw = None
+        self.previous_dilated = None
+        self.previous_pixels = 0.0
+
+    @staticmethod
+    def _blob_rect(blob):
+        value = blob.rect
+        if isinstance(value, tuple):
+            return value
+        return value()
+
+    @staticmethod
+    def _blob_pixels(blob):
+        value = blob.pixels
+        if isinstance(value, int):
+            return value
+        return value()
+
+    @staticmethod
+    def _select_screen_blob(mask):
+        frame_width = mask.width()
+        frame_height = mask.height()
+        blobs = mask.find_blobs(
+            [(1, 255)],
+            x_stride=1,
+            y_stride=1,
+            area_threshold=500,
+            pixels_threshold=250,
+            merge=True,
+            margin=2,
+        )
+        best_blob = None
+        best_score = -1
+        for blob in blobs:
+            x, y, width, height = (
+                LissajousStabilityDetector._blob_rect(blob)
+            )
+            center_x = x + (0.5 * width)
+            center_y = y + (0.5 * height)
+            aspect = width / max(1.0, height)
+            if width < (0.22 * frame_width):
+                continue
+            if width > (0.52 * frame_width):
+                continue
+            if height < (0.35 * frame_height):
+                continue
+            if height > (0.82 * frame_height):
+                continue
+            if aspect < 0.62 or aspect > 1.35:
+                continue
+            if center_x < (0.36 * frame_width):
+                continue
+            if center_x > (0.68 * frame_width):
+                continue
+            if center_y < (0.20 * frame_height):
+                continue
+            if center_y > (0.80 * frame_height):
+                continue
+            pixels = LissajousStabilityDetector._blob_pixels(blob)
+            if (pixels * 5) < (width * height):
+                continue
+            if pixels > best_score:
+                best_blob = blob
+                best_score = pixels
+        return best_blob
+
+    @staticmethod
+    def _select_locator_trace_blob(mask):
+        frame_width = mask.width()
+        frame_height = mask.height()
+        blobs = mask.find_blobs(
+            [(1, 255)],
+            x_stride=1,
+            y_stride=1,
+            area_threshold=120,
+            pixels_threshold=80,
+            merge=True,
+            margin=DDS_LOCATOR_MERGE_MARGIN,
+        )
+        best_blob = None
+        best_score = -1.0
+        for blob in blobs:
+            x, y, width, height = (
+                LissajousStabilityDetector._blob_rect(blob)
+            )
+            center_x = x + (0.5 * width)
+            center_y = y + (0.5 * height)
+            aspect = width / max(1.0, height)
+            if width < (0.15 * frame_width):
+                continue
+            if width > (0.65 * frame_width):
+                continue
+            if height < (0.12 * frame_height):
+                continue
+            if height > (0.75 * frame_height):
+                continue
+            if aspect < 0.45 or aspect > 2.20:
+                continue
+            if center_x < (0.20 * frame_width):
+                continue
+            if center_x > (0.75 * frame_width):
+                continue
+            if center_y < (0.15 * frame_height):
+                continue
+            if center_y > (0.88 * frame_height):
+                continue
+            pixels = LissajousStabilityDetector._blob_pixels(blob)
+            center_penalty = abs(
+                (center_x / float(frame_width)) - 0.45
+            )
+            score = pixels * (1.0 - (0.5 * center_penalty))
+            if score > best_score:
+                best_blob = blob
+                best_score = score
+        return best_blob
+
+    @staticmethod
+    def _inner_screen_rect(blob_rect, frame_width, frame_height):
+        x, y, width, height = blob_rect
+        margin_x = max(
+            1,
+            int(
+                width * DDS_SCREEN_MARGIN_X1000 / 1000.0
+                + 0.5
+            ),
+        )
+        margin_y = max(
+            1,
+            int(
+                height * DDS_SCREEN_MARGIN_X1000 / 1000.0
+                + 0.5
+            ),
+        )
+        patch = (
+            x + margin_x,
+            y + margin_y,
+            width - (2 * margin_x),
+            height - (2 * margin_y),
+        )
+        if patch[2] < 32 or patch[3] < 32:
+            return None
+        if patch[0] < 0 or patch[1] < 0:
+            return None
+        if patch[0] + patch[2] > frame_width:
+            return None
+        if patch[1] + patch[3] > frame_height:
+            return None
+        return patch
+
+    def _locate_screen(self, frame):
+        dark_screen = frame.to_grayscale(copy=True)
+        dark_screen.binary([(0, DDS_SCREEN_DARK_MAX)])
+        blob = self._select_screen_blob(dark_screen)
+        if blob is None:
+            return False
+        outline = self._blob_rect(blob)
+        patch = self._inner_screen_rect(
+            outline,
+            frame.width(),
+            frame.height(),
+        )
+        if patch is None:
+            return False
+        self.screen_outline_rect = outline
+        self.screen_patch_rect = patch
+        self.locator_source = 3
+        return True
+
+    def _set_screen_from_trace_rect(
+        self,
+        trace_rect,
+        frame_width,
+        frame_height,
+        locator_source,
+    ):
+        x, y, width, height = trace_rect
+        if width < 8 or height < 8:
+            return False
+        side = int(
+            max(width, height)
+            * DDS_SCREEN_TRACE_EXPAND_X1000
+            / 1000.0
+            + 0.5
+        )
+        side = max(side, DDS_SCREEN_TRACE_MIN_SIDE)
+        maximum_side = int(
+            min(0.65 * frame_width, 0.82 * frame_height)
+        )
+        if side > maximum_side:
+            return False
+
+        center_x = x + (0.5 * width)
+        center_y = y + (0.5 * height)
+        screen_x = int(center_x - (0.5 * side) + 0.5)
+        screen_y = int(center_y - (0.5 * side) + 0.5)
+        screen_x = max(0, min(screen_x, frame_width - side))
+        screen_y = max(0, min(screen_y, frame_height - side))
+        outline = (screen_x, screen_y, side, side)
+        patch = self._inner_screen_rect(
+            outline,
+            frame_width,
+            frame_height,
+        )
+        if patch is None:
+            return False
+        self.screen_outline_rect = outline
+        self.screen_patch_rect = patch
+        self.locator_source = locator_source
+        return True
+
+    def _locate_seeded_screen(self, frame):
+        if self.trace_seed_rect is None:
+            return False
+        return self._set_screen_from_trace_rect(
+            self.trace_seed_rect,
+            frame.width(),
+            frame.height(),
+            1,
+        )
+
+    @staticmethod
+    def _make_locator_trace_mask(frame):
+        green = frame.to_grayscale(rgb_channel=1, copy=True)
+        red_difference = frame.to_grayscale(
+            rgb_channel=0,
+            copy=True,
+        )
+        blue_difference = frame.to_grayscale(
+            rgb_channel=2,
+            copy=True,
+        )
+        green_gate = green.copy()
+        green_gate.binary([(DDS_LOCATOR_GREEN_MIN, 255)])
+        red_difference.rsub(green)
+        red_difference.binary(
+            [(DDS_LOCATOR_GREEN_MINUS_RED_MIN, 255)]
+        )
+        blue_difference.rsub(green)
+        blue_difference.binary(
+            [(DDS_LOCATOR_GREEN_MINUS_BLUE_MIN, 255)]
+        )
+        red_difference.b_and(blue_difference)
+        red_difference.b_and(green_gate)
+        red_difference.dilate(1)
+        return red_difference
+
+    def _locate_green_screen(self, frame):
+        trace_mask = self._make_locator_trace_mask(frame)
+        blob = self._select_locator_trace_blob(trace_mask)
+        if blob is None:
+            return False
+        return self._set_screen_from_trace_rect(
+            self._blob_rect(blob),
+            frame.width(),
+            frame.height(),
+            2,
+        )
+
+    def _scaled_channel(self, frame, channel):
+        rect = self.screen_patch_rect
+        patch = frame.to_grayscale(
+            rgb_channel=channel,
+            x_scale=(DDS_FEATURE_SIDE + 0.01) / float(rect[2]),
+            y_scale=(DDS_FEATURE_SIDE + 0.01) / float(rect[3]),
+            roi=rect,
+            hint=omv_image.BILINEAR,
+            copy=True,
+        )
+        if (
+            patch.width() != DDS_FEATURE_SIDE
+            or patch.height() != DDS_FEATURE_SIDE
+        ):
+            return None
+        return patch
+
+    def _extract_trace(self, frame):
+        if self.screen_patch_rect is None:
+            if not self._locate_seeded_screen(frame):
+                if not self._locate_green_screen(frame):
+                    if not self._locate_screen(frame):
+                        return None
+
+        green = self._scaled_channel(frame, 1)
+        red_difference = self._scaled_channel(frame, 0)
+        blue_difference = self._scaled_channel(frame, 2)
+        if (
+            green is None
+            or red_difference is None
+            or blue_difference is None
+        ):
+            return None
+
+        green_gate = green.copy()
+        green_gate.binary([(DDS_TRACE_GREEN_MIN, 255)])
+        red_difference.rsub(green)
+        red_difference.binary(
+            [(DDS_TRACE_GREEN_MINUS_RED_MIN, 255)]
+        )
+        blue_difference.rsub(green)
+        blue_difference.binary(
+            [(DDS_TRACE_GREEN_MINUS_BLUE_MIN, 255)]
+        )
+        red_difference.b_and(blue_difference)
+        red_difference.b_and(green_gate)
+
+        raw = red_difference.to_ndarray("f").flatten() / 255.0
+        expanded_image = red_difference.copy()
+        expanded_image.dilate(DDS_TRACE_TOLERANCE_DILATION)
+        expanded = (
+            expanded_image.to_ndarray("f").flatten() / 255.0
+        )
+        pixels = float(np.sum(raw))
+        if pixels <= 0.0:
+            return raw, expanded, pixels, 0.0, 0.0
+
+        matrix = raw.reshape(
+            (DDS_FEATURE_SIDE, DDS_FEATURE_SIDE)
+        )
+        columns = np.sum(matrix, axis=0)
+        rows = np.sum(matrix, axis=1)
+        center_x = float(np.sum(columns * self.positions)) / pixels
+        center_y = float(np.sum(rows * self.positions)) / pixels
+        return raw, expanded, pixels, center_x, center_y
+
+    @staticmethod
+    def _tolerant_overlap(
+        first_raw,
+        first_dilated,
+        first_pixels,
+        second_raw,
+        second_dilated,
+        second_pixels,
+    ):
+        if first_pixels <= 0.0 or second_pixels <= 0.0:
+            return 0.0
+        first_in_second = float(
+            np.sum(first_raw * second_dilated)
+        ) / first_pixels
+        second_in_first = float(
+            np.sum(second_raw * first_dilated)
+        ) / second_pixels
+        return min(first_in_second, second_in_first)
+
+    def _quality(self):
+        if self.comparison_count <= 0:
+            self.last_score = 0
+            self.last_confidence = 0
+            return 0, 0
+        stable_fraction = (
+            self.stable_votes / float(self.comparison_count)
+        )
+        similarity = (
+            self.similarity_sum / float(self.comparison_count)
+        )
+        valid_fraction = self.valid_frames / float(
+            max(1, self.sampled_frames)
+        )
+        score = int(
+            1000.0 * min(stable_fraction, similarity) + 0.5
+        )
+        confidence = int(
+            100.0 * min(stable_fraction, valid_fraction) + 0.5
+        )
+        self.last_score = int(_clamp(score, 0, 1000))
+        self.last_confidence = int(_clamp(confidence, 0, 100))
+        return self.last_score, self.last_confidence
+
+    def _deadline_result(self, now_ms):
+        if _ticks_diff(now_ms, self.deadline_ms) < 0:
+            return None
+        score, confidence = self._quality()
+        valid_span_ms = (
+            0
+            if self.first_valid_ms is None or self.last_valid_ms is None
+            else _ticks_diff(self.last_valid_ms, self.first_valid_ms)
+        )
+        dense_span_ms = (
+            0
+            if self.first_dense_ms is None or self.last_dense_ms is None
+            else _ticks_diff(self.last_dense_ms, self.first_dense_ms)
+        )
+        if (
+            (
+                self.valid_frames >= DDS_MIN_VALID_FRAMES
+                and valid_span_ms >= DDS_MIN_OBSERVATION_MS
+            )
+            or (
+                self.dense_frames >= DDS_MIN_VALID_FRAMES
+                and dense_span_ms >= DDS_MIN_OBSERVATION_MS
+            )
+        ):
+            return DDS_RESULT_NOT_MATCHED, score, confidence
+        return DDS_RESULT_IMAGE_ERROR, score, confidence
+
+    def invalidate_screen(self):
+        self.screen_outline_rect = None
+        self.screen_patch_rect = None
+        self.trace_seed_rect = None
+        self.locator_source = 0
+
+    def update(self, frame, now_ms):
+        if _ticks_diff(now_ms, self.capture_due_ms) < 0:
+            return None
+
+        self.sampled_frames += 1
+        trace = self._extract_trace(frame)
+        if trace is None:
+            self._break_continuity()
+            return self._deadline_result(now_ms)
+
+        raw, expanded, pixels, center_x, center_y = trace
+        density = pixels / float(DDS_FEATURE_SIDE * DDS_FEATURE_SIDE)
+        self.last_density = density
+        if density > DDS_MAX_TRACE_DENSITY:
+            if self.first_dense_ms is None:
+                self.first_dense_ms = now_ms
+            self.last_dense_ms = now_ms
+            self.dense_frames += 1
+            self._break_continuity()
+            return self._deadline_result(now_ms)
+        if density < DDS_MIN_TRACE_DENSITY:
+            self._break_continuity()
+            return self._deadline_result(now_ms)
+
+        self.valid_frames += 1
+        if self.first_valid_ms is None:
+            self.first_valid_ms = now_ms
+        self.last_valid_ms = now_ms
+        if self.anchor_raw is None:
+            self.anchor_raw = raw
+            self.anchor_dilated = expanded
+            self.anchor_pixels = pixels
+            self.anchor_x = center_x
+            self.anchor_y = center_y
+            self.previous_raw = raw
+            self.previous_dilated = expanded
+            self.previous_pixels = pixels
+            self.previous_x = center_x
+            self.previous_y = center_y
+            return self._deadline_result(now_ms)
+        if self.previous_raw is None:
+            # A missing/rejected frame broke continuity. Rebase the adjacent
+            # comparison and require a new run of stable frames.
+            self.previous_raw = raw
+            self.previous_dilated = expanded
+            self.previous_pixels = pixels
+            self.previous_x = center_x
+            self.previous_y = center_y
+            return self._deadline_result(now_ms)
+
+        anchor_overlap = self._tolerant_overlap(
+            self.anchor_raw,
+            self.anchor_dilated,
+            self.anchor_pixels,
+            raw,
+            expanded,
+            pixels,
+        )
+        previous_overlap = self._tolerant_overlap(
+            self.previous_raw,
+            self.previous_dilated,
+            self.previous_pixels,
+            raw,
+            expanded,
+            pixels,
+        )
+        anchor_area_change = abs(
+            pixels - self.anchor_pixels
+        ) / max(1.0, self.anchor_pixels)
+        previous_area_change = abs(
+            pixels - self.previous_pixels
+        ) / max(1.0, self.previous_pixels)
+        anchor_centroid_ok = (
+            abs(center_x - self.anchor_x) <= DDS_MAX_CENTROID_DRIFT
+            and abs(center_y - self.anchor_y)
+            <= DDS_MAX_CENTROID_DRIFT
+        )
+        previous_centroid_ok = (
+            abs(center_x - self.previous_x) <= DDS_MAX_CENTROID_DRIFT
+            and abs(center_y - self.previous_y)
+            <= DDS_MAX_CENTROID_DRIFT
+        )
+
+        self.comparison_count += 1
+        self.last_anchor_overlap = anchor_overlap
+        self.last_previous_overlap = previous_overlap
+        self.similarity_sum += min(
+            anchor_overlap,
+            previous_overlap,
+        )
+        current_stable = (
+            anchor_overlap >= DDS_MIN_ANCHOR_OVERLAP
+            and previous_overlap >= DDS_MIN_PREVIOUS_OVERLAP
+            and anchor_area_change <= DDS_MAX_AREA_CHANGE
+            and previous_area_change <= DDS_MAX_AREA_CHANGE
+            and anchor_centroid_ok
+            and previous_centroid_ok
+        )
+        if current_stable:
+            self.stable_votes += 1
+            self.consecutive_stable += 1
+        else:
+            self.consecutive_stable = 0
+
+        self.previous_raw = raw
+        self.previous_dilated = expanded
+        self.previous_pixels = pixels
+        self.previous_x = center_x
+        self.previous_y = center_y
+
+        score, confidence = self._quality()
+        observed_ms = _ticks_diff(now_ms, self.first_valid_ms)
+        if (
+            self.valid_frames >= DDS_MIN_VALID_FRAMES
+            and observed_ms >= DDS_MIN_OBSERVATION_MS
+            and self.stable_votes * 100
+            >= DDS_MIN_STABLE_PERCENT * self.comparison_count
+            and current_stable
+            and self.consecutive_stable
+            >= DDS_MIN_CONSECUTIVE_STABLE
+            and score >= DDS_TARGET_SCORE
+            and confidence >= DDS_TARGET_CONFIDENCE
+        ):
+            return DDS_RESULT_TARGET_REACHED, score, confidence
+        return self._deadline_result(now_ms)
+
 # ========================= UART PROTOCOL ==========================
 
 PROTOCOL_VERSION = 0x01
@@ -4581,22 +5204,40 @@ def annotate(frame, controller, fps):
         color=(80, 255, 80),
         scale=1,
     )
-    frame.draw_string(
-        (2, 14),
-        "SCAN:%5dHz  EST:%6dHz" % (
+    if controller.state == STATE_DDS_RECOGNIZING:
+        detector = controller.stability_detector
+        information_line = "ROI:%d V:%02d/%02d D:%02d%%" % (
+            detector.locator_source,
+            detector.valid_frames,
+            detector.sampled_frames,
+            clamp_int(int(detector.last_density * 100.0 + 0.5), 0, 99),
+        )
+    else:
+        information_line = "SCAN:%5dHz  EST:%6dHz" % (
             controller.saw_frequency_hz,
             controller.coarse_estimated_hz,
-        ),
+        )
+    frame.draw_string(
+        (2, 14),
+        information_line,
         color=(255, 255, 255),
         scale=1,
     )
-    frame.draw_string(
-        (2, 27),
-        "RATIO:%4.1fx CONF:%2d%% FPS:%3.1f" % (
+    if controller.state == STATE_DDS_RECOGNIZING:
+        status_line = "DDS:%6d S:%3d C:%2d%%" % (
+            controller.dds_frequency_hz,
+            controller.dds_match_score,
+            controller.dds_stability_confidence,
+        )
+    else:
+        status_line = "RATIO:%4.1fx CONF:%2d%% FPS:%3.1f" % (
             controller.display_ratio,
             controller.coarse_confidence,
             fps,
-        ),
+        )
+    frame.draw_string(
+        (2, 27),
+        status_line,
         color=(200, 220, 255),
         scale=1,
     )
@@ -4619,6 +5260,7 @@ class Task5Controller:
         self.last_completed_session = 0
 
         self.classifier = None
+        self.stability_detector = LissajousStabilityDetector()
         self.pending_model_spec = None
         self.model_retry_due_ms = 0
         self.model_error_count = 0
@@ -4645,6 +5287,8 @@ class Task5Controller:
         self.dds_frequency_hz = 0
         self.dds_search_stage = 0
         self.dds_capture_due_ms = 0
+        self.dds_match_score = 0
+        self.dds_stability_confidence = 0
         self.last_stop_key = None
 
     def _cache_and_send_result(self, message_type, payload):
@@ -4689,6 +5333,9 @@ class Task5Controller:
         self.dds_frequency_hz = 0
         self.dds_search_stage = 0
         self.dds_capture_due_ms = 0
+        self.dds_match_score = 0
+        self.dds_stability_confidence = 0
+        self.stability_detector.reset_session()
         self._clear_result_cache()
         gc.collect()
 
@@ -4803,6 +5450,7 @@ class Task5Controller:
         self.display_ratio = 0.0
         self.last_rect = None
         self.dds_command_key = None
+        self.stability_detector.reset_session()
         self._clear_result_cache()
         print(
             "【开始粗识别】任务%d，扫描%d Hz，模式%d"
@@ -4864,6 +5512,15 @@ class Task5Controller:
             ticks_ms(),
             capture_delay_ms,
         )
+        self.dds_match_score = 0
+        self.dds_stability_confidence = 0
+        self.stability_detector.set_trace_seed(self.last_rect)
+        self.stability_detector.reset_test(
+            self.dds_capture_due_ms
+        )
+        # Previous candidate masks are now unreachable; reclaim them during
+        # the requested capture delay rather than during a measured frame.
+        gc.collect()
         self._clear_result_cache()
         print(
             "【DDS测试】编号%d，频率%d Hz，等待%d ms"
@@ -5083,40 +5740,29 @@ class Task5Controller:
             )
             self.send_coarse_result(1, fallback[0], fallback[1])
 
-    def process_dds_if_due(self):
+    def process_dds_frame(self, frame):
         if self.state != STATE_DDS_RECOGNIZING:
             return
-        if ticks_diff(ticks_ms(), self.dds_capture_due_ms) < 0:
+        decision = self.stability_detector.update(
+            frame,
+            ticks_ms(),
+        )
+        self.last_rect = (
+            self.stability_detector.screen_outline_rect
+        )
+        self.dds_match_score = self.stability_detector.last_score
+        self.dds_stability_confidence = (
+            self.stability_detector.last_confidence
+        )
+        if decision is None:
             return
-
-        if not DDS_NUMERIC_FALLBACK:
-            result_code = 5
-            match_score = 0
-            confidence = 0
-        else:
-            target_hz = self.coarse_estimated_hz
-            if self.lock_mode == 2:
-                target_hz *= 2
-            target_hz = clamp_int(target_hz, 1, 200000)
-            tolerance_hz = max(100, self.saw_frequency_hz // 10)
-            error_hz = abs(self.dds_frequency_hz - target_hz)
-            if error_hz <= tolerance_hz:
-                result_code = 0
-            elif self.dds_frequency_hz < target_hz:
-                result_code = 1
-            else:
-                result_code = 2
-            match_score = clamp_int(
-                1000
-                - int(
-                    1000
-                    * error_hz
-                    / max(1, 4 * tolerance_hz)
-                ),
-                0,
-                1000,
-            )
-            confidence = self.coarse_confidence
+        result_code, match_score, confidence = decision
+        self.dds_match_score = match_score
+        self.dds_stability_confidence = confidence
+        if result_code == DDS_RESULT_IMAGE_ERROR:
+            # Reacquire the fixed screen ROI on the same-frequency retry.
+            self.stability_detector.invalidate_screen()
+            self.last_rect = None
 
         payload = struct.pack(
             "<HHBHB",
@@ -5181,7 +5827,7 @@ while True:
     # A command arriving during snapshot is acknowledged before PCA work.
     controller.poll_uart()
     controller.process_coarse_frame(frame)
-    controller.process_dds_if_due()
+    controller.process_dds_frame(frame)
     controller.poll_uart()
 
     if display is not None:

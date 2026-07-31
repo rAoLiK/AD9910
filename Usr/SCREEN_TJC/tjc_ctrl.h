@@ -76,6 +76,15 @@
 HAL_StatusTypeDef TJC_CtrlSendCommand(const char *command);
 
 /**
+ * @brief  Request a supported TJC display to sound its buzzer.
+ * @param  durationMs Buzzer duration in milliseconds, 1-65535.
+ * @retval HAL status returned by the non-blocking screen transport.
+ * @note   The TJC `beep` command is only available on display models with
+ *         buzzer support; this call never delays the MCU for the duration.
+ */
+HAL_StatusTypeDef TJC_SystemBeep(uint16_t durationMs);
+
+/**
  * @brief  向目标属性写入数值。
  * @param  target 控件名称或跨页面全路径，例如 t0、main.t0。
  * @param  attribute 属性名，例如 val、pic、font。
