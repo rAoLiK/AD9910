@@ -87,10 +87,11 @@ session_id:u16, lock_mode:u8, saw_frequency_hz:u32
 
 OpenMV ACK `START_TASK` 后进入内部 `WAIT_SIGNAL` 状态。该 ACK 只确认模式
 选择，不代表信号已经接入。在 `WAIT_SIGNAL` 中不得加载频率模型、累计粗识别
-结果或启动粗识别回退计时；无输入时 XY 区域的绿色细竖线不是有效信号。
-只有绿色轨迹横纵跨度均满足条件并连续有效 6 帧后，才进入 `COARSE` 并从零
-开始识别计时。等待期间 STM32 继续处于 `WAIT_COARSE_RESULT`，协议无需新增
-消息类型。
+结果或启动粗识别回退计时；无输入时 XY 区域的绿色居中细竖线不是有效
+信号。OpenMV 对中心绿色高轨迹的水平宽度做 7 帧中值滤波，使用 10%/7.5%
+画面宽度及 0.20/0.14 宽高比作为进入/退出迟滞门限。滤波结果连续满足 6 次
+后才进入 `COARSE` 并从零开始识别计时。等待期间 STM32 继续处于
+`WAIT_COARSE_RESULT`，协议无需新增消息类型。
 
 ### 4.2 COARSE_RESULT `0x11`
 
@@ -198,7 +199,8 @@ LOCK_HOLD -- manual new START --> WAIT_SIGNAL(new session)
 
 - 三种模式找频阶段全部使用单倍频率；
 - 未接入外部信号时按模式键，OpenMV 保持 `WAIT_SIGNAL` 且不发送
-  `COARSE_RESULT`；接入后必须连续确认 6 帧才进入 `COARSE`；
+  `COARSE_RESULT`；居中竖线的 `W:xx%` 必须稳定低于进入门限，接入后经
+  7 帧中值和 6 次滤波确认才进入 `COARSE`；
 - 绝对频率确认时只响铃一次；
 - 双环只在确认后设置一次二倍种子，不发生重复倍频或超高频输出；
 - 对角线方向为左下到右上；圆和双环相位不会被直线对齐逻辑修改；

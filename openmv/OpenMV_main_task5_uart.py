@@ -62,20 +62,28 @@ COARSE_MIN_CONFIDENCE = 50
 
 # A START_TASK only means that the operator selected a Task5 mode. The
 # external source may be connected later, so do not expand the frequency
-# model or feed frames into it until a real two-dimensional XY trace has been
-# present for several consecutive frames. With only the scope scan channel
-# connected, the XY display is a narrow vertical line; the minimum width and
-# aspect-ratio gates below reject that idle pattern.
+# model or feed frames into it until the XY trace has a stable horizontal
+# spread. With no input the scope draws a centered vertical line; its width is
+# far below the expanded drawing produced after the source is connected.
 SIGNAL_CONFIRM_FRAMES = 6
+SIGNAL_WIDTH_HISTORY_FRAMES = 7
+SIGNAL_WIDTH_MIN_SAMPLES = 5
+SIGNAL_GREEN_MIN = 96
 SIGNAL_GREEN_MINUS_RED_MIN = 6
 SIGNAL_GREEN_MINUS_BLUE_MIN = 4
-SIGNAL_MASK_DILATION = 2
-SIGNAL_MIN_WIDTH_RATIO = 0.18
-SIGNAL_MAX_WIDTH_RATIO = 0.90
-SIGNAL_MIN_HEIGHT_RATIO = 0.25
-SIGNAL_MAX_HEIGHT_RATIO = 0.95
-SIGNAL_MIN_ASPECT = 0.60
-SIGNAL_MAX_ASPECT = 2.20
+SIGNAL_MASK_DILATION = 1
+SIGNAL_LOCATOR_MERGE_MARGIN = 6
+SIGNAL_MIN_TRACE_HEIGHT_RATIO = 0.12
+SIGNAL_MAX_TRACE_HEIGHT_RATIO = 0.75
+SIGNAL_MAX_TRACE_WIDTH_RATIO = 0.65
+SIGNAL_CENTER_X_MIN_RATIO = 0.20
+SIGNAL_CENTER_X_MAX_RATIO = 0.75
+SIGNAL_CENTER_Y_MIN_RATIO = 0.15
+SIGNAL_CENTER_Y_MAX_RATIO = 0.88
+SIGNAL_ENTER_WIDTH_RATIO = 0.10
+SIGNAL_EXIT_WIDTH_RATIO = 0.075
+SIGNAL_ENTER_ASPECT = 0.20
+SIGNAL_EXIT_ASPECT = 0.14
 
 # Second-stage Lissajous line/ellipse-family detector. Thresholds below cover
 # all 68 same-frequency calibration captures, including lines, ellipses and
@@ -3476,11 +3484,10 @@ class InputSignalDetector:
     """Confirm that the oscilloscope XY window contains a valid input.
 
     The source-absent reference scene still contains a bright green vertical
-    line, so pixel count alone is not sufficient. A valid unknown source
-    spreads the green XY trace in both axes. Requiring a suitably sized,
-    roughly square connected trace for consecutive frames prevents mode-button
-    frames, single-channel traces, and brief display refresh artifacts from
-    starting frequency recognition.
+    line, so pixel count alone is not sufficient. The detector first locates
+    the tall green XY trace without requiring it to be wide, then measures its
+    horizontal span. A short median filter and separate enter/exit thresholds
+    prevent glow, refresh gaps, and one-frame noise from changing the result.
     """
 
     def __init__(self, confirm_frames=SIGNAL_CONFIRM_FRAMES):
@@ -3491,6 +3498,11 @@ class InputSignalDetector:
         self.consecutive_frames = 0
         self.candidate_rect = None
         self.confirmed = False
+        self.expanded = False
+        self.width_history = []
+        self.aspect_history = []
+        self.last_width_ratio = 0.0
+        self.last_aspect = 0.0
 
     @staticmethod
     def _blob_rect(blob):
@@ -3506,7 +3518,7 @@ class InputSignalDetector:
             return value
         return value()
 
-    def _find_candidate(self, frame):
+    def _find_observation(self, frame):
         green = frame.to_grayscale(rgb_channel=1, copy=True)
         red_difference = frame.to_grayscale(rgb_channel=0, copy=True)
         blue_difference = frame.to_grayscale(rgb_channel=2, copy=True)
@@ -3515,7 +3527,9 @@ class InputSignalDetector:
         red_difference.binary([(SIGNAL_GREEN_MINUS_RED_MIN, 255)])
         blue_difference.rsub(green)
         blue_difference.binary([(SIGNAL_GREEN_MINUS_BLUE_MIN, 255)])
+        green.binary([(SIGNAL_GREEN_MIN, 255)])
         red_difference.b_and(blue_difference)
+        red_difference.b_and(green)
         red_difference.dilate(SIGNAL_MASK_DILATION)
 
         frame_width = frame.width()
@@ -3525,45 +3539,86 @@ class InputSignalDetector:
             x_stride=1,
             y_stride=1,
             area_threshold=500,
-            pixels_threshold=250,
-            merge=False,
+            pixels_threshold=80,
+            merge=True,
+            margin=SIGNAL_LOCATOR_MERGE_MARGIN,
         )
         best_rect = None
+        best_width_ratio = 0.0
+        best_aspect = 0.0
         best_score = -1.0
         for blob in blobs:
             x, y, width, height = self._blob_rect(blob)
             center_x = x + (0.5 * width)
+            center_y = y + (0.5 * height)
             aspect = width / max(1.0, height)
-            if width < (SIGNAL_MIN_WIDTH_RATIO * frame_width):
+            if width > (SIGNAL_MAX_TRACE_WIDTH_RATIO * frame_width):
                 continue
-            if width > (SIGNAL_MAX_WIDTH_RATIO * frame_width):
+            if height < (SIGNAL_MIN_TRACE_HEIGHT_RATIO * frame_height):
                 continue
-            if height < (SIGNAL_MIN_HEIGHT_RATIO * frame_height):
+            if height > (SIGNAL_MAX_TRACE_HEIGHT_RATIO * frame_height):
                 continue
-            if height > (SIGNAL_MAX_HEIGHT_RATIO * frame_height):
+            if aspect > 3.0:
                 continue
-            if aspect < SIGNAL_MIN_ASPECT or aspect > SIGNAL_MAX_ASPECT:
+            if center_x < (SIGNAL_CENTER_X_MIN_RATIO * frame_width):
                 continue
-            if center_x < (0.10 * frame_width):
+            if center_x > (SIGNAL_CENTER_X_MAX_RATIO * frame_width):
                 continue
-            if center_x > (0.90 * frame_width):
+            if center_y < (SIGNAL_CENTER_Y_MIN_RATIO * frame_height):
+                continue
+            if center_y > (SIGNAL_CENTER_Y_MAX_RATIO * frame_height):
                 continue
 
-            score = self._blob_pixels(blob) * width * height
+            center_distance = abs(
+                (center_x / float(frame_width)) - 0.48
+            ) + abs((center_y / float(frame_height)) - 0.50)
+            score = (
+                self._blob_pixels(blob)
+                * height
+                * max(0.25, 1.0 - center_distance)
+            )
             if score > best_score:
                 best_score = score
                 best_rect = (x, y, width, height)
-        return best_rect
+                best_width_ratio = width / float(frame_width)
+                best_aspect = aspect
+        return best_rect, best_width_ratio, best_aspect
 
     def update(self, frame):
-        candidate = self._find_candidate(frame)
+        candidate, width_ratio, aspect = self._find_observation(frame)
         self.candidate_rect = candidate
-        if candidate is None:
+        self.width_history.append(width_ratio)
+        self.aspect_history.append(aspect)
+        if len(self.width_history) > SIGNAL_WIDTH_HISTORY_FRAMES:
+            self.width_history.pop(0)
+            self.aspect_history.pop(0)
+
+        ordered_widths = sorted(self.width_history)
+        ordered_aspects = sorted(self.aspect_history)
+        self.last_width_ratio = ordered_widths[len(ordered_widths) // 2]
+        self.last_aspect = ordered_aspects[len(ordered_aspects) // 2]
+
+        if len(self.width_history) < SIGNAL_WIDTH_MIN_SAMPLES:
             self.consecutive_frames = 0
             self.confirmed = False
             return False
 
-        self.consecutive_frames += 1
+        if self.expanded:
+            self.expanded = (
+                self.last_width_ratio >= SIGNAL_EXIT_WIDTH_RATIO
+                and self.last_aspect >= SIGNAL_EXIT_ASPECT
+            )
+        else:
+            self.expanded = (
+                self.last_width_ratio >= SIGNAL_ENTER_WIDTH_RATIO
+                and self.last_aspect >= SIGNAL_ENTER_ASPECT
+            )
+
+        if self.expanded:
+            self.consecutive_frames += 1
+        else:
+            self.consecutive_frames = 0
+            self.confirmed = False
         if self.consecutive_frames >= self.confirm_frames:
             self.consecutive_frames = self.confirm_frames
             self.confirmed = True
@@ -5700,7 +5755,15 @@ def annotate(frame, controller, fps):
             fps,
         )
     elif controller.state == STATE_WAIT_SIGNAL:
-        status_line = "VALID:%d/%d  FPS:%3.1f" % (
+        status_line = "W:%02d%% VALID:%d/%d FPS:%3.1f" % (
+            clamp_int(
+                int(
+                    controller.signal_detector.last_width_ratio * 100.0
+                    + 0.5
+                ),
+                0,
+                99,
+            ),
             controller.signal_detector.consecutive_frames,
             controller.signal_detector.confirm_frames,
             fps,

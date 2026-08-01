@@ -183,6 +183,23 @@ def main():
     assert "P:123.4" in visual_frame.drawn_strings[2]
     assert "D:0.57Hz" in visual_frame.drawn_strings[2]
 
+    class SignalDetectorStatus:
+        last_width_ratio = 0.123
+        consecutive_frames = 4
+        confirm_frames = 6
+
+    class WaitSignalController:
+        state = namespace["STATE_WAIT_SIGNAL"]
+        signal_detector = SignalDetectorStatus()
+        last_rect = None
+
+    wait_frame = FakeFrame(320, 240)
+    namespace["annotate"](wait_frame, WaitSignalController(), 24.5)
+    assert "WAIT SIGNAL" in wait_frame.drawn_strings[0]
+    assert wait_frame.drawn_strings[1] == "CONNECT INPUT SIGNAL"
+    assert "W:12%" in wait_frame.drawn_strings[2]
+    assert "VALID:4/6" in wait_frame.drawn_strings[2]
+
     class HoldController:
         state = namespace["STATE_LOCK_HOLD"]
         lock_input_frequency_hz = 5200
