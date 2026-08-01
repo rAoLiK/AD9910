@@ -12,11 +12,11 @@
 #define LOCK_MID_PHASE_RAD                (15.0f * LOCK_PI_F / 180.0f)
 #define LOCK_FINE_GRADIENT_HZ             (0.50f)
 #define LOCK_FINE_STEP_HZ                 (0.05f)
-#define LOCK_DIRECT_PHASE_GAIN            (0.65f)
-#define LOCK_DIRECT_FINE_STEP_RAD          (0.15f * LOCK_PI_F / 180.0f)
-#define LOCK_DIRECT_MID_STEP_RAD           (1.0f * LOCK_PI_F / 180.0f)
-#define LOCK_DIRECT_COARSE_STEP_RAD        (10.0f * LOCK_PI_F / 180.0f)
-#define LOCK_DIRECT_LOCK_STEP_RAD          (0.10f * LOCK_PI_F / 180.0f)
+#define LOCK_DIRECT_PHASE_GAIN            (0.50f)
+#define LOCK_DIRECT_FINE_STEP_RAD          (0.10f * LOCK_PI_F / 180.0f)
+#define LOCK_DIRECT_MID_STEP_RAD           (0.70f * LOCK_PI_F / 180.0f)
+#define LOCK_DIRECT_COARSE_STEP_RAD        (7.0f * LOCK_PI_F / 180.0f)
+#define LOCK_DIRECT_LOCK_STEP_RAD          (0.08f * LOCK_PI_F / 180.0f)
 #define LOCK_ACQUIRE_THRESHOLD_RAD        (3.0f * LOCK_PI_F / 180.0f)
 #define LOCK_RELEASE_THRESHOLD_RAD        (12.0f * LOCK_PI_F / 180.0f)
 #define LOCK_ACQUIRE_TIME_S               (0.050f)
@@ -26,11 +26,11 @@
 #define LOCK_INPUT_STABLE_MIN_HZ          (2.0f)
 #define LOCK_INPUT_STABLE_FRACTION        (0.00002f)
 #define LOCK_LOW_INPUT_STABLE_HZ          (1.0f)
-#define LOCK_PHASE_RATE_FILTER_TAU_S      (0.006f)
-#define LOCK_PHASE_RATE_GAIN              (0.50f)
+#define LOCK_PHASE_RATE_FILTER_TAU_S      (0.010f)
+#define LOCK_PHASE_RATE_GAIN              (0.30f)
 #define LOCK_PHASE_RATE_LIMIT_HZ          (500.0f)
-#define LOCK_LOW_RATE_FILTER_TAU_S        (0.020f)
-#define LOCK_LOW_RATE_LEARN_TAU_S         (0.020f)
+#define LOCK_LOW_RATE_FILTER_TAU_S        (0.025f)
+#define LOCK_LOW_RATE_LEARN_TAU_S         (0.030f)
 #define LOCK_HIGH_HOLD_SETTLE_S           (0.150f)
 #define LOCK_HIGH_HOLD_FILTER_TAU_S       (0.020f)
 #define LOCK_HIGH_HOLD_PHASE_DEADBAND_RAD (0.20f * LOCK_PI_F / 180.0f)
@@ -54,12 +54,12 @@ typedef struct {
 } lock_band_parameters_t;
 
 static const lock_band_parameters_t s_band_parameters[] = {
-    /* LOW: reject block-to-block jitter and avoid repeated reacquisition. */
-    {0.010f, 0.015f, 0.0f, 5.0f, 0.060f, 0.10f, 0.50f},
-    /* MID: keep the previously board-verified high-frequency FTW loop. */
-    {0.004f, 0.004f, 20.0f, 120.0f, 0.060f, 0.50f, 5.0f},
-    /* HIGH: retain the fast loop already verified above 41 kHz. */
-    {0.004f, 0.004f, 20.0f, 120.0f, 0.060f, 0.50f, 5.0f}
+    /* LOW: damp POW motion so a near-180-degree start cannot ring. */
+    {0.012f, 0.018f, 0.0f, 4.0f, 0.060f, 0.08f, 0.35f},
+    /* MID: retain useful capture speed with half the previous loop gain. */
+    {0.006f, 0.006f, 12.0f, 70.0f, 0.060f, 0.30f, 2.5f},
+    /* HIGH: use the same damped acquisition before fixed-FTW hold. */
+    {0.006f, 0.006f, 12.0f, 70.0f, 0.060f, 0.30f, 2.5f}
 };
 
 static float LockController_Wrap(float radians)

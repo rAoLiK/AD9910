@@ -157,6 +157,19 @@ def main():
     side = namespace["DDS_FEATURE_SIDE"]
     tracker_type = namespace["FoldedPhaseSpeedTracker"]
 
+    assert math.isclose(
+        base_type._visual_phase_proxy(0, 0.5, 0.5, 0.5, 0.0),
+        math.acos(0.5),
+    )
+    generalized_positive = base_type._visual_phase_proxy(
+        2, 0.0, 0.5, 0.5, -0.125
+    )
+    generalized_negative = base_type._visual_phase_proxy(
+        2, 0.9, 0.5, 0.5, 0.125
+    )
+    assert math.isclose(generalized_positive, math.radians(120.0))
+    assert math.isclose(generalized_negative, math.radians(60.0))
+
     class VisualController:
         state = namespace["STATE_VISUAL_LOCK"]
         visual_phase_mdeg = 123400
@@ -169,6 +182,21 @@ def main():
     assert visual_frame.drawn_strings[1] == "VISUAL 1X LINE  STREAMING"
     assert "P:123.4" in visual_frame.drawn_strings[2]
     assert "D:0.57Hz" in visual_frame.drawn_strings[2]
+
+    class HoldController:
+        state = namespace["STATE_LOCK_HOLD"]
+        lock_input_frequency_hz = 5200
+        lock_output_frequency_hz = 10400
+        visual_speed_millihz = 25
+        last_rect = None
+
+    hold_frame = FakeFrame(320, 240)
+    namespace["annotate"](hold_frame, HoldController(), 24.5)
+    assert "LOCK HOLD" in hold_frame.drawn_strings[0]
+    assert hold_frame.drawn_strings[1] == (
+        "VISUAL HOLD  +/-5Hz  MANUAL EXIT"
+    )
+    assert "OUT: 10400" in hold_frame.drawn_strings[2]
 
     tracker = tracker_type()
     speeds = [

@@ -57,9 +57,6 @@ typedef struct {
   bool (*set_dds_tone)(void *context,
                        uint32_t frequency_millihz,
                        int32_t phase_offset_mdeg);
-  bool (*start_phase_lock)(void *context,
-                           task5_lock_mode_t mode,
-                           uint32_t seed_frequency_millihz);
   void (*safe_outputs)(void *context);
   bool (*send_frame)(void *context,
                      uint8_t type,
@@ -78,6 +75,7 @@ typedef struct {
   uint16_t test_id;
   uint32_t saw_frequency_hz;
   uint32_t estimated_input_frequency_hz;
+  uint32_t absolute_frequency_hz;
   uint32_t dds_frequency_hz;
   uint32_t visual_frequency_millihz;
   int32_t visual_phase_offset_mdeg;
@@ -103,6 +101,8 @@ typedef struct {
   uint32_t stale_result_count;
   uint32_t invalid_frame_count;
   uint32_t tx_queue_error_count;
+  bool absolute_frequency_locked;
+  bool lock_hold_acknowledged;
   uint32_t revision;
 } task5_status_t;
 

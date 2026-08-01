@@ -51,6 +51,7 @@ typedef struct {
   float output_scale;
   bool initialized;
   bool running;
+  bool external_frequency_seeded;
   bool dds_output_enabled;
   bool have_ftw;
   bool frequency_change_pending_seen;
@@ -458,10 +459,14 @@ static void PLL_Demo_ProcessAcquireWatchdog(void)
    * ACQUIRE until the old one-second watchdog expires.  A full estimator reset
    * at that point is the large periodic jerk seen on the board.  If frequency
    * and phase are both valid and the filtered error is already near lock, keep
-   * the PI state and extend only this watchdog window.  Source-change timeout
-   * remains authoritative.
+   * the PI state and extend only this watchdog window. Task5 supplies an
+   * independently confirmed absolute-frequency seed, so its acquisition must
+   * also preserve the controller state instead of periodically restarting.
+   * Source-change timeout remains authoritative.
    */
-  if (acquire_timed_out && high_frequency_near_lock) {
+  if (acquire_timed_out &&
+      (high_frequency_near_lock ||
+       s_context.external_frequency_seeded)) {
     s_context.acquire_start_tick = now;
     s_status.acquire_restart_suppressed_count++;
     acquire_timed_out = false;
@@ -643,6 +648,7 @@ HAL_StatusTypeDef PLL_Demo_SeedFrequency(float frequency_hz)
     PLL_Demo_UpdateStatus();
     return HAL_ERROR;
   }
+  s_context.external_frequency_seeded = true;
   PLL_Demo_UpdateStatus();
   return HAL_OK;
 }
@@ -695,6 +701,7 @@ HAL_StatusTypeDef PLL_Demo_Stop(void)
   result = DualADC_Stop();
   PLL_Demo_ClearPendingDMA();
   s_context.running = false;
+  s_context.external_frequency_seeded = false;
   s_context.actual_sample_rate_hz = 0U;
   s_context.active_half_pair_count = 0U;
   s_context.frequency_change_pending_seen = false;

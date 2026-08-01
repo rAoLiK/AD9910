@@ -48,7 +48,7 @@ app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
 | `TASK14` + `LOCK_*` | DDS | 搜索/捕获/锁定 | 禁用 |
 | `TASK5` 等待选择/粗识别 | 直通安全位 | PA4 DAC 输出锯齿波 | 启用 |
 | `TASK5` DDS 搜索 | DDS | 相机判频，ADC 停止 | 启用 |
-| `TASK5` 相位锁定 | DDS | ADC/PLL 运行 | 启用 |
+| `TASK5` 视觉锁定 | DDS | OpenMV 视觉反馈，ADC/PLL 停止 | 启用 |
 | `TASK5` + `ERROR` | DAC | 保持所选满码域锯齿波，显示错误原因 | 启用 |
 | `ERROR_SAFE` | 直通安全位 | DDS 零幅度、ADC 停止 | 禁用 |
 
@@ -146,7 +146,7 @@ ADC2 在放大器前，因此它只用于频率/相位反馈，不能验证放�
 |---|---|
 | PE5 | 继电器；默认高电平直通 |
 | PE6 | Task5 总输出选择；高电平选择 DDS/Task1–4 支路，低电平选择 PA4 DAC 锯齿波 |
-| PA0 | Task5 对角线，按下接 3.3 V，内部下拉，EXTI 上升沿 |
+| PA0 | Task5 对角线（左下到右上的正斜率），按下接 3.3 V，内部下拉，EXTI 上升沿 |
 | PB9 | Task5 圆，按下接地，内部上拉，EXTI 下降沿 |
 | PB8 | Task5 ∞，按下接地，内部上拉，EXTI 下降沿 |
 | USART6 PC6/PC7 | TJC，115200 8N1，逐字节 RX/TX 中断 |
@@ -166,9 +166,16 @@ PE5 继电器极性由 `APP_RELAY_DIRECT_ACTIVE_HIGH` 控制。PE6 极性固定�
 短按、长按、等待判定状态或任何 DAC 锯齿波频率；判定完成后直接进入
 相应模式。Task5 已经通信、
 搜索、锁相、锁定或进入错误态后仍可再次选择：STM32 依次排队发送旧
-Session 的 `STOP_TASK(reason=0x04)` 和新 Session 的 `START_TASK`，然后
+Session 的 `EXIT_TASK(reason=0x04)` 和新 Session 的 `START_TASK`，然后
 进入新模式。Task5 待选择页面固定分三行显示
 `PA0: diagonal`、`PB9: circle`、`PB8: infinity`。
+
+Task5 的 DDS_TEST 始终先用单倍频率确定绝对输入频率。确认后立即响铃并发送
+协议 v2 的 `LOCK_HOLD`，不再先锁一倍频对角线。STM32 直接设置题目图像并
+停止本地 PLL；OpenMV 随后持续发送图像运动样本，STM32 只在目标输出频率
+`±5 Hz` 内微调 DDS。锁定后视觉反馈仍持续，图像或通信暂时中断只保持最后
+DDS 命令，不会自动退出。实体模式键重选、串口屏返回/切换和显式 `exit`
+仍是允许的人工退出路径，并发送非零原因的 `EXIT_TASK`。
 
 ## 8. TJC 非阻塞规则
 
@@ -254,9 +261,11 @@ RAM:   27,168 bytes
    Task1–4 页面按键无作用。
 8. 断开 UART5 或让 OpenMV 不应答，确认仍停留在 Task5 页面，屏幕显示
    具体错误以及 `RX/CRC/U` 计数，PE6 为低且所选满码域 DAC 锯齿波持续。
-9. 用户退出 Task5 后回到直通安全态，DAC、DDS 和 ADC 停止。
-10. 检查 PLL 的 `OVR/ADCERR/DDSERR` 以及 TJC 的 RX/TX/队列诊断计数
-   不增长。
+9. 绝对频率确认后检查 DDS 直接呈现所选图像，所有视觉纠偏均在目标输出
+   `±5 Hz` 内；锁定后让源频率小幅漂移，确认能原地重捕获且不退出。
+10. 暂时断开 OpenMV TX，确认 DDS 保持；恢复通信后确认视觉闭环恢复。
+11. 用户退出 Task5 后回到直通安全态，DAC、DDS 和 ADC 停止。
+12. 检查 TJC 与 OpenMV 的 RX/TX/CRC/队列诊断计数不异常增长。
 
 Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
 去重、粗识别、DDS 测试搜索以及命中后向本地相位锁定的交接。OpenMV

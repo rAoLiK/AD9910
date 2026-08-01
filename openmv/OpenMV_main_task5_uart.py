@@ -3942,12 +3942,17 @@ class LissajousStabilityDetector:
         self.locator_source = 0
         self.last_phase_rad = 0.0
         self.last_phase_valid = False
+        self.visual_lock_mode = 0
         self.visual_speed_tracker = FoldedPhaseSpeedTracker()
         self.reset_test(0)
 
     def reset_visual_tracking(self):
         self.last_phase_valid = False
         self.visual_speed_tracker.reset()
+
+    def set_visual_lock_mode(self, lock_mode):
+        self.visual_lock_mode = lock_mode
+        self.reset_visual_tracking()
 
     def set_trace_seed(self, trace_rect):
         if (
@@ -4356,6 +4361,28 @@ class LissajousStabilityDetector:
             )
         )
 
+    @staticmethod
+    def _visual_phase_proxy(
+        lock_mode,
+        correlation,
+        variance_x,
+        variance_y,
+        moment_xxy,
+    ):
+        if lock_mode != 2:
+            return math.acos(correlation)
+        generalized_sine = _clamp(
+            -1.41421356237
+            * moment_xxy
+            / max(
+                0.0001,
+                variance_x * max(0.0001, variance_y) ** 0.5,
+            ),
+            -1.0,
+            1.0,
+        )
+        return math.asin(generalized_sine) + 0.5 * math.pi
+
     def _analyze_trace_mask(self, mask):
         """Return fixed-cost line/ellipse features for one binary mask."""
 
@@ -4423,7 +4450,25 @@ class LissajousStabilityDetector:
             -1.0,
             1.0,
         )
-        self.last_phase_rad = math.acos(correlation)
+        moment_xxy = 0.0
+        if self.visual_lock_mode == 2:
+            # For x=sin(t), y=sin(2t+phi), ordinary XY correlation is zero
+            # for every phi and therefore cannot drive a 2:1 visual lock.
+            # The normalized E[x^2*y] moment is proportional to -sin(phi).
+            # Mapping it through asin yields a folded generalized-phase proxy
+            # in [0, pi], which is exactly what the unsigned speed tracker
+            # needs. Image feedback can now stabilize the required figure-8.
+            xxy_grid = dy.reshape(
+                (DDS_FEATURE_SIDE, 1)
+            ) * dx_squared
+            moment_xxy = float(np.sum(mask * xxy_grid)) / pixels
+        self.last_phase_rad = self._visual_phase_proxy(
+            self.visual_lock_mode,
+            correlation,
+            variance_x,
+            variance_y,
+            moment_xxy,
+        )
         self.last_phase_valid = True
 
         trace = variance_x + variance_y
@@ -4531,7 +4576,21 @@ class LissajousStabilityDetector:
             0,
             180000,
         )
-        quality = clamp_int(int(frame_score / 10.0 + 0.5), 0, 100)
+        if self.visual_lock_mode == 2:
+            # The DDS-search classifier intentionally recognizes the 1:1
+            # line/ellipse family, so a correct 2:1 figure is not a "family"
+            # member. During permanent visual hold, a valid green trace and
+            # its generalized moment are sufficient quality evidence.
+            density = _pixels / float(
+                DDS_FEATURE_SIDE * DDS_FEATURE_SIDE
+            )
+            current_family = (
+                density >= DDS_MIN_TRACE_DENSITY
+                and density <= DDS_MAX_TRACE_DENSITY
+            )
+            quality = 70 if current_family else 0
+        else:
+            quality = clamp_int(int(frame_score / 10.0 + 0.5), 0, 100)
         flags = 0x01
         if current_family:
             flags |= 0x02
@@ -4705,7 +4764,7 @@ class LissajousStabilityDetector:
 
 # ========================= UART PROTOCOL ==========================
 
-PROTOCOL_VERSION = 0x01
+PROTOCOL_VERSION = 0x02
 FRAME_HEAD_0 = 0xAA
 FRAME_HEAD_1 = 0x55
 MAX_PAYLOAD = 64
@@ -4717,9 +4776,10 @@ TYPE_START_TASK = 0x10
 TYPE_COARSE_RESULT = 0x11
 TYPE_DDS_TEST = 0x20
 TYPE_DDS_TEST_RESULT = 0x21
-TYPE_STOP_TASK = 0x22
+TYPE_EXIT_TASK = 0x22
 TYPE_VISUAL_LOCK_START = 0x30
 TYPE_VISUAL_LOCK_SAMPLE = 0x31
+TYPE_LOCK_HOLD = 0x32
 TYPE_OPENMV_ERROR = 0x7F
 
 ACK_ACCEPTED = 0x00
@@ -4736,6 +4796,7 @@ ERR_SESSION = 0x07
 ERR_RANGE = 0x08
 ERR_CAMERA = 0x09
 ERR_INTERNAL = 0x0A
+ERR_LOCK_HELD = 0x0B
 
 
 def crc16_modbus(data):
@@ -5349,6 +5410,7 @@ STATE_COARSE = 1
 STATE_WAIT_DDS = 2
 STATE_DDS_RECOGNIZING = 3
 STATE_VISUAL_LOCK = 4
+STATE_LOCK_HOLD = 5
 
 
 def ticks_ms():
@@ -5453,7 +5515,14 @@ def consensus(history, minimum_samples, cluster_radius):
 
 
 def annotate(frame, controller, fps):
-    state_names = ("IDLE", "COARSE", "WAIT DDS", "DDS", "VISUAL")
+    state_names = (
+        "IDLE",
+        "COARSE",
+        "WAIT DDS",
+        "DDS",
+        "VISUAL",
+        "LOCK HOLD",
+    )
     state_name = (
         state_names[controller.state]
         if 0 <= controller.state < len(state_names)
@@ -5470,7 +5539,9 @@ def annotate(frame, controller, fps):
         color=(80, 255, 80),
         scale=1,
     )
-    if controller.state == STATE_VISUAL_LOCK:
+    if controller.state == STATE_LOCK_HOLD:
+        information_line = "VISUAL HOLD  +/-5Hz  MANUAL EXIT"
+    elif controller.state == STATE_VISUAL_LOCK:
         information_line = "VISUAL 1X LINE  STREAMING"
     elif controller.state == STATE_DDS_RECOGNIZING:
         detector = controller.stability_detector
@@ -5498,7 +5569,13 @@ def annotate(frame, controller, fps):
         color=(255, 255, 255),
         scale=1,
     )
-    if controller.state == STATE_VISUAL_LOCK:
+    if controller.state == STATE_LOCK_HOLD:
+        status_line = "OUT:%6d D:%4.2fHz FPS:%3.1f" % (
+            controller.lock_output_frequency_hz,
+            controller.visual_speed_millihz / 1000.0,
+            fps,
+        )
+    elif controller.state == STATE_VISUAL_LOCK:
         status_line = "P:%5.1f D:%4.2fHz FPS:%3.1f" % (
             controller.visual_phase_mdeg / 1000.0,
             controller.visual_speed_millihz / 1000.0,
@@ -5588,7 +5665,10 @@ class Task5Controller:
         self.visual_sample_id = 0
         self.visual_phase_mdeg = 0
         self.visual_speed_millihz = 0
-        self.last_stop_key = None
+        self.lock_hold_command_key = None
+        self.lock_input_frequency_hz = 0
+        self.lock_output_frequency_hz = 0
+        self.last_exit_key = None
 
     def _cache_and_send_result(self, message_type, payload):
         frame, sequence = self.link.send_new(message_type, payload)
@@ -5640,6 +5720,9 @@ class Task5Controller:
         self.visual_sample_id = 0
         self.visual_phase_mdeg = 0
         self.visual_speed_millihz = 0
+        self.lock_hold_command_key = None
+        self.lock_input_frequency_hz = 0
+        self.lock_output_frequency_hz = 0
         self.stability_detector.reset_session()
         self._clear_result_cache()
         gc.collect()
@@ -5689,6 +5772,20 @@ class Task5Controller:
                 ERR_SAW_FREQUENCY,
             )
             return
+
+        # A new START while LOCK_HOLD is itself an explicit mode-button
+        # intervention. Accept it as an atomic manual re-selection so a lost
+        # EXIT frame cannot strand OpenMV in the previous held session.
+        if (
+            self.state == STATE_LOCK_HOLD
+            and session_id != self.session_id
+        ):
+            previous_session = self.session_id
+            print(
+                "【人工切换】任务%d -> 任务%d"
+                % (previous_session, session_id)
+            )
+            self._reset_to_idle(completed_session=previous_session)
 
         if self.state != STATE_IDLE:
             if command_key == self.start_command_key:
@@ -5795,6 +5892,9 @@ class Task5Controller:
                 ACK_DUPLICATE,
             )
             self._send_cached_result(TYPE_DDS_TEST_RESULT)
+            return
+        if self.state == STATE_LOCK_HOLD:
+            self.link.send_nack(TYPE_DDS_TEST, sequence, ERR_LOCK_HELD)
             return
         if self.state == STATE_DDS_RECOGNIZING:
             self.link.send_nack(TYPE_DDS_TEST, sequence, ERR_BUSY)
@@ -5908,40 +6008,115 @@ class Task5Controller:
             % (seed_millihz / 1000.0)
         )
 
-    def _handle_stop(self, sequence, payload, command_key):
+    def _handle_lock_hold(self, sequence, payload, command_key):
+        if len(payload) != 11:
+            self.link.send_nack(TYPE_LOCK_HOLD, sequence, ERR_LENGTH)
+            return
+        (
+            session_id,
+            lock_mode,
+            input_frequency_hz,
+            output_frequency_hz,
+        ) = struct.unpack("<HBII", payload)
+
+        if session_id != self.session_id or not session_id:
+            self.link.send_nack(TYPE_LOCK_HOLD, sequence, ERR_SESSION)
+            return
+        expected_output_hz = (
+            input_frequency_hz * 2
+            if lock_mode == 2
+            else input_frequency_hz
+        )
+        if lock_mode != self.lock_mode or lock_mode > 2:
+            self.link.send_nack(TYPE_LOCK_HOLD, sequence, ERR_LOCK_MODE)
+            return
+        if (
+            input_frequency_hz < 100
+            or input_frequency_hz > 100000
+            or output_frequency_hz != expected_output_hz
+            or output_frequency_hz > 200000
+        ):
+            self.link.send_nack(TYPE_LOCK_HOLD, sequence, ERR_RANGE)
+            return
+        if command_key == self.lock_hold_command_key:
+            self.link.send_ack(
+                TYPE_LOCK_HOLD,
+                sequence,
+                ACK_DUPLICATE,
+            )
+            return
+        if self.state == STATE_LOCK_HOLD:
+            self.link.send_nack(TYPE_LOCK_HOLD, sequence, ERR_LOCK_HELD)
+            return
+        if self.state != STATE_WAIT_DDS:
+            self.link.send_nack(TYPE_LOCK_HOLD, sequence, ERR_STATE)
+            return
+
+        self.link.send_ack(TYPE_LOCK_HOLD, sequence, ACK_ACCEPTED)
+        self.state = STATE_LOCK_HOLD
+        self.lock_hold_command_key = command_key
+        self.lock_input_frequency_hz = input_frequency_hz
+        self.lock_output_frequency_hz = output_frequency_hz
+        self.visual_seed_millihz = output_frequency_hz * 1000
+        self.visual_sample_id = 0
+        self.visual_phase_mdeg = 0
+        self.visual_speed_millihz = 0
+        self.classifier = None
+        self.pending_model_spec = None
+        self._clear_result_cache()
+        # Preserve the fixed screen ROI acquired during the 1x frequency
+        # search. From this point onward OpenMV continuously measures image
+        # motion for the requested line/circle/figure-8 profile.
+        self.stability_detector.set_visual_lock_mode(lock_mode)
+        gc.collect()
+        print(
+            "【视觉锁相保持】任务%d，模式%d，输入%d Hz，输出%d Hz；持续反馈，人工退出"
+            % (
+                session_id,
+                lock_mode,
+                input_frequency_hz,
+                output_frequency_hz,
+            )
+        )
+
+    def _handle_exit(self, sequence, payload, command_key):
         if len(payload) != 3:
-            self.link.send_nack(TYPE_STOP_TASK, sequence, ERR_LENGTH)
+            self.link.send_nack(TYPE_EXIT_TASK, sequence, ERR_LENGTH)
             return
         session_id, reason = struct.unpack("<HB", payload)
 
-        if reason > 5:
-            self.link.send_nack(TYPE_STOP_TASK, sequence, ERR_RANGE)
+        # Reason zero was the v1 automatic-success STOP. Protocol v2 rejects
+        # it so a completed lock can never silently fall back to IDLE.
+        if reason < 1 or reason > 5:
+            self.link.send_nack(TYPE_EXIT_TASK, sequence, ERR_RANGE)
             return
 
         if self.state == STATE_IDLE:
-            if command_key == self.last_stop_key:
+            if command_key == self.last_exit_key:
                 self.link.send_ack(
-                    TYPE_STOP_TASK,
+                    TYPE_EXIT_TASK,
                     sequence,
                     ACK_DUPLICATE,
                 )
             else:
                 self.link.send_nack(
-                    TYPE_STOP_TASK,
+                    TYPE_EXIT_TASK,
                     sequence,
                     ERR_SESSION,
                 )
             return
         if session_id != self.session_id:
-            self.link.send_nack(TYPE_STOP_TASK, sequence, ERR_SESSION)
+            self.link.send_nack(TYPE_EXIT_TASK, sequence, ERR_SESSION)
             return
 
-        self.link.send_ack(TYPE_STOP_TASK, sequence, ACK_ACCEPTED)
-        self.last_stop_key = command_key
-        print(
-            "【任务结束】任务%d，原因%d，已回到空闲"
-            % (session_id, reason)
-        )
+        self.link.send_ack(TYPE_EXIT_TASK, sequence, ACK_ACCEPTED)
+        self.last_exit_key = command_key
+        if reason == 1:
+            print("【人工退出】任务%d，已回到空闲" % session_id)
+        elif reason == 4:
+            print("【会话切换】任务%d，准备接受新选择" % session_id)
+        else:
+            print("【显式退出】任务%d，原因%d" % (session_id, reason))
         self._reset_to_idle(completed_session=session_id)
 
     def handle_received(self, received):
@@ -5983,8 +6158,10 @@ class Task5Controller:
                 payload,
                 command_key,
             )
-        elif message_type == TYPE_STOP_TASK:
-            self._handle_stop(sequence, payload, command_key)
+        elif message_type == TYPE_LOCK_HOLD:
+            self._handle_lock_hold(sequence, payload, command_key)
+        elif message_type == TYPE_EXIT_TASK:
+            self._handle_exit(sequence, payload, command_key)
         else:
             self.link.send_nack(message_type, sequence, ERR_STATE)
 
@@ -6172,7 +6349,7 @@ class Task5Controller:
         )
 
     def process_visual_lock_frame(self, frame):
-        if self.state != STATE_VISUAL_LOCK:
+        if self.state not in (STATE_VISUAL_LOCK, STATE_LOCK_HOLD):
             return
         now_ms = ticks_ms()
         sample = self.stability_detector.update_visual(frame, now_ms)
@@ -6206,7 +6383,7 @@ except NameError:
     boot_started = ticks_ms()
 
 print("")
-print("【启动】Task5 双档识别 + UART7")
+print("【启动】Task5 双档识别 + UART7，协议v2锁相保持")
 camera = setup_camera()
 display = setup_display()
 uart = setup_uart()
@@ -6248,7 +6425,10 @@ while True:
 
     # OLED conversion/I2C is intentionally suspended during fine lock. The
     # camera and telemetry loop then run at the maximum available frame rate.
-    if display is not None and controller.state != STATE_VISUAL_LOCK:
+    if (
+        display is not None
+        and controller.state not in (STATE_VISUAL_LOCK, STATE_LOCK_HOLD)
+    ):
         try:
             display.update_if_due(frame, now_ms=ticks_ms())
         except Exception as error:

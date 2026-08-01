@@ -66,14 +66,14 @@ self.buffer = self.buffer[consumed:]
 
 - 固定帧头、LEN、CRC16/MODBUS；
 - UART 粘包、拆包、前导噪声和 CRC 错帧恢复；
+- 协议版本固定为 v2（`VER=0x02`）；
 - `START_TASK`、`COARSE_RESULT`、`DDS_TEST`、
-  `DDS_TEST_RESULT`、`VISUAL_LOCK_START`、`VISUAL_LOCK_SAMPLE`、
-  `STOP_TASK`、`HEARTBEAT`；
+  `DDS_TEST_RESULT`、`LOCK_HOLD`、`EXIT_TASK`、`HEARTBEAT`；
 - 耗时处理前立即 ACK；
 - 重复命令不重复执行，结果帧按原 SEQ 原字节重发；
 - Session、状态、范围、忙状态及长度检查；
-- 串口信息采用简短中文提示，IDE 图像保留瞄准框；视觉锁定期间暂停 OLED
-  刷新，把处理时间留给取图和控制，其余阶段 OLED 仍只作瞄准预览。
+- 串口信息采用简短中文提示，IDE 图像保留瞄准框；`0x30` 只保留旧实验兼容，
+  `0x31 VISUAL_LOCK_SAMPLE` 是 v2 永久视觉保持的反馈消息。
 
 ## 第二阶段 DDS_TEST 视觉判定
 
@@ -102,24 +102,23 @@ OpenMV 不在第二阶段发送 `DDS_TOO_LOW`、`DDS_TOO_HIGH`、`UNSTABLE`、
 同一频率重试，而不是把相机故障误当成频率不匹配。重复的同一 `DDS_TEST`
 仍按协议重发缓存结果，不创建一次新的判定。
 
-收到 `TARGET_REACHED` 后，F407 ACK 结果并发送 `VISUAL_LOCK_START(0x30)`，
-而不是立即停止相机。无论最终要求是直线、圆还是二倍频“∞”，这一阶段都先
-锁定输入频率的一倍正斜率直线，以获得最明确的相位运动方向。
+收到 `TARGET_REACHED` 后，F407 将当前单倍频候选记为绝对输入频率并立即响铃，
+随后可靠发送 `LOCK_HOLD(0x32)`，载荷同时声明单倍输入频率和最终 DDS 输出频率。
+OpenMV ACK 后进入 `LOCK_HOLD`，保留当前 Session，画面显示
+`VISUAL HOLD / +/-5Hz / MANUAL EXIT`，并持续从同一固定 ROI 测量李萨如图像
+运动、发送 `VISUAL_LOCK_SAMPLE(0x31)`。STM32 不启动本地 ADC PLL，而是直接
+设置题目图像并仅在输出种子 `±5 Hz` 内根据视觉样本微调 DDS。直线和圆使用
+单倍频，“∞”在此处才乘二一次；直线目标是左下到右上的正斜率对角线。
+进入稳定状态后仍持续反馈；短时无图像时保持最后 DDS 命令，不自动回 IDLE。
 
-OpenMV 随后逐帧估计相关相位，并把折叠相位、相位变化速度、质量和图形有效
-标志打包为 `VISUAL_LOCK_SAMPLE(0x31)`。该消息是高速遥测，不缓存、不重发、
-不等待 ACK；丢失一帧不会阻塞下一帧。F407 用这些数据执行 0.1 Hz PI 调节、
-方向试探/反向和 ±5 Hz 保护，并在频率稳定后调整 DDS 相位字到正斜率直线。
+退出使用 `EXIT_TASK(0x22)`，原因必须为 `1..5`。`reason=0` 是已废止的 v1
+自动成功退出语义，OpenMV v2 会 NACK 且继续保持锁相。实体模式键重选会先退出
+旧 Session 再启动新 Session；即使旧 EXIT 丢失，保持态收到不同 Session 的新
+`START_TASK` 也把它视为明确的人工重选并原子切换。人工退出时控制台打印
+`【人工退出】`，正常锁定过程不会再出现“任务结束、原因0、已回到空闲”。
 
-视觉直线连续稳定后 F407 才发送正常 `STOP_TASK`，随后按按键要求立即切换
-DDS 频率/相位目标并启动本地 ADC+AD9910 闭环。二倍频仅在这里乘二；只有
-本地 PLL 最终报告锁定后才响铃，前面的粗命中和视觉锁定都不响铃。
-
-`VISUAL_LOCK_START` 的 payload 为小端序 `<HIB>`：`session_id`、一倍频种子
-`seed_frequency_millihz`、`target_profile=0`。`VISUAL_LOCK_SAMPLE` 的 payload
-为 `<HHIIHBB>`：`session_id`、`sample_id`、OpenMV `timestamp_ms`、
-`phase_mdeg`、`speed_millihz`、`quality`、`flags`；`flags.bit0` 表示相位有效，
-`flags.bit1` 表示当前轨迹属于目标图形族。
+`VISUAL_LOCK_START(0x30)` 仅为旧 F407 固件兼容保留；新流程由
+`LOCK_HOLD(0x32)` 启动视觉流，并依赖 `VISUAL_LOCK_SAMPLE(0x31)` 闭环。
 
 ### 视觉阈值标定
 

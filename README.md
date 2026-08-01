@@ -173,9 +173,9 @@ coarse_step_hz
 
 | 频段 | 进入/退出规则 | 相位滤波 τ | 判频跟踪 τ | Kp | Ki | 变频稳定时间 | 中/粗步进 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| LOW | 初始 <40 kHz；≤35 kHz 进入，≥45 kHz 退出 | 10 ms | 15 ms | 0 | 5 | 60 ms | 0.10 / 0.50 Hz |
-| MID | LOW/HIGH 之间 | 4 ms | 4 ms | 20 | 120 | 60 ms | 0.50 / 5 Hz |
-| HIGH | 初始 ≥80 kHz；≥90 kHz 进入，≤75 kHz 退出 | 4 ms | 4 ms | 20 | 120 | 60 ms | 0.50 / 5 Hz |
+| LOW | 初始 <40 kHz；≤35 kHz 进入，≥45 kHz 退出 | 12 ms | 18 ms | 0 | 4 | 60 ms | 0.08 / 0.35 Hz |
+| MID | LOW/HIGH 之间 | 6 ms | 6 ms | 12 | 70 | 60 ms | 0.30 / 2.5 Hz |
+| HIGH | 初始 ≥80 kHz；≥90 kHz 进入，≤75 kHz 退出 | 6 ms | 6 ms | 12 | 70 | 60 ms | 0.30 / 2.5 Hz |
 
 MID 和 HIGH 当前 PI 数值相同，分频段仍保留，便于后续独立标定。59 kHz
 固定 FTW 保持阈值独立于上述控制频段，因此 60 kHz 捕获时仍使用 MID PI，
@@ -191,8 +191,8 @@ MID 和 HIGH 当前 PI 数值相同，分频段仍保留，便于后续独立标
 | `LOCK_ACQUIRE_TIME_S` | 50 ms | 必须连续满足锁定条件的时间 |
 | `LOCK_RELEASE_THRESHOLD_RAD` | 12° | 掉锁相位误差门限 |
 | `LOCK_RELEASE_TIME_S` | 30 ms | 必须连续越界才释放锁定 |
-| `LOCK_PHASE_RATE_FILTER_TAU_S` | 6 ms | 相位变化率低通；增大更稳但频差响应更慢 |
-| `LOCK_PHASE_RATE_GAIN` | 0.50 | 相位变化率到频率校正的阻尼增益 |
+| `LOCK_PHASE_RATE_FILTER_TAU_S` | 10 ms | 相位变化率低通；增大更稳但频差响应更慢 |
+| `LOCK_PHASE_RATE_GAIN` | 0.30 | 相位变化率到频率校正的阻尼增益 |
 | `LOCK_PHASE_RATE_LIMIT_HZ` | 500 Hz | 相位变化率估计限幅，防止相位跳变变成大频率指令 |
 | `LOCK_MAX_DDS_FREQUENCY_HZ` | 400 MHz | 控制器安全频率上限，不是建议工作上限 |
 | `LOCK_FREQUENCY_MISSING_RESET_S` | 100 ms | 判频连续丢失多久后清空环路 |
@@ -201,13 +201,13 @@ MID 和 HIGH 当前 PI 数值相同，分频段仍保留，便于后续独立标
 
 | 参数 | 当前值 | 含义和调节方向 |
 |---|---:|---|
-| `LOCK_DIRECT_PHASE_GAIN` | 0.65 | 低频相位误差到 POW 的比例；大则快，也更易过冲 |
-| `LOCK_DIRECT_FINE_STEP_RAD` | 0.15°/次 | 低频细调 POW 限幅 |
-| `LOCK_DIRECT_MID_STEP_RAD` | 1°/次 | 低频中调 POW 限幅 |
-| `LOCK_DIRECT_COARSE_STEP_RAD` | 10°/次 | 低频粗调 POW 限幅 |
-| `LOCK_DIRECT_LOCK_STEP_RAD` | 0.10°/次 | 宣告锁定时允许的最大 POW 动作 |
-| `LOCK_LOW_RATE_FILTER_TAU_S` | 20 ms | 低频相位变化率滤波 |
-| `LOCK_LOW_RATE_LEARN_TAU_S` | 20 ms | 低频由 POW 漂移学习 FTW 偏差的时间常数 |
+| `LOCK_DIRECT_PHASE_GAIN` | 0.50 | 低频相位误差到 POW 的比例；大则快，也更易过冲 |
+| `LOCK_DIRECT_FINE_STEP_RAD` | 0.10°/次 | 低频细调 POW 限幅 |
+| `LOCK_DIRECT_MID_STEP_RAD` | 0.70°/次 | 低频中调 POW 限幅 |
+| `LOCK_DIRECT_COARSE_STEP_RAD` | 7°/次 | 低频粗调 POW 限幅 |
+| `LOCK_DIRECT_LOCK_STEP_RAD` | 0.08°/次 | 宣告锁定时允许的最大 POW 动作 |
+| `LOCK_LOW_RATE_FILTER_TAU_S` | 25 ms | 低频相位变化率滤波 |
+| `LOCK_LOW_RATE_LEARN_TAU_S` | 30 ms | 低频由 POW 漂移学习 FTW 偏差的时间常数 |
 
 高频固定 FTW 保持参数：
 

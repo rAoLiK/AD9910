@@ -22,7 +22,7 @@
 #define APP_DDS_FULL_SCALE_VPP_AFTER_GAIN      (4.432f)
 #define APP_TASK5_OUTPUT_DIVS                  (8U)
 #define APP_FEEDBACK_INVERSION_DEG             (180.0f)
-#define APP_TASK1_OUTPUT_PHASE_DEG             (0.0f)
+#define APP_TASK1_OUTPUT_PHASE_DEG             (0.0f) /* lower-left to upper-right */
 #define APP_TASK2_OUTPUT_PHASE_DEG             (90.0f)
 #define APP_TASK3_GENERALIZED_PHASE_DEG        (0.0f)
 #define APP_TASK5_FOUND_BEEP_MS                 (500U)
@@ -270,7 +270,8 @@ static bool AppIntegration_Task5SetTone(
 
   AppIntegration_StopVisualDither();
   if ((app == NULL) || (app->dds == NULL) ||
-      (frequency_millihz == 0UL)) {
+      (frequency_millihz == 0UL) ||
+      (PLL_Demo_Stop() != HAL_OK)) {
     return false;
   }
   exact_ftw =
@@ -303,52 +304,6 @@ static bool AppIntegration_Task5SetTone(
   s_app.task5_visual_dither_active = true;
   AppBoard_SetPath(APP_BOARD_PATH_DDS);
   AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
-  return true;
-}
-
-static bool AppIntegration_Task5StartPhaseLock(
-    void *context,
-    task5_lock_mode_t mode,
-    uint32_t seed_frequency_millihz)
-{
-  app_integration_context_t *app =
-      (app_integration_context_t *)context;
-  app_waveform_t waveform;
-  uint8_t multiplier;
-  float feedback_phase_deg;
-
-  AppIntegration_StopVisualDither();
-  if (app == NULL) {
-    return false;
-  }
-  waveform =
-      (mode == TASK5_MODE_LINE_0_DEG)
-          ? APP_WAVEFORM_TASK1_LINE
-          : (mode == TASK5_MODE_CIRCLE_NEG_90_DEG)
-                ? APP_WAVEFORM_TASK2_CIRCLE
-                : APP_WAVEFORM_TASK3_INFINITY;
-  if (!AppIntegration_LockParameters(
-          waveform, &multiplier, &feedback_phase_deg) ||
-      (PLL_Demo_Stop() != HAL_OK) ||
-      (PLL_Demo_SeedFrequency(
-           (float)seed_frequency_millihz / 1000.0f) != HAL_OK) ||
-      (PLL_Demo_Configure(
-           multiplier, feedback_phase_deg,
-           AppIntegration_AmplitudeScale(
-               APP_TASK5_OUTPUT_DIVS)) != HAL_OK)) {
-    AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
-    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
-    return false;
-  }
-
-  AppBoard_SetPath(APP_BOARD_PATH_DDS);
-  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
-  if (PLL_Demo_Start() != HAL_OK) {
-    AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
-    AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
-    (void)PLL_Demo_Stop();
-    return false;
-  }
   return true;
 }
 
@@ -649,7 +604,9 @@ static void AppIntegration_UpdateLockActivity(void)
       AppCore_SetLockActivity(&s_app.core, APP_ACTIVITY_LOCKED);
       break;
     case PLL_DEMO_ERROR:
-      AppCore_ReportError(&s_app.core, APP_ERROR_LOCK_RUNTIME);
+      if (!task5.absolute_frequency_locked) {
+        AppCore_ReportError(&s_app.core, APP_ERROR_LOCK_RUNTIME);
+      }
       break;
     case PLL_DEMO_STOPPED:
     default:
@@ -663,6 +620,12 @@ static void AppIntegration_UpdateTask5Activity(void)
   app_activity_t activity;
 
   Task5_GetStatus(&s_app.task5, &task5);
+  if (task5.absolute_frequency_locked &&
+      (task5.session_id != 0U) &&
+      (task5.session_id != s_app.task5_beeped_session) &&
+      (TJC_SystemBeep(APP_TASK5_FOUND_BEEP_MS) == HAL_OK)) {
+    s_app.task5_beeped_session = task5.session_id;
+  }
   switch (task5.state) {
     case TASK5_STATE_WAIT_SELECTION:
       activity = APP_ACTIVITY_TASK5_WAIT_SELECTION;
@@ -682,18 +645,13 @@ static void AppIntegration_UpdateTask5Activity(void)
       activity = APP_ACTIVITY_TASK5_LOCKING;
       break;
     case TASK5_STATE_FREQUENCY_HOLD:
-      activity = APP_ACTIVITY_TASK5_LOCKED;
+      activity = APP_ACTIVITY_TASK5_LOCKING;
       break;
     case TASK5_STATE_PHASE_LOCKING:
       activity = APP_ACTIVITY_TASK5_LOCKING;
       break;
     case TASK5_STATE_LOCKED:
       activity = APP_ACTIVITY_TASK5_LOCKED;
-      if ((task5.session_id != 0U) &&
-          (task5.session_id != s_app.task5_beeped_session) &&
-          (TJC_SystemBeep(APP_TASK5_FOUND_BEEP_MS) == HAL_OK)) {
-        s_app.task5_beeped_session = task5.session_id;
-      }
       break;
     case TASK5_STATE_ERROR:
       activity = APP_ACTIVITY_ERROR;
@@ -857,25 +815,28 @@ static void AppIntegration_Task5Text(
       break;
     case TASK5_STATE_WAIT_STOP_ACK:
       (void)snprintf(
-          text, text_size, "visual locked %s\rcamera stop / PLL handoff",
+          text, text_size, "visual lock hold %s\rmanual exit only",
           AppIntegration_Task5ModeText(task5->mode));
       break;
     case TASK5_STATE_FREQUENCY_HOLD:
       (void)snprintf(
-          text, text_size, "FOUND %s %luHz\rDDS HOLD",
+          text, text_size, "FOUND %s %luHz\rVISUAL LOCK +/-5Hz",
           AppIntegration_Task5ModeText(task5->mode),
-          (unsigned long)task5->dds_frequency_hz);
+          (unsigned long)task5->absolute_frequency_hz);
       break;
     case TASK5_STATE_PHASE_LOCKING:
       (void)snprintf(
-          text, text_size, "phase locking at %luHz",
+          text, text_size, "legacy PLL state at %luHz",
           (unsigned long)task5->dds_frequency_hz);
       break;
     case TASK5_STATE_LOCKED:
       (void)snprintf(
-          text, text_size, "LOCKED %s %luHz",
+          text, text_size,
+          "VISUAL LOCKED %s %lu.%01luHz\r+/-5Hz / manual exit only",
           AppIntegration_Task5ModeText(task5->mode),
-          (unsigned long)task5->dds_frequency_hz);
+          (unsigned long)(task5->visual_frequency_millihz / 1000UL),
+          (unsigned long)((task5->visual_frequency_millihz % 1000UL) /
+                          100UL));
       break;
     case TASK5_STATE_ERROR:
       AppSaw_GetStatus(&saw);
@@ -983,7 +944,6 @@ HAL_StatusTypeDef AppIntegration_Init(ad9910_t *dds)
       .stop_saw = AppIntegration_Task5StopSaw,
       .set_dds_frequency = AppIntegration_Task5SetDDS,
       .set_dds_tone = AppIntegration_Task5SetTone,
-      .start_phase_lock = AppIntegration_Task5StartPhaseLock,
       .safe_outputs = AppIntegration_Task5SafeOutputs,
       .send_frame = AppIntegration_Task5SendFrame,
       .context = &s_app,
