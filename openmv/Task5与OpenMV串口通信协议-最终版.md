@@ -168,10 +168,13 @@ NACK error_code = 0x07
 | `0x20` | DDS_TEST | STM32 → OpenMV | 必须 |
 | `0x21` | DDS_TEST_RESULT | OpenMV → STM32 | 必须 |
 | `0x22` | STOP_TASK | STM32 → OpenMV | 必须 |
+| `0x30` | VISUAL_LOCK_START | STM32 → OpenMV | 必须；可靠命令 |
+| `0x31` | VISUAL_LOCK_SAMPLE | OpenMV → STM32 | 必须；实时遥测 |
 | `0x7F` | OPENMV_ERROR | OpenMV → STM32 | 可选 |
 
-`0x30` 之后的相位消息未启用。频率找到后，相位锁定由 STM32 本地
-ADC+AD9910 环路完成，OpenMV 回到空闲态。
+`0x30/0x31` 用于最终本地 PLL 之前的视觉精锁。视觉阶段统一先把一倍频图像
+锁成正斜率直线；随后 OpenMV 回到空闲态，最终模式由 STM32 本地
+ADC+AD9910 环路完成。
 
 ## 6. ACK
 
@@ -304,16 +307,13 @@ STM32 计算：
 estimated_input_hz =
     round(saw_freq_hz * ratio_x1000 / 1000)
 
-mode 0/1:
+mode 0/1/2（视觉搜索阶段）:
     initial_dds_hz = estimated_input_hz
-
-mode 2:
-    initial_dds_hz = 2 * estimated_input_hz
 ```
 
 本工程有效输入频率范围为 1～100 kHz，因此
-`estimated_input_hz > 100000` 会返回 `NACK 0x08`；mode 2 的 DDS
-上限相应为 200 kHz。
+`estimated_input_hz > 100000` 会返回 `NACK 0x08`。mode 2 也先在一倍频完成
+视觉锁定，只在本地 PLL 交接时将 DDS 种子乘二，其最终 DDS 上限为 200 kHz。
 
 收到合法 COARSE_RESULT 后，STM32 立即 ACK、停止 DAC 锯齿波、切换
 继电器到 DDS 路径，并设置第一个 DDS 频率。
@@ -331,7 +331,7 @@ LEN  = 11
 | 2 | uint16 | `test_id` | 当前测试号 |
 | 4 | uint32 | `dds_freq_hz` | STM32 已设置的 DDS 频率 |
 | 8 | uint8 | `search_stage` | 搜索阶段 |
-| 9 | uint16 | `capture_delay_ms` | 当前固定为 200 ms |
+| 9 | uint16 | `capture_delay_ms` | 普通候选 80 ms，最终确认 160 ms |
 
 | search_stage | 含义 |
 |---:|---|
@@ -341,7 +341,7 @@ LEN  = 11
 | `0x03` | 最终确认，当前实现暂不主动发送 |
 | `0x04` | 预留相位阶段 |
 
-STM32 在修改 DDS 后先本地等待 200 ms，再发送 DDS_TEST。OpenMV 收到
+STM32 在修改 DDS 后先本地等待 20 ms，再发送 DDS_TEST。OpenMV 收到
 合法命令后立即 ACK，然后至少再等待 `capture_delay_ms`，再采集和判断。
 
 ## 11. DDS_TEST_RESULT
@@ -361,7 +361,7 @@ LEN  = 8
 
 | result | OpenMV 含义 | STM32 行为 |
 |---:|---|---|
-| `0x00` | TARGET_REACHED | 结束相机搜索，进入本地相位锁定 |
+| `0x00` | TARGET_REACHED | 结束 100 Hz 搜索，进入 0.1 Hz 视觉精锁 |
 | `0x01` | DDS_TOO_LOW | 提高 DDS 频率 |
 | `0x02` | DDS_TOO_HIGH | 降低 DDS 频率 |
 | `0x03` | NOT_MATCHED，方向未知 | 围绕粗估值正负交替扩大搜索 |
@@ -370,18 +370,56 @@ LEN  = 8
 | `0x06` | IMAGE_ERROR | 原频率重新测试，最多额外 2 次 |
 | `0x07` | TIMEOUT | 原频率重新测试，最多额外 2 次 |
 
-`DDS_TOO_LOW/HIGH` 的比较对象是当前模式所要求的目标 DDS 频率：
-
-- mode 0/1 的目标是输入信号的 1 倍；
-- mode 2 的目标是输入信号的 2 倍。
-
-如果 OpenMV 能可靠判断方向，应优先返回 `0x01/0x02`，STM32 会先扩展
-直到找到上下界，再取中点收敛。如果只能判断“相符/不相符”，可以只返回
-`0x00/0x03`，但搜索次数和时间会更长。单个 Session 最多发送 40 个新的
-DDS_TEST；超过即安全终止。
+三种最终模式的 DDS_TEST 阶段都搜索输入信号的一倍频率，以便优先获得最清晰
+的一倍正斜率直线。当前 OpenMV 实现只把 `TARGET_REACHED/NOT_MATCHED` 作为
+正常业务分类；`DDS_TOO_LOW/HIGH` 保留作协议兼容。STM32 围绕粗估值按
+`origin, +100, -100, +200, -200 ... Hz` 搜索，命中后才进入视觉精锁。
 
 STM32 对每个合法 DDS_TEST_RESULT 立即 ACK。OpenMV 在收到这个 ACK
 之前必须保留结果帧，以便超时后原样重发。
+
+### 11.1 VISUAL_LOCK_START
+
+```text
+TYPE = 0x30
+LEN  = 7
+```
+
+| 偏移 | 类型 | 字段 | 说明 |
+|---:|---|---|---|
+| 0 | uint16 | `session_id` | 当前 Session |
+| 2 | uint32 | `seed_frequency_millihz` | 一倍频种子，单位 0.001 Hz |
+| 6 | uint8 | `target_profile` | 当前固定为 0：一倍正斜率直线 |
+
+这是可靠命令。OpenMV 校验 Session、状态、长度和参数后立即 ACK，清空旧的
+相位速度历史并进入视觉遥测状态。重复命令只回 `ACK_DUPLICATE`，不重置已在
+运行的控制过程。
+
+### 11.2 VISUAL_LOCK_SAMPLE
+
+```text
+TYPE = 0x31
+LEN  = 16
+```
+
+| 偏移 | 类型 | 字段 | 说明 |
+|---:|---|---|---|
+| 0 | uint16 | `session_id` | 当前 Session |
+| 2 | uint16 | `sample_id` | 逐帧递增并跳过 0 |
+| 4 | uint32 | `timestamp_ms` | OpenMV 单调时钟，允许回绕 |
+| 8 | uint32 | `phase_mdeg` | 折叠相位 0～180000，单位 0.001° |
+| 12 | uint16 | `speed_millihz` | 相位变化速度等效频差，单位 0.001 Hz |
+| 14 | uint8 | `quality` | 图像质量 0～100 |
+| 15 | uint8 | `flags` | bit0 相位有效；bit1 属于目标图形族 |
+
+该帧是尽力而为的实时遥测，不 ACK、不缓存、不重发；下一帧会替代丢失的旧帧。
+OpenMV 用 5 点滚动中值抑制 0°/180° 折叠处的单帧速度误差，视觉锁定期间暂停
+OLED 刷新。STM32 若连续 1500 ms 没有收到合法样本则进入 Task5 错误态。
+
+STM32 先测量种子频率，再试探 `+0.1 Hz`；若速度未改善则试探 `-0.1 Hz`。
+确定方向后按速度作 0.1 Hz 网格 PI 调节。连续三帧明显变差会恢复到已知最佳点
+并反向；若下一指令将越过种子频率的 `±5 Hz`，立即恢复种子并反向。频率速度
+连续稳定后，控制器再试探和调整 DDS 相位字，直到一倍正斜率直线连续稳定。
 
 ## 12. STOP_TASK
 
@@ -404,9 +442,10 @@ LEN  = 3
 | `0x04` | 重新开始 |
 | `0x05` | STM32 系统或通信错误 |
 
-OpenMV 收到后应停止当前识别、清除本 Session 的运行态、返回 ACK，
-进入 IDLE。正常完成时，STM32 等到 STOP_TASK 的 ACK 后才启动本地相位
-锁定。
+OpenMV 收到后应停止当前识别或视觉遥测、清除本 Session 的运行态、返回 ACK，
+进入 IDLE。正常完成时，STM32 等到 STOP_TASK 的 ACK 后按最终模式更新 DDS
+频率/相位目标并启动本地相位锁定；即使 STOP ACK 重试耗尽也会继续本地锁定，
+不会退回诊断锯齿波。
 
 Task5 运行中重新选择模式时，STM32 会依次发送旧 Session 的
 `STOP_TASK(reason=0x04)` 和新 Session 的 `START_TASK`，但不等待旧
@@ -423,7 +462,7 @@ STM32                                      OpenMV
   |                                          | 粗识别
   |<-- COARSE_RESULT(session,ratio) ---------|
   |---------------- ACK --------------------->|
-  | 停 DAC 锯齿波，设置 DDS，等待 200 ms      |
+  | 停 DAC 锯齿波，设置 DDS，等待 20 ms       |
   |-- DDS_TEST(session,test,freq,delay) ------>|
   |<---------------- ACK ---------------------|
   |                                          | 等待 delay，识别
@@ -434,10 +473,17 @@ STM32                                      OpenMV
   |                                          |
   |<-- DDS_TEST_RESULT(TARGET_REACHED) -------|
   |---------------- ACK --------------------->|
+  |-- VISUAL_LOCK_START(seed, line) ---------->|
+  |<---------------- ACK ---------------------|
+  |<-- VISUAL_LOCK_SAMPLE(phase,speed,...) ----|
+  |  0.1 Hz PI；必要时恢复最佳点并反向          |
+  |<-- VISUAL_LOCK_SAMPLE(phase,speed,...) ----|
+  |  调整相位字，直至一倍正斜率直线稳定          |
   |-- STOP_TASK(reason=normal) -------------->|
   |<---------------- ACK ---------------------|
   |                                          | 回到 IDLE
-  | 启动 STM32 本地 ADC/AD9910 相位锁定         |
+  | 按所选模式更新频率/相位字，启动本地 PLL       |
+  | 本地 PLL 最终 LOCKED 后蜂鸣一次              |
 ```
 
 ## 14. 超时与重发
@@ -447,11 +493,12 @@ STM32                                      OpenMV
 | 命令 ACK 超时 | 100 ms |
 | ACK 最大重发次数 | 3 次；总发送次数最多 4 次 |
 | COARSE_RESULT 等待 | 无失败硬超时；每 5 s 重放同一 START_TASK |
-| DDS_TEST_RESULT 超时 | 2 s |
+| DDS_TEST_RESULT 超时 | 3 s |
 | COARSE_RESULT 等待重放 | 不限次数，用户可按模式键取消/重选 |
 | DDS_TEST_RESULT 等待最大重放次数 | 3 次 |
-| DDS 本地稳定等待 | 200 ms |
-| OpenMV 拍摄延迟字段 | 200 ms |
+| DDS 本地稳定等待 | 20 ms |
+| OpenMV 拍摄延迟字段 | 普通 80 ms；确认 160 ms |
+| VISUAL_LOCK_SAMPLE 超时 | 1500 ms |
 
 等待粗识别结果期间，STM32 每 5 秒重放原 START_TASK 且不设重放上限；
 等待 DDS 结果超时时则按上表的有限次数重放原 DDS_TEST。两者都保持
@@ -606,10 +653,13 @@ CRC = 0x3696
 8. 短按任一模式键得到 1 kHz DAC 锯齿波；长按至少 400 ms 得到
    10 kHz。
 9. 示波器确认 PA4 波形在每周期内单调递增。
-10. TARGET_REACHED 后 OpenMV 收到 STOP_TASK 并回到 IDLE；STM32 随后
-    切入本地相位锁定。
-11. 拔掉 UART 或让 OpenMV 不应答，STM32 在超时后仍停留在 Task5，
+10. TARGET_REACHED 后 OpenMV 收到 VISUAL_LOCK_START，并以最高可用帧率
+    连续发送相位/速度遥测；人为给 DDS 加减数 Hz，确认控制器能判断或纠正方向。
+11. 视觉锁定期间确认 DDS 指令只在种子 ±5 Hz 内，并最终稳定为一倍正斜率直线。
+12. 随后 OpenMV 收到 STOP_TASK 并回到 IDLE；STM32 按最终模式切换 DDS，
+    进入本地相位锁定，只有最终 LOCKED 后蜂鸣。
+13. 拔掉 UART 或让 OpenMV 不应答，STM32 在超时后仍停留在 Task5，
     显示错误原因，并保持本次选择的满码域 DAC 锯齿波。
-12. 在 Task5 已运行或已锁定时再次选择模式，OpenMV 依次收到旧 Session
+14. 在 Task5 已运行或已锁定时再次选择模式，OpenMV 依次收到旧 Session
     的 `STOP_TASK(reason=0x04)` 和新 Session 的 `START_TASK`，并开始
     新模式。

@@ -9,6 +9,7 @@
 #define TASK5_DDS_RESULT_TIMEOUT_MS      (3000UL)
 #define TASK5_RESULT_MAX_RETRIES         (3U)
 #define TASK5_DDS_SETTLE_MS              (20UL)
+#define TASK5_VISUAL_SAMPLE_TIMEOUT_MS    (1500UL)
 #define TASK5_CAPTURE_DELAY_MS           (80U)
 #define TASK5_CONFIRM_CAPTURE_DELAY_MS   (160U)
 #define TASK5_FINE_SEARCH_STEP_HZ        (100UL)
@@ -191,7 +192,34 @@ static void Task5_BeginReliable(
   Task5_SetState(controller, wait_state);
 }
 
-static bool Task5_FinishStopCleanupWithoutAck(
+static bool Task5_StartLocalPhaseLock(task5_controller_t *controller)
+{
+  uint32_t multiplier =
+      (controller->status.mode == TASK5_MODE_INFINITY_2X_0_DEG)
+          ? 2UL
+          : 1UL;
+  uint64_t seed_millihz =
+      (uint64_t)controller->status.visual_frequency_millihz * multiplier;
+
+  if ((seed_millihz == 0ULL) ||
+      (seed_millihz >
+       ((uint64_t)TASK5_MAX_DDS_FREQUENCY_HZ * 1000ULL)) ||
+      (controller->port.start_phase_lock == NULL) ||
+      !controller->port.start_phase_lock(
+          controller->port.context,
+          controller->status.mode,
+          (uint32_t)seed_millihz)) {
+    Task5_EnterError(controller, TASK5_ERROR_PHASE_LOCK);
+    return false;
+  }
+  controller->status.dds_frequency_hz =
+      (uint32_t)((seed_millihz + 500ULL) / 1000ULL);
+  Task5_SetState(controller, TASK5_STATE_PHASE_LOCKING);
+  Task5_Touch(controller);
+  return true;
+}
+
+static bool Task5_FinishStopWithoutAck(
     task5_controller_t *controller)
 {
   if ((controller->status.state != TASK5_STATE_WAIT_STOP_ACK) ||
@@ -199,12 +227,11 @@ static bool Task5_FinishStopCleanupWithoutAck(
     return false;
   }
 
-  /* TARGET_REACHED already established success.  A lost STOP ACK must not
-   * replace the held DDS tone with the diagnostic sawtooth/error output. */
+  /* Visual lock already established success. A lost STOP ACK must not block
+   * the local high-rate ADC loop or replace the DDS tone with diagnostics. */
   controller->pending.active = false;
   controller->pending.sent = false;
-  Task5_SetState(controller, TASK5_STATE_FREQUENCY_HOLD);
-  return true;
+  return Task5_StartLocalPhaseLock(controller);
 }
 
 static void Task5_ServicePending(task5_controller_t *controller,
@@ -232,7 +259,7 @@ static void Task5_ServicePending(task5_controller_t *controller,
           now_ms + TASK5_ACK_TIMEOUT_MS;
     } else if (controller->pending.retry_count >=
                TASK5_ACK_MAX_RETRIES) {
-      if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+      if (!Task5_FinishStopWithoutAck(controller)) {
         Task5_EnterError(
             controller, TASK5_ERROR_UART_SEND);
       }
@@ -250,7 +277,7 @@ static void Task5_ServicePending(task5_controller_t *controller,
   }
   if (controller->pending.retry_count >=
       TASK5_ACK_MAX_RETRIES) {
-    if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+    if (!Task5_FinishStopWithoutAck(controller)) {
       Task5_EnterError(controller, TASK5_ERROR_ACK_TIMEOUT);
     }
     return;
@@ -270,7 +297,7 @@ static void Task5_ServicePending(task5_controller_t *controller,
     Task5_Touch(controller);
   } else if ((uint8_t)(controller->pending.retry_count + 1U) >=
              TASK5_ACK_MAX_RETRIES) {
-    if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+    if (!Task5_FinishStopWithoutAck(controller)) {
       Task5_EnterError(
           controller, TASK5_ERROR_UART_SEND);
     }
@@ -908,11 +935,13 @@ static void Task5_HandleAck(task5_controller_t *controller,
       Task5_SetState(
           controller, TASK5_STATE_WAIT_DDS_RESULT);
       break;
+    case TASK5_STATE_WAIT_VISUAL_LOCK_ACK:
+      controller->state_deadline =
+          now_ms + TASK5_VISUAL_SAMPLE_TIMEOUT_MS;
+      Task5_SetState(controller, TASK5_STATE_VISUAL_LOCKING);
+      break;
     case TASK5_STATE_WAIT_STOP_ACK:
-      /* Frequency search is complete.  Keep the last AD9910 tone unchanged;
-       * the optional local phase loop is deliberately not started here. */
-      Task5_SetState(
-          controller, TASK5_STATE_FREQUENCY_HOLD);
+      (void)Task5_StartLocalPhaseLock(controller);
       break;
     default:
       break;
@@ -940,7 +969,7 @@ static void Task5_HandleNack(task5_controller_t *controller,
     controller->pending.ack_deadline = now_ms + 200UL;
     return;
   }
-  if (!Task5_FinishStopCleanupWithoutAck(controller)) {
+  if (!Task5_FinishStopWithoutAck(controller)) {
     Task5_EnterError(controller, TASK5_ERROR_NACK);
   }
 }
@@ -955,7 +984,6 @@ static void Task5_HandleCoarseResult(
   uint32_t ratio_x1000;
   uint64_t estimated_input;
   uint64_t estimated;
-  uint8_t multiplier;
 
   if (frame->length != 10U) {
     Task5_SendNack(
@@ -1005,16 +1033,13 @@ static void Task5_HandleCoarseResult(
     return;
   }
 
-  multiplier =
-      (controller->status.mode ==
-       TASK5_MODE_INFINITY_2X_0_DEG)
-          ? 2U
-          : 1U;
   estimated_input =
       ((uint64_t)controller->status.saw_frequency_hz *
        ratio_x1000 + 500ULL) /
       1000ULL;
-  estimated = estimated_input * multiplier;
+  /* Always acquire the camera-assisted 1:1 line first. The requested 1x/2x
+   * FTW and target POW are applied only when handing off to the local loop. */
+  estimated = estimated_input;
   if ((estimated_input == 0ULL) ||
       (estimated_input > TASK5_MAX_INPUT_FREQUENCY_HZ) ||
       (estimated > TASK5_MAX_DDS_FREQUENCY_HZ)) {
@@ -1050,19 +1075,45 @@ static void Task5_HandleCoarseResult(
       controller, controller->search_origin_hz, now_ms);
 }
 
-static void Task5_BeginFrequencyHold(
+static void Task5_BeginVisualLock(
     task5_controller_t *controller,
     uint32_t now_ms)
 {
-  uint8_t stop_payload[3];
+  uint8_t payload[7];
+  uint32_t seed_millihz = controller->status.dds_frequency_hz * 1000UL;
 
-  OpenMV_WriteU16LE(
-      &stop_payload[0], controller->status.session_id);
-  stop_payload[2] = 0x00U;
+  /* Visual samples carry the OpenMV monotonic clock, which has a different
+   * epoch from HAL_GetTick(). Seed the visual controller in that clock domain;
+   * every later settle deadline is based on a received sample timestamp. */
+  VisualLock_Init(&controller->visual_lock, seed_millihz, 0UL);
+  controller->visual_sample_valid = false;
+  controller->status.visual_frequency_millihz = seed_millihz;
+  controller->status.visual_phase_offset_mdeg = 0L;
+  controller->status.visual_phase_mdeg = 0UL;
+  controller->status.visual_speed_millihz = 0U;
+  controller->status.visual_quality = 0U;
+  controller->status.visual_frequency_direction = 0;
+  OpenMV_WriteU16LE(&payload[0], controller->status.session_id);
+  OpenMV_WriteU32LE(&payload[2], seed_millihz);
+  payload[6] = 0x00U; /* visual target: 1x, positive-slope line */
+  Task5_BeginReliable(
+      controller, OPENMV_MSG_VISUAL_LOCK_START,
+      payload, sizeof(payload),
+      TASK5_STATE_WAIT_VISUAL_LOCK_ACK);
+  Task5_ServicePending(controller, now_ms);
+}
+
+static void Task5_StopVisualLock(
+    task5_controller_t *controller,
+    uint32_t now_ms)
+{
+  uint8_t payload[3];
+
+  OpenMV_WriteU16LE(&payload[0], controller->status.session_id);
+  payload[2] = 0x00U;
   Task5_BeginReliable(
       controller, OPENMV_MSG_STOP_TASK,
-      stop_payload, sizeof(stop_payload),
-      TASK5_STATE_WAIT_STOP_ACK);
+      payload, sizeof(payload), TASK5_STATE_WAIT_STOP_ACK);
   Task5_ServicePending(controller, now_ms);
 }
 
@@ -1137,7 +1188,7 @@ static void Task5_HandleDDSTestResult(
 
   if ((result == TASK5_DDS_TARGET_REACHED) &&
       !controller->high_frequency_search) {
-    Task5_BeginFrequencyHold(controller, now_ms);
+    Task5_BeginVisualLock(controller, now_ms);
     return;
   }
 
@@ -1188,7 +1239,7 @@ static void Task5_HandleDDSTestResult(
                          controller,
                          controller->fine_best_frequency_hz,
                          now_ms)) {
-            Task5_BeginFrequencyHold(controller, now_ms);
+            Task5_BeginVisualLock(controller, now_ms);
           }
         }
         return;
@@ -1220,7 +1271,7 @@ static void Task5_HandleDDSTestResult(
            (uint16_t)(1000U -
                       TASK5_SUSPICION_MIN_QUALITY)) &&
           (quality >= TASK5_CONFIRM_MIN_QUALITY)) {
-        Task5_BeginFrequencyHold(controller, now_ms);
+        Task5_BeginVisualLock(controller, now_ms);
       } else {
         (void)Task5_RestartLowSearch(
             controller,
@@ -1249,6 +1300,93 @@ static void Task5_HandleDDSTestResult(
   Task5_Touch(controller);
 }
 
+static void Task5_HandleVisualLockSample(
+    task5_controller_t *controller,
+    const openmv_frame_t *frame,
+    uint32_t now_ms)
+{
+  visual_lock_sample_t sample;
+  visual_lock_output_t output;
+  uint16_t session;
+  uint16_t sample_id;
+
+  if (frame->length != 16U) {
+    Task5_SendNack(controller, frame, OPENMV_NACK_BAD_LENGTH);
+    controller->status.invalid_frame_count++;
+    Task5_Touch(controller);
+    return;
+  }
+  session = OpenMV_ReadU16LE(&frame->payload[0]);
+  sample_id = OpenMV_ReadU16LE(&frame->payload[2]);
+  if (session != controller->status.session_id) {
+    Task5_SendNack(controller, frame, OPENMV_NACK_BAD_SESSION);
+    controller->status.stale_result_count++;
+    Task5_Touch(controller);
+    return;
+  }
+  if (controller->status.state != TASK5_STATE_VISUAL_LOCKING) {
+    Task5_SendNack(controller, frame, OPENMV_NACK_BAD_STATE);
+    return;
+  }
+  if (controller->visual_sample_valid &&
+      (sample_id == controller->last_visual_sample_id)) {
+    controller->status.duplicate_result_count++;
+    Task5_Touch(controller);
+    return;
+  }
+
+  sample.timestamp_ms = OpenMV_ReadU32LE(&frame->payload[4]);
+  sample.phase_mdeg = OpenMV_ReadU32LE(&frame->payload[8]);
+  sample.speed_millihz = OpenMV_ReadU16LE(&frame->payload[12]);
+  sample.quality = frame->payload[14];
+  sample.flags = frame->payload[15];
+  if ((sample.phase_mdeg > 180000UL) ||
+      (sample.speed_millihz > 10000U) ||
+      (sample.quality > 100U) ||
+      ((sample.flags & (uint8_t)~(
+          VISUAL_LOCK_SAMPLE_PHASE_VALID |
+          VISUAL_LOCK_SAMPLE_FAMILY_VALID)) != 0U)) {
+    Task5_SendNack(controller, frame, OPENMV_NACK_OUT_OF_RANGE);
+    controller->status.invalid_frame_count++;
+    Task5_Touch(controller);
+    return;
+  }
+
+  controller->visual_sample_valid = true;
+  controller->last_visual_sample_id = sample_id;
+  controller->state_deadline = now_ms + TASK5_VISUAL_SAMPLE_TIMEOUT_MS;
+  controller->status.visual_phase_mdeg = sample.phase_mdeg;
+  controller->status.visual_speed_millihz = sample.speed_millihz;
+  controller->status.visual_quality = sample.quality;
+  VisualLock_Step(&controller->visual_lock, &sample, &output);
+  controller->status.visual_frequency_millihz = output.frequency_millihz;
+  controller->status.visual_phase_offset_mdeg = output.phase_offset_mdeg;
+  controller->status.visual_frequency_direction =
+      (int8_t)controller->visual_lock.frequency_direction;
+  controller->status.visual_direction_reversals =
+      controller->visual_lock.direction_reversal_count;
+  controller->status.visual_boundary_reversals =
+      controller->visual_lock.boundary_reversal_count;
+  Task5_Touch(controller);
+
+  if (output.error) {
+    Task5_EnterError(controller, TASK5_ERROR_SEARCH_LIMIT);
+    return;
+  }
+  if (output.command_changed &&
+      ((controller->port.set_dds_tone == NULL) ||
+       !controller->port.set_dds_tone(
+           controller->port.context,
+           output.frequency_millihz,
+           output.phase_offset_mdeg))) {
+    Task5_EnterError(controller, TASK5_ERROR_DDS_OUTPUT);
+    return;
+  }
+  if (output.locked) {
+    Task5_StopVisualLock(controller, now_ms);
+  }
+}
+
 bool Task5_Init(task5_controller_t *controller,
                 const task5_port_t *port)
 {
@@ -1256,6 +1394,7 @@ bool Task5_Init(task5_controller_t *controller,
       (port->start_saw == NULL) ||
       (port->stop_saw == NULL) ||
       (port->set_dds_frequency == NULL) ||
+      (port->set_dds_tone == NULL) ||
       (port->start_phase_lock == NULL) ||
       (port->safe_outputs == NULL) ||
       (port->send_frame == NULL)) {
@@ -1397,6 +1536,12 @@ void Task5_Process(task5_controller_t *controller,
             controller, TASK5_ERROR_RESULT_TIMEOUT);
       }
       break;
+    case TASK5_STATE_VISUAL_LOCKING:
+      if (Task5_DeadlineReached(now_ms, controller->state_deadline)) {
+        Task5_EnterError(
+            controller, TASK5_ERROR_IMAGE_RECOGNITION);
+      }
+      break;
     default:
       break;
   }
@@ -1431,6 +1576,9 @@ void Task5_OnFrame(task5_controller_t *controller,
       Task5_HandleDDSTestResult(
           controller, frame, now_ms);
       break;
+    case OPENMV_MSG_VISUAL_LOCK_SAMPLE:
+      Task5_HandleVisualLockSample(controller, frame, now_ms);
+      break;
     case OPENMV_MSG_OPENMV_ERROR:
       Task5_SendAck(controller, frame, TASK5_ACK_STATUS_OK);
       Task5_EnterError(
@@ -1463,6 +1611,16 @@ void Task5_NotifyPhaseLock(task5_controller_t *controller,
   } else if (controller->status.state == TASK5_STATE_LOCKED) {
     Task5_SetState(controller, TASK5_STATE_PHASE_LOCKING);
   }
+}
+
+void Task5_NotifyDDSError(task5_controller_t *controller)
+{
+  if ((controller == NULL) ||
+      (controller->status.state == TASK5_STATE_INACTIVE) ||
+      (controller->status.state == TASK5_STATE_WAIT_SELECTION)) {
+    return;
+  }
+  Task5_EnterError(controller, TASK5_ERROR_DDS_OUTPUT);
 }
 
 void Task5_GetStatus(const task5_controller_t *controller,

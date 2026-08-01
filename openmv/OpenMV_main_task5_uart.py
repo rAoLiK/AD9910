@@ -7,6 +7,7 @@ Embedded model blocks are synchronized by tools/sync_openmv_task5_models.ps1.
 
 import binascii
 import gc
+import math
 import struct
 import time
 import csi
@@ -97,6 +98,16 @@ DDS_EARLY_REJECT_MAX_FAMILY_PERCENT = 25
 DDS_EARLY_REJECT_CONSECUTIVE = 6
 DDS_HIGH_SCORE_TOP_FRAMES = 3
 DDS_HIGH_NONFAMILY_SCORE_CAP = 499
+
+# Streaming visual fine-lock telemetry. The folded Lissajous phase is a
+# triangle wave, so the median of several absolute frame-to-frame slopes
+# rejects the one underestimated interval produced when a sample straddles a
+# 0/180-degree reflection. No display throttling is allowed in this state.
+VISUAL_SPEED_HISTORY = 5
+VISUAL_SPEED_MIN_SAMPLES = 3
+VISUAL_MIN_DELTA_MS = 5
+VISUAL_MAX_DELTA_MS = 250
+VISUAL_TWO_PI = 6.283185307179586
 
 DDS_RESULT_TARGET_REACHED = 0
 DDS_RESULT_NOT_MATCHED = 3
@@ -3860,6 +3871,48 @@ class PcaRatioClassifier:
         return result
 
 
+class FoldedPhaseSpeedTracker:
+    """Robust |df| estimate from the folded 0..pi image phase."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.previous_phase_rad = None
+        self.previous_ms = 0
+        self.speed_history = []
+
+    def update(self, phase_rad, now_ms):
+        if self.previous_phase_rad is None:
+            self.previous_phase_rad = phase_rad
+            self.previous_ms = now_ms
+            return None
+
+        delta_ms = time.ticks_diff(now_ms, self.previous_ms)
+        phase_delta = abs(phase_rad - self.previous_phase_rad)
+        self.previous_phase_rad = phase_rad
+        self.previous_ms = now_ms
+        if (
+            delta_ms < VISUAL_MIN_DELTA_MS
+            or delta_ms > VISUAL_MAX_DELTA_MS
+        ):
+            self.speed_history = []
+            return None
+
+        speed_millihz = int(
+            phase_delta * 1000000.0
+            / (VISUAL_TWO_PI * float(delta_ms))
+            + 0.5
+        )
+        self.speed_history.append(speed_millihz)
+        if len(self.speed_history) > VISUAL_SPEED_HISTORY:
+            self.speed_history.pop(0)
+        if len(self.speed_history) < VISUAL_SPEED_MIN_SAMPLES:
+            return None
+        ordered = sorted(self.speed_history)
+        return ordered[len(ordered) // 2]
+
+
 class LissajousStabilityDetector:
     """Detect the 1:1 Lissajous line/ellipse family in a fixed ROI.
 
@@ -3887,7 +3940,14 @@ class LissajousStabilityDetector:
         self.screen_patch_rect = None
         self.trace_seed_rect = None
         self.locator_source = 0
+        self.last_phase_rad = 0.0
+        self.last_phase_valid = False
+        self.visual_speed_tracker = FoldedPhaseSpeedTracker()
         self.reset_test(0)
+
+    def reset_visual_tracking(self):
+        self.last_phase_valid = False
+        self.visual_speed_tracker.reset()
 
     def set_trace_seed(self, trace_rect):
         if (
@@ -4303,6 +4363,7 @@ class LissajousStabilityDetector:
         row_counts = np.sum(mask, axis=1)
         pixels = float(np.sum(column_counts))
         if pixels <= 0.0:
+            self.last_phase_valid = False
             return (0.0, 0.0, 99.0, 99.0, 0, False)
 
         # Count bright runs along rows and columns. A clean conic has at most
@@ -4353,6 +4414,17 @@ class LissajousStabilityDetector:
         covariance_xy = float(
             np.sum(mask * cross_grid)
         ) / pixels
+
+        correlation_denominator = (
+            max(0.0001, variance_x * variance_y) ** 0.5
+        )
+        correlation = _clamp(
+            covariance_xy / correlation_denominator,
+            -1.0,
+            1.0,
+        )
+        self.last_phase_rad = math.acos(correlation)
+        self.last_phase_valid = True
 
         trace = variance_x + variance_y
         discriminant = (
@@ -4428,6 +4500,46 @@ class LissajousStabilityDetector:
             run_excess_ratio,
             frame_score,
             is_family,
+        )
+
+    def update_visual(self, frame, now_ms):
+        trace = self._extract_trace(frame)
+        if trace is None or not self.last_phase_valid:
+            self.visual_speed_tracker.reset()
+            return None
+        (
+            _pixels,
+            _axis_ratio,
+            _radial_cv,
+            _run_excess_ratio,
+            frame_score,
+            current_family,
+        ) = trace
+        speed_millihz = self.visual_speed_tracker.update(
+            self.last_phase_rad,
+            now_ms,
+        )
+        if speed_millihz is None:
+            return None
+        phase_mdeg = clamp_int(
+            int(
+                self.last_phase_rad
+                * 180000.0
+                / math.pi
+                + 0.5
+            ),
+            0,
+            180000,
+        )
+        quality = clamp_int(int(frame_score / 10.0 + 0.5), 0, 100)
+        flags = 0x01
+        if current_family:
+            flags |= 0x02
+        return (
+            phase_mdeg,
+            clamp_int(speed_millihz, 0, 10000),
+            quality,
+            flags,
         )
 
     def _quality(self):
@@ -4606,6 +4718,8 @@ TYPE_COARSE_RESULT = 0x11
 TYPE_DDS_TEST = 0x20
 TYPE_DDS_TEST_RESULT = 0x21
 TYPE_STOP_TASK = 0x22
+TYPE_VISUAL_LOCK_START = 0x30
+TYPE_VISUAL_LOCK_SAMPLE = 0x31
 TYPE_OPENMV_ERROR = 0x7F
 
 ACK_ACCEPTED = 0x00
@@ -5234,6 +5348,7 @@ STATE_IDLE = 0
 STATE_COARSE = 1
 STATE_WAIT_DDS = 2
 STATE_DDS_RECOGNIZING = 3
+STATE_VISUAL_LOCK = 4
 
 
 def ticks_ms():
@@ -5338,8 +5453,12 @@ def consensus(history, minimum_samples, cluster_radius):
 
 
 def annotate(frame, controller, fps):
-    state_names = ("IDLE", "COARSE", "WAIT DDS", "DDS")
-    state_name = state_names[controller.state]
+    state_names = ("IDLE", "COARSE", "WAIT DDS", "DDS", "VISUAL")
+    state_name = (
+        state_names[controller.state]
+        if 0 <= controller.state < len(state_names)
+        else "UNKNOWN"
+    )
     frame.draw_rectangle(
         (0, 0, frame.width(), 39),
         color=(0, 0, 0),
@@ -5351,7 +5470,9 @@ def annotate(frame, controller, fps):
         color=(80, 255, 80),
         scale=1,
     )
-    if controller.state == STATE_DDS_RECOGNIZING:
+    if controller.state == STATE_VISUAL_LOCK:
+        information_line = "VISUAL 1X LINE  STREAMING"
+    elif controller.state == STATE_DDS_RECOGNIZING:
         detector = controller.stability_detector
         information_line = "ROI:%d V:%02d D:%02d X:%02d" % (
             detector.locator_source,
@@ -5377,7 +5498,13 @@ def annotate(frame, controller, fps):
         color=(255, 255, 255),
         scale=1,
     )
-    if controller.state == STATE_DDS_RECOGNIZING:
+    if controller.state == STATE_VISUAL_LOCK:
+        status_line = "P:%5.1f D:%4.2fHz FPS:%3.1f" % (
+            controller.visual_phase_mdeg / 1000.0,
+            controller.visual_speed_millihz / 1000.0,
+            fps,
+        )
+    elif controller.state == STATE_DDS_RECOGNIZING:
         detector = controller.stability_detector
         family_percent = clamp_int(
             int(
@@ -5456,6 +5583,11 @@ class Task5Controller:
         self.dds_capture_due_ms = 0
         self.dds_match_score = 0
         self.dds_stability_confidence = 0
+        self.visual_command_key = None
+        self.visual_seed_millihz = 0
+        self.visual_sample_id = 0
+        self.visual_phase_mdeg = 0
+        self.visual_speed_millihz = 0
         self.last_stop_key = None
 
     def _cache_and_send_result(self, message_type, payload):
@@ -5503,6 +5635,11 @@ class Task5Controller:
         self.dds_capture_due_ms = 0
         self.dds_match_score = 0
         self.dds_stability_confidence = 0
+        self.visual_command_key = None
+        self.visual_seed_millihz = 0
+        self.visual_sample_id = 0
+        self.visual_phase_mdeg = 0
+        self.visual_speed_millihz = 0
         self.stability_detector.reset_session()
         self._clear_result_cache()
         gc.collect()
@@ -5702,6 +5839,75 @@ class Task5Controller:
             % (test_id, dds_frequency_hz, capture_delay_ms)
         )
 
+    def _handle_visual_lock_start(
+        self,
+        sequence,
+        payload,
+        command_key,
+    ):
+        if len(payload) != 7:
+            self.link.send_nack(
+                TYPE_VISUAL_LOCK_START,
+                sequence,
+                ERR_LENGTH,
+            )
+            return
+        session_id, seed_millihz, target_profile = struct.unpack(
+            "<HIB",
+            payload,
+        )
+        if session_id != self.session_id or not session_id:
+            self.link.send_nack(
+                TYPE_VISUAL_LOCK_START,
+                sequence,
+                ERR_SESSION,
+            )
+            return
+        if (
+            seed_millihz < 100000
+            or seed_millihz > 100000000
+            or target_profile != 0
+        ):
+            self.link.send_nack(
+                TYPE_VISUAL_LOCK_START,
+                sequence,
+                ERR_RANGE,
+            )
+            return
+        if command_key == self.visual_command_key:
+            self.link.send_ack(
+                TYPE_VISUAL_LOCK_START,
+                sequence,
+                ACK_DUPLICATE,
+            )
+            return
+        if self.state != STATE_WAIT_DDS:
+            self.link.send_nack(
+                TYPE_VISUAL_LOCK_START,
+                sequence,
+                ERR_STATE,
+            )
+            return
+
+        self.link.send_ack(
+            TYPE_VISUAL_LOCK_START,
+            sequence,
+            ACK_ACCEPTED,
+        )
+        self.state = STATE_VISUAL_LOCK
+        self.visual_command_key = command_key
+        self.visual_seed_millihz = seed_millihz
+        self.visual_sample_id = 0
+        self.visual_phase_mdeg = 0
+        self.visual_speed_millihz = 0
+        self.stability_detector.reset_visual_tracking()
+        self._clear_result_cache()
+        gc.collect()
+        print(
+            "[visual lock] seed %.1f Hz, streaming phase motion"
+            % (seed_millihz / 1000.0)
+        )
+
     def _handle_stop(self, sequence, payload, command_key):
         if len(payload) != 3:
             self.link.send_nack(TYPE_STOP_TASK, sequence, ERR_LENGTH)
@@ -5771,6 +5977,12 @@ class Task5Controller:
             self._handle_start(sequence, payload, command_key)
         elif message_type == TYPE_DDS_TEST:
             self._handle_dds_test(sequence, payload, command_key)
+        elif message_type == TYPE_VISUAL_LOCK_START:
+            self._handle_visual_lock_start(
+                sequence,
+                payload,
+                command_key,
+            )
         elif message_type == TYPE_STOP_TASK:
             self._handle_stop(sequence, payload, command_key)
         else:
@@ -5959,6 +6171,34 @@ class Task5Controller:
             )
         )
 
+    def process_visual_lock_frame(self, frame):
+        if self.state != STATE_VISUAL_LOCK:
+            return
+        now_ms = ticks_ms()
+        sample = self.stability_detector.update_visual(frame, now_ms)
+        self.last_rect = self.stability_detector.screen_outline_rect
+        if sample is None:
+            return
+        phase_mdeg, speed_millihz, quality, flags = sample
+        self.visual_sample_id = (self.visual_sample_id + 1) & 0xFFFF
+        if self.visual_sample_id == 0:
+            self.visual_sample_id = 1
+        self.visual_phase_mdeg = phase_mdeg
+        self.visual_speed_millihz = speed_millihz
+        payload = struct.pack(
+            "<HHIIHBB",
+            self.session_id,
+            self.visual_sample_id,
+            now_ms & 0xFFFFFFFF,
+            phase_mdeg,
+            speed_millihz,
+            quality,
+            flags,
+        )
+        # Telemetry is intentionally not ACKed or cached. A later frame
+        # supersedes a lost sample and keeps the camera/control cadence high.
+        self.link.send_new(TYPE_VISUAL_LOCK_SAMPLE, payload)
+
 
 try:
     boot_started = SCRIPT_STARTED_MS
@@ -6003,9 +6243,12 @@ while True:
     controller.poll_uart()
     controller.process_coarse_frame(frame)
     controller.process_dds_frame(frame)
+    controller.process_visual_lock_frame(frame)
     controller.poll_uart()
 
-    if display is not None:
+    # OLED conversion/I2C is intentionally suspended during fine lock. The
+    # camera and telemetry loop then run at the maximum available frame rate.
+    if display is not None and controller.state != STATE_VISUAL_LOCK:
         try:
             display.update_if_due(frame, now_ms=ticks_ms())
         except Exception as error:

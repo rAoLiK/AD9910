@@ -67,11 +67,13 @@ self.buffer = self.buffer[consumed:]
 - 固定帧头、LEN、CRC16/MODBUS；
 - UART 粘包、拆包、前导噪声和 CRC 错帧恢复；
 - `START_TASK`、`COARSE_RESULT`、`DDS_TEST`、
-  `DDS_TEST_RESULT`、`STOP_TASK`、`HEARTBEAT`；
+  `DDS_TEST_RESULT`、`VISUAL_LOCK_START`、`VISUAL_LOCK_SAMPLE`、
+  `STOP_TASK`、`HEARTBEAT`；
 - 耗时处理前立即 ACK；
 - 重复命令不重复执行，结果帧按原 SEQ 原字节重发；
 - Session、状态、范围、忙状态及长度检查；
-- 串口信息采用简短中文提示，IDE 图像保留瞄准框，OLED 仍只作瞄准预览。
+- 串口信息采用简短中文提示，IDE 图像保留瞄准框；视觉锁定期间暂停 OLED
+  刷新，把处理时间留给取图和控制，其余阶段 OLED 仍只作瞄准预览。
 
 ## 第二阶段 DDS_TEST 视觉判定
 
@@ -100,9 +102,24 @@ OpenMV 不在第二阶段发送 `DDS_TOO_LOW`、`DDS_TOO_HIGH`、`UNSTABLE`、
 同一频率重试，而不是把相机故障误当成频率不匹配。重复的同一 `DDS_TEST`
 仍按协议重发缓存结果，不创建一次新的判定。
 
-收到 `TARGET_REACHED` 后，F407 ACK 结果并发送正常 `STOP_TASK`。STOP
-清理握手无论成功还是重试耗尽，都保持当时的 DDS 频率，不启动本地 PLL；
-对于支持蜂鸣命令的 TJC 屏，F407 发送 `beep 500`，产生 0.5 s 提示音。
+收到 `TARGET_REACHED` 后，F407 ACK 结果并发送 `VISUAL_LOCK_START(0x30)`，
+而不是立即停止相机。无论最终要求是直线、圆还是二倍频“∞”，这一阶段都先
+锁定输入频率的一倍正斜率直线，以获得最明确的相位运动方向。
+
+OpenMV 随后逐帧估计相关相位，并把折叠相位、相位变化速度、质量和图形有效
+标志打包为 `VISUAL_LOCK_SAMPLE(0x31)`。该消息是高速遥测，不缓存、不重发、
+不等待 ACK；丢失一帧不会阻塞下一帧。F407 用这些数据执行 0.1 Hz PI 调节、
+方向试探/反向和 ±5 Hz 保护，并在频率稳定后调整 DDS 相位字到正斜率直线。
+
+视觉直线连续稳定后 F407 才发送正常 `STOP_TASK`，随后按按键要求立即切换
+DDS 频率/相位目标并启动本地 ADC+AD9910 闭环。二倍频仅在这里乘二；只有
+本地 PLL 最终报告锁定后才响铃，前面的粗命中和视觉锁定都不响铃。
+
+`VISUAL_LOCK_START` 的 payload 为小端序 `<HIB>`：`session_id`、一倍频种子
+`seed_frequency_millihz`、`target_profile=0`。`VISUAL_LOCK_SAMPLE` 的 payload
+为 `<HHIIHBB>`：`session_id`、`sample_id`、OpenMV `timestamp_ms`、
+`phase_mdeg`、`speed_millihz`、`quality`、`flags`；`flags.bit0` 表示相位有效，
+`flags.bit1` 表示当前轨迹属于目标图形族。
 
 ### 视觉阈值标定
 

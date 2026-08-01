@@ -26,6 +26,7 @@
 #define APP_TASK2_OUTPUT_PHASE_DEG             (90.0f)
 #define APP_TASK3_GENERALIZED_PHASE_DEG        (0.0f)
 #define APP_TASK5_FOUND_BEEP_MS                 (500U)
+#define APP_TASK5_FINE_DDS_INTERVAL_MS          (1UL)
 
 typedef struct {
   app_core_t core;
@@ -41,6 +42,14 @@ typedef struct {
   app_waveform_t rendered_task5_waveform;
   uint32_t rendered_task5_revision;
   uint16_t task5_beeped_session;
+  double task5_ftw_fraction;
+  double task5_ftw_accumulator;
+  uint32_t task5_ftw_floor;
+  uint32_t task5_last_ftw;
+  uint16_t task5_visual_pow;
+  uint16_t task5_visual_asf;
+  uint32_t task5_last_dds_tick;
+  bool task5_visual_dither_active;
   uint32_t last_button_tick[3];
   bool last_button_tick_valid[3];
   uint32_t button_press_tick;
@@ -53,6 +62,12 @@ typedef struct {
 } app_integration_context_t;
 
 static app_integration_context_t s_app;
+
+static void AppIntegration_StopVisualDither(void)
+{
+  s_app.task5_visual_dither_active = false;
+  s_app.task5_ftw_accumulator = 0.0;
+}
 
 static float AppIntegration_WrapDegrees(float degrees)
 {
@@ -116,6 +131,7 @@ static float AppIntegration_AmplitudeScale(uint8_t amplitude_div)
 static bool AppIntegration_EnterSafe(void *context)
 {
   (void)context;
+  AppIntegration_StopVisualDither();
   AppSaw_Stop();
   AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
   AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
@@ -125,6 +141,7 @@ static bool AppIntegration_EnterSafe(void *context)
 static bool AppIntegration_RunDirect(void *context)
 {
   (void)context;
+  AppIntegration_StopVisualDither();
   if (PLL_Demo_Stop() != HAL_OK) {
     AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
     AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
@@ -144,6 +161,7 @@ static bool AppIntegration_RunLock(void *context,
   float scale;
 
   (void)context;
+  AppIntegration_StopVisualDither();
   if (!AppIntegration_LockParameters(
           waveform, &multiplier, &feedback_phase_deg)) {
     return false;
@@ -202,6 +220,7 @@ static bool AppIntegration_Task5StartSaw(
     void *context, uint32_t frequency_hz)
 {
   (void)context;
+  AppIntegration_StopVisualDither();
   (void)PLL_Demo_Stop();
   AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DAC);
   return AppSaw_Start(frequency_hz) == HAL_OK;
@@ -219,6 +238,7 @@ static bool AppIntegration_Task5SetDDS(
   app_integration_context_t *app =
       (app_integration_context_t *)context;
 
+  AppIntegration_StopVisualDither();
   if ((app == NULL) || (app->dds == NULL) ||
       (PLL_Demo_Stop() != HAL_OK)) {
     return false;
@@ -237,10 +257,59 @@ static bool AppIntegration_Task5SetDDS(
   return true;
 }
 
+static bool AppIntegration_Task5SetTone(
+    void *context,
+    uint32_t frequency_millihz,
+    int32_t phase_offset_mdeg)
+{
+  app_integration_context_t *app =
+      (app_integration_context_t *)context;
+  ad9910_profile_word_t profile;
+  double exact_ftw;
+  uint32_t ftw;
+
+  AppIntegration_StopVisualDither();
+  if ((app == NULL) || (app->dds == NULL) ||
+      (frequency_millihz == 0UL)) {
+    return false;
+  }
+  exact_ftw =
+      (((double)frequency_millihz / 1000.0) * 4294967296.0) /
+      (double)app->dds->cfg.sysclk.sys_clk_hz;
+  if ((exact_ftw < 0.0) || (exact_ftw > 4294967295.0)) {
+    return false;
+  }
+  s_app.task5_ftw_floor = (uint32_t)exact_ftw;
+  s_app.task5_ftw_fraction =
+      exact_ftw - (double)s_app.task5_ftw_floor;
+  s_app.task5_ftw_accumulator = s_app.task5_ftw_fraction;
+  ftw = s_app.task5_ftw_floor;
+  s_app.task5_visual_pow = AD9910_PhaseDegToPOW(
+      (double)phase_offset_mdeg / 1000.0);
+  s_app.task5_visual_asf = AD9910_AmplitudeScaleToASF(
+      (double)AppIntegration_AmplitudeScale(APP_TASK5_OUTPUT_DIVS));
+  profile.ftw = ftw;
+  profile.pow = s_app.task5_visual_pow;
+  profile.asf = s_app.task5_visual_asf;
+  if (AD9910_ProgramProfile(
+          app->dds, AD9910_PROFILE_0, &profile, 1U) !=
+      AD9910_STATUS_OK) {
+    AppIntegration_StopVisualDither();
+    AppBoard_SetPath(APP_BOARD_PATH_DIRECT);
+    return false;
+  }
+  s_app.task5_last_ftw = ftw;
+  s_app.task5_last_dds_tick = HAL_GetTick();
+  s_app.task5_visual_dither_active = true;
+  AppBoard_SetPath(APP_BOARD_PATH_DDS);
+  AppBoard_SetSignalSource(APP_BOARD_SIGNAL_DDS);
+  return true;
+}
+
 static bool AppIntegration_Task5StartPhaseLock(
     void *context,
     task5_lock_mode_t mode,
-    uint32_t seed_frequency_hz)
+    uint32_t seed_frequency_millihz)
 {
   app_integration_context_t *app =
       (app_integration_context_t *)context;
@@ -248,6 +317,7 @@ static bool AppIntegration_Task5StartPhaseLock(
   uint8_t multiplier;
   float feedback_phase_deg;
 
+  AppIntegration_StopVisualDither();
   if (app == NULL) {
     return false;
   }
@@ -261,7 +331,7 @@ static bool AppIntegration_Task5StartPhaseLock(
           waveform, &multiplier, &feedback_phase_deg) ||
       (PLL_Demo_Stop() != HAL_OK) ||
       (PLL_Demo_SeedFrequency(
-           (float)seed_frequency_hz) != HAL_OK) ||
+           (float)seed_frequency_millihz / 1000.0f) != HAL_OK) ||
       (PLL_Demo_Configure(
            multiplier, feedback_phase_deg,
            AppIntegration_AmplitudeScale(
@@ -280,6 +350,41 @@ static bool AppIntegration_Task5StartPhaseLock(
     return false;
   }
   return true;
+}
+
+static void AppIntegration_ServiceVisualDither(void)
+{
+  ad9910_profile_word_t profile;
+  uint32_t now = HAL_GetTick();
+  uint32_t ftw;
+
+  if (!s_app.task5_visual_dither_active || (s_app.dds == NULL) ||
+      ((uint32_t)(now - s_app.task5_last_dds_tick) <
+       APP_TASK5_FINE_DDS_INTERVAL_MS)) {
+    return;
+  }
+  s_app.task5_last_dds_tick = now;
+  ftw = s_app.task5_ftw_floor;
+  s_app.task5_ftw_accumulator += s_app.task5_ftw_fraction;
+  if ((s_app.task5_ftw_accumulator >= 1.0) &&
+      (ftw != UINT32_MAX)) {
+    ftw++;
+    s_app.task5_ftw_accumulator -= 1.0;
+  }
+  if (ftw == s_app.task5_last_ftw) {
+    return;
+  }
+  profile.ftw = ftw;
+  profile.pow = s_app.task5_visual_pow;
+  profile.asf = s_app.task5_visual_asf;
+  if (AD9910_ProgramProfile(
+          s_app.dds, AD9910_PROFILE_0, &profile, 1U) !=
+      AD9910_STATUS_OK) {
+    AppIntegration_StopVisualDither();
+    Task5_NotifyDDSError(&s_app.task5);
+    return;
+  }
+  s_app.task5_last_ftw = ftw;
 }
 
 static void AppIntegration_Task5SafeOutputs(void *context)
@@ -571,20 +676,24 @@ static void AppIntegration_UpdateTask5Activity(void)
     case TASK5_STATE_WAIT_DDS_RESULT:
       activity = APP_ACTIVITY_TASK5_SEARCHING;
       break;
+    case TASK5_STATE_WAIT_VISUAL_LOCK_ACK:
+    case TASK5_STATE_VISUAL_LOCKING:
     case TASK5_STATE_WAIT_STOP_ACK:
+      activity = APP_ACTIVITY_TASK5_LOCKING;
+      break;
     case TASK5_STATE_FREQUENCY_HOLD:
       activity = APP_ACTIVITY_TASK5_LOCKED;
-      if ((task5.session_id != 0U) &&
-          (task5.session_id != s_app.task5_beeped_session) &&
-          (TJC_SystemBeep(APP_TASK5_FOUND_BEEP_MS) == HAL_OK)) {
-        s_app.task5_beeped_session = task5.session_id;
-      }
       break;
     case TASK5_STATE_PHASE_LOCKING:
       activity = APP_ACTIVITY_TASK5_LOCKING;
       break;
     case TASK5_STATE_LOCKED:
       activity = APP_ACTIVITY_TASK5_LOCKED;
+      if ((task5.session_id != 0U) &&
+          (task5.session_id != s_app.task5_beeped_session) &&
+          (TJC_SystemBeep(APP_TASK5_FOUND_BEEP_MS) == HAL_OK)) {
+        s_app.task5_beeped_session = task5.session_id;
+      }
       break;
     case TASK5_STATE_ERROR:
       activity = APP_ACTIVITY_ERROR;
@@ -674,9 +783,14 @@ static void AppIntegration_Task5ErrorText(
           reason, reason_size, "OpenMV reported error");
       break;
     case TASK5_ERROR_IMAGE_RECOGNITION:
-      (void)snprintf(
-          reason, reason_size, "OpenMV image error 0x%02X",
-          (unsigned int)task5->last_openmv_result);
+      if (task5->error_origin_state == TASK5_STATE_VISUAL_LOCKING) {
+        (void)snprintf(
+            reason, reason_size, "visual telemetry timeout");
+      } else {
+        (void)snprintf(
+            reason, reason_size, "OpenMV image error 0x%02X",
+            (unsigned int)task5->last_openmv_result);
+      }
       break;
     case TASK5_ERROR_NONE:
     default:
@@ -726,11 +840,25 @@ static void AppIntegration_Task5Text(
           (unsigned int)task5->test_id,
           (unsigned int)task5->search_stage);
       break;
+    case TASK5_STATE_WAIT_VISUAL_LOCK_ACK:
+      (void)snprintf(
+          text, text_size, "visual fine-lock: wait ACK");
+      break;
+    case TASK5_STATE_VISUAL_LOCKING:
+      (void)snprintf(
+          text, text_size, "VIS %lu.%luHz d%u.%03uHz p%lu.%ludeg",
+          (unsigned long)(task5->visual_frequency_millihz / 1000UL),
+          (unsigned long)((task5->visual_frequency_millihz % 1000UL) /
+                          100UL),
+          (unsigned int)(task5->visual_speed_millihz / 1000U),
+          (unsigned int)(task5->visual_speed_millihz % 1000U),
+          (unsigned long)(task5->visual_phase_mdeg / 1000UL),
+          (unsigned long)((task5->visual_phase_mdeg % 1000UL) / 100UL));
+      break;
     case TASK5_STATE_WAIT_STOP_ACK:
       (void)snprintf(
-          text, text_size, "FOUND %s %luHz\rDDS HOLD / camera stop",
-          AppIntegration_Task5ModeText(task5->mode),
-          (unsigned long)task5->dds_frequency_hz);
+          text, text_size, "visual locked %s\rcamera stop / PLL handoff",
+          AppIntegration_Task5ModeText(task5->mode));
       break;
     case TASK5_STATE_FREQUENCY_HOLD:
       (void)snprintf(
@@ -854,6 +982,7 @@ HAL_StatusTypeDef AppIntegration_Init(ad9910_t *dds)
       .start_saw = AppIntegration_Task5StartSaw,
       .stop_saw = AppIntegration_Task5StopSaw,
       .set_dds_frequency = AppIntegration_Task5SetDDS,
+      .set_dds_tone = AppIntegration_Task5SetTone,
       .start_phase_lock = AppIntegration_Task5StartPhaseLock,
       .safe_outputs = AppIntegration_Task5SafeOutputs,
       .send_frame = AppIntegration_Task5SendFrame,
@@ -905,6 +1034,7 @@ void AppIntegration_Process(void)
 
   Task5_Process(&s_app.task5, HAL_GetTick());
   AppSaw_Process();
+  AppIntegration_ServiceVisualDither();
   PLL_Demo_Process();
   AppIntegration_UpdateLockActivity();
   AppIntegration_UpdateTask5Activity();

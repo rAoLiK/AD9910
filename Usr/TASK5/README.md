@@ -6,7 +6,8 @@
 |---|---|
 | `openmv_protocol.*` | 纯 C 帧编解码、CRC16/MODBUS、流式解析 |
 | `openmv_uart.*` | UART5 单字节中断、RX/TX 环形缓冲、主循环发布帧 |
-| `task5_controller.*` | Session/Test、ACK、重发、粗识别和 DDS 100 Hz 步进状态机 |
+| `task5_controller.*` | Session/Test、ACK、重发、粗识别、视觉锁频及本地 PLL 交接状态机 |
+| `visual_lock.*` | 纯 C 的 0.1 Hz 视觉 PI、方向试探/反转、±5 Hz 保护与直线对相 |
 | `app_saw.*` | PA4 DAC、TIM6 TRGO、DMA1 Stream5 的 100 点单增锯齿波 |
 
 执行路径：
@@ -25,7 +26,7 @@ main loop -> Task5_Process -> UART TX ring / DAC / DDS / TJC HMI port
 UART ISR 不解析协议、不执行 SPI、不做浮点搜索。DAC DMA 使用无完成中断
 的循环搬运，避免 10 kHz 锯齿波产生 10 kHz 的周期完成中断。
 
-Task5 的三个模式键在等待、通信、DDS 步进搜索、STOP 握手、DDS 保持和错误状态
+Task5 的三个模式键在等待、通信、DDS 步进搜索、视觉锁定、STOP 握手、本地锁相和错误状态
 下都可重新选择。重新选择时 `Task5_Start()` 先把旧 Session 的
 `STOP_TASK(reason=0x04)` 放入 UART5 TX 环，再以递增的新 Session ID
 排入 `START_TASK`；随后停止旧输出并按新选择重新启动 DAC。旧 Session
@@ -66,12 +67,22 @@ F407 发送一个新的 `DDS_TEST`。OpenMV 不判断频率偏高还是偏低；
 当前最多测试 41 个不同候选（非边界情况下覆盖 `origin ± 2000 Hz`）；同一
 候选的图像错误重试不占用这 41 个候选名额。
 
-收到 `TARGET_REACHED` 后，F407 ACK 该结果并以正常原因发送 `STOP_TASK`。
-从确认命中起就保持当前 DDS 频率不变且不会启动本地 PLL；STOP ACK 正常
-到达或相机停止握手重试耗尽后，都会收敛到成功保持状态。频率命中本身不
-依赖 STOP ACK，不会因为停止握手丢失而切回诊断锯齿波。若所配 TJC 屏
-支持蜂鸣命令，同时向屏幕发送
-`beep 500`，蜂鸣 0.5 s；不支持该命令的屏幕不能假定具有此提示能力。
+`TARGET_REACHED` 只表示进入精锁范围，不表示 Task5 已完成。F407 随即发送
+`VISUAL_LOCK_START`，所有模式都先以输入频率的一倍、正斜率直线为视觉目标。
+OpenMV 以最高可用帧率连续发送折叠相位、相位变化速度、质量和图形有效标志；
+遥测不要求 ACK，新帧可以覆盖丢失的旧帧，视觉锁定期间暂停 OLED 刷新。
+
+F407 先比较原频率、`+0.1 Hz` 和必要时的 `-0.1 Hz` 探针来确定调节方向，
+随后根据相位变化速度作 0.1 Hz 网格的 PI 调节。连续变差时恢复最佳点并反向；
+任何方向若将越过初始命中频率的 `±5 Hz`，立即恢复初始频率并反向。频率稳定
+后再调整 DDS 相位字，使图像收敛为一倍正斜率直线并连续稳定。
+
+由于 400 MHz 系统时钟下单个 AD9910 FTW 约为 0.093 Hz，应用层以 1 ms
+节拍在相邻两个 FTW 间作脉冲密度调制，使 0.1 Hz 指令获得正确的长期平均频率。
+视觉直线稳定后才发送 `STOP_TASK`；STOP ACK 正常到达或重试耗尽后都会立即
+按用户模式切换频率/相位目标并启动 STM32 本地 ADC+AD9910 PLL。二倍频模式
+只在此交接点把频率乘二。只有本地 PLL 报告最终锁定后才发送一次 `beep 500`，
+视觉命中、视觉直线锁定和 STOP 握手阶段均不响铃。
 
 视觉阈值必须在实际相机位置、曝光、示波器亮度和接线条件下，用“频率正确”、
 `+100 Hz`、`-100 Hz`、`+200 Hz`、`-200 Hz` 等多帧数据标定并留出验证集。
@@ -103,17 +114,19 @@ DAC 锯齿波频率。用户明确退出 Task5 时会尽力发送
 OpenMV 端联调协议见：
 
 ```text
-ref/Task5与OpenMV串口通信协议-最终版.md
+openmv/Task5与OpenMV串口通信协议-最终版.md
 ```
 
 ## Host regression checks
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -Werror -IUsr\TASK5 analysis\test_task5_controller.c Usr\TASK5\task5_controller.c Usr\TASK5\openmv_protocol.c -o build\host-tests\test_task5_controller.exe
+gcc -std=c11 -Wall -Wextra -Werror -IUsr\TASK5 analysis\test_visual_lock.c Usr\TASK5\visual_lock.c -lm -o build\host-tests\test_visual_lock.exe
+.\build\host-tests\test_visual_lock.exe
+gcc -std=c11 -Wall -Wextra -Werror -IUsr\TASK5 analysis\test_task5_controller.c Usr\TASK5\task5_controller.c Usr\TASK5\openmv_protocol.c Usr\TASK5\visual_lock.c -o build\host-tests\test_task5_controller.exe
 .\build\host-tests\test_task5_controller.exe
 python analysis\test_lissajous_stability.py
 ```
 
-第二条测试从 OpenMV 单文件的 AST 中只加载稳定判定器，并用合成掩膜验证
+最后一条测试从 OpenMV 单文件的 AST 中只加载稳定判定器，并用合成掩膜验证
 最小观察跨度、最新帧稳定、丢帧打断连续性以及 `IMAGE_ERROR` 回退；相机取图、
 阈值和实际李萨如图形仍必须在 N6 与真实示波器上验证。

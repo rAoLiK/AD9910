@@ -7,6 +7,7 @@ vector stub; image extraction itself remains an N6 hardware test.
 """
 
 import ast
+import math
 from pathlib import Path
 
 
@@ -48,12 +49,20 @@ class FakeFrame:
     def __init__(self, width, height):
         self._width = width
         self._height = height
+        self.drawn_strings = []
 
     def width(self):
         return self._width
 
     def height(self):
         return self._height
+
+    def draw_rectangle(self, *args, **kwargs):
+        del args, kwargs
+
+    def draw_string(self, position, value, **kwargs):
+        del position, kwargs
+        self.drawn_strings.append(value)
 
 
 def load_detector():
@@ -71,22 +80,36 @@ def load_detector():
                 for target in node.targets
                 if isinstance(target, ast.Name)
             ]
-            if any(name.startswith("DDS_") for name in names):
+            if any(
+                name.startswith("DDS_")
+                or name.startswith("VISUAL_")
+                or name.startswith("STATE_")
+                for name in names
+            ):
                 selected.append(node)
         elif (
             isinstance(node, ast.FunctionDef)
-            and node.name in ("_clamp", "_ticks_diff")
+            and node.name in (
+                "_clamp",
+                "_ticks_diff",
+                "clamp_int",
+                "annotate",
+            )
         ):
             selected.append(node)
         elif (
             isinstance(node, ast.ClassDef)
-            and node.name == "LissajousStabilityDetector"
+            and node.name in (
+                "FoldedPhaseSpeedTracker",
+                "LissajousStabilityDetector",
+            )
         ):
             selected.append(node)
 
     namespace = {
         "np": FakeNumpy,
         "time": FakeTime,
+        "math": math,
         "omv_image": type("ImageModule", (), {"BILINEAR": 0}),
     }
     module = ast.Module(body=selected, type_ignores=[])
@@ -132,6 +155,37 @@ def main():
     not_matched = namespace["DDS_RESULT_NOT_MATCHED"]
     image_error = namespace["DDS_RESULT_IMAGE_ERROR"]
     side = namespace["DDS_FEATURE_SIDE"]
+    tracker_type = namespace["FoldedPhaseSpeedTracker"]
+
+    class VisualController:
+        state = namespace["STATE_VISUAL_LOCK"]
+        visual_phase_mdeg = 123400
+        visual_speed_millihz = 567
+        last_rect = None
+
+    visual_frame = FakeFrame(320, 240)
+    namespace["annotate"](visual_frame, VisualController(), 24.5)
+    assert "VISUAL" in visual_frame.drawn_strings[0]
+    assert visual_frame.drawn_strings[1] == "VISUAL 1X LINE  STREAMING"
+    assert "P:123.4" in visual_frame.drawn_strings[2]
+    assert "D:0.57Hz" in visual_frame.drawn_strings[2]
+
+    tracker = tracker_type()
+    speeds = [
+        tracker.update(0.1 * index, 100 * index)
+        for index in range(6)
+    ]
+    assert speeds[-1] == 159
+
+    # One interval straddles the folded phase reflection and under-reports
+    # motion. The short median preserves the true surrounding speed.
+    tracker.reset()
+    reflected = [2.7, 2.9, 3.1, 3.0, 2.8, 2.6]
+    speeds = [
+        tracker.update(phase, 100 * index)
+        for index, phase in enumerate(reflected)
+    ]
+    assert speeds[-1] == 318
 
     class SyntheticDetector(base_type):
         def _extract_trace(self, frame):

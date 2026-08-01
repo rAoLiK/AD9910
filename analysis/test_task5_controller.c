@@ -27,7 +27,9 @@ typedef struct {
   uint32_t dds_frequency_hz;
   uint32_t dds_frequency_history[TEST_DDS_HISTORY_CAPACITY];
   uint32_t dds_set_count;
-  uint32_t seed_frequency_hz;
+  uint32_t dds_frequency_millihz;
+  int32_t dds_phase_offset_mdeg;
+  uint32_t seed_frequency_millihz;
   uint32_t saw_start_count;
   task5_lock_mode_t lock_mode;
   bool saw_running;
@@ -62,13 +64,24 @@ static bool fake_set_dds(void *context, uint32_t frequency_hz)
   return true;
 }
 
+static bool fake_set_tone(void *context,
+                          uint32_t frequency_millihz,
+                          int32_t phase_offset_mdeg)
+{
+  fake_port_t *fake = context;
+
+  fake->dds_frequency_millihz = frequency_millihz;
+  fake->dds_phase_offset_mdeg = phase_offset_mdeg;
+  return true;
+}
+
 static bool fake_start_lock(void *context,
                             task5_lock_mode_t mode,
-                            uint32_t seed_frequency_hz)
+                            uint32_t seed_frequency_millihz)
 {
   fake_port_t *fake = context;
   fake->lock_mode = mode;
-  fake->seed_frequency_hz = seed_frequency_hz;
+  fake->seed_frequency_millihz = seed_frequency_millihz;
   fake->phase_started = true;
   return true;
 }
@@ -123,6 +136,7 @@ static task5_port_t make_port(fake_port_t *fake)
       .start_saw = fake_start_saw,
       .stop_saw = fake_stop_saw,
       .set_dds_frequency = fake_set_dds,
+      .set_dds_tone = fake_set_tone,
       .start_phase_lock = fake_start_lock,
       .safe_outputs = fake_safe,
       .send_frame = fake_send,
@@ -223,6 +237,44 @@ static void finish_dds_test(
   finish_dds_test_with_quality(
       controller, fake, result, 900U, 95U,
       result_seq, now_ms);
+}
+
+static void finish_visual_line_lock(task5_controller_t *controller,
+                                    fake_port_t *fake,
+                                    uint32_t *now_ms)
+{
+  task5_status_t status;
+  openmv_frame_t frame;
+  uint16_t sample_id;
+
+  assert(fake->type == OPENMV_MSG_VISUAL_LOCK_START);
+  assert(fake->length == 7U);
+  frame = ack_for(fake);
+  *now_ms += 1U;
+  Task5_OnFrame(controller, &frame, *now_ms);
+  Task5_GetStatus(controller, &status);
+  assert(status.state == TASK5_STATE_VISUAL_LOCKING);
+
+  for (sample_id = 1U; sample_id <= 12U; sample_id++) {
+    memset(&frame, 0, sizeof(frame));
+    frame.version = OPENMV_PROTOCOL_VERSION;
+    frame.type = OPENMV_MSG_VISUAL_LOCK_SAMPLE;
+    frame.seq = (uint8_t)(0xD0U + sample_id);
+    frame.length = 16U;
+    OpenMV_WriteU16LE(&frame.payload[0], status.session_id);
+    OpenMV_WriteU16LE(&frame.payload[2], sample_id);
+    OpenMV_WriteU32LE(&frame.payload[4], (uint32_t)sample_id * 40UL);
+    OpenMV_WriteU32LE(&frame.payload[8], 0UL);
+    OpenMV_WriteU16LE(&frame.payload[12], 0U);
+    frame.payload[14] = 95U;
+    frame.payload[15] = VISUAL_LOCK_SAMPLE_PHASE_VALID |
+                        VISUAL_LOCK_SAMPLE_FAMILY_VALID;
+    *now_ms += 40U;
+    Task5_OnFrame(controller, &frame, *now_ms);
+  }
+  Task5_GetStatus(controller, &status);
+  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
+  assert(fake->type == OPENMV_MSG_STOP_TASK);
 }
 
 static void assert_frequency_history(
@@ -353,7 +405,7 @@ static void test_boundary_candidates_are_unique_100_hz_grid(void)
   exercise_boundary_search(
       TASK5_MODE_LINE_0_DEG, 149U, 100U);
   exercise_boundary_search(
-      TASK5_MODE_INFINITY_2X_0_DEG, 100000U, 200000U);
+      TASK5_MODE_INFINITY_2X_0_DEG, 100000U, 100000U);
 }
 
 static void test_high_flat_scan_selects_best_without_confirmation(void)
@@ -374,14 +426,14 @@ static void test_high_flat_scan_selects_best_without_confirmation(void)
   }
 
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
+  assert(status.state == TASK5_STATE_WAIT_VISUAL_LOCK_ACK);
   assert(status.last_error == TASK5_ERROR_NONE);
   assert(status.search_stage == 0x02U);
   assert(status.search_restart_count == 0U);
   assert(status.search_count == 29U);
   assert(fake.dds_frequency_hz == 100000U);
   assert(fake.dds_set_count == 29U);
-  assert(fake.type == OPENMV_MSG_STOP_TASK);
+  assert(fake.type == OPENMV_MSG_VISUAL_LOCK_START);
   assert(!fake.saw_running);
 }
 
@@ -446,8 +498,8 @@ static void test_low_search_holds_local_quality_peak(void)
       &controller, &fake, TEST_DDS_NOT_MATCHED,
       700U, 100U, 0x70U, &now_ms);
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
-  assert(fake.type == OPENMV_MSG_STOP_TASK);
+  assert(status.state == TASK5_STATE_WAIT_VISUAL_LOCK_ACK);
+  assert(fake.type == OPENMV_MSG_VISUAL_LOCK_START);
   assert(fake.dds_frequency_hz == 5300U);
   assert(!fake.saw_running);
 }
@@ -595,7 +647,6 @@ static void test_high_full_scan_holds_best_without_confirmation(void)
   fake_port_t fake = {0};
   task5_controller_t controller;
   task5_status_t status;
-  openmv_frame_t frame;
   uint32_t now_ms;
   uint32_t index;
 
@@ -632,20 +683,16 @@ static void test_high_full_scan_holds_best_without_confirmation(void)
   }
 
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
+  assert(status.state == TASK5_STATE_WAIT_VISUAL_LOCK_ACK);
   assert(status.search_stage == 0x02U);
   assert(status.last_error == TASK5_ERROR_NONE);
   assert(controller.fine_best_frequency_hz == 50200U);
-  assert(fake.type == OPENMV_MSG_STOP_TASK);
+  assert(fake.type == OPENMV_MSG_VISUAL_LOCK_START);
   assert(fake.dds_frequency_hz == 50200U);
   assert(fake.dds_set_count == 17U);
   assert(status.test_id == 16U);
 
-  frame = ack_for(&fake);
-  Task5_OnFrame(&controller, &frame, now_ms + 1U);
-  Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_FREQUENCY_HOLD);
-  assert(status.dds_frequency_hz == 50200U);
+  assert(status.visual_frequency_millihz == 50200000UL);
 }
 
 static void test_image_error_retries_forever_without_output_change(void)
@@ -722,6 +769,7 @@ static void test_complete_success_flow(void)
       .start_saw = fake_start_saw,
       .stop_saw = fake_stop_saw,
       .set_dds_frequency = fake_set_dds,
+      .set_dds_tone = fake_set_tone,
       .start_phase_lock = fake_start_lock,
       .safe_outputs = fake_safe,
       .send_frame = fake_send,
@@ -729,6 +777,7 @@ static void test_complete_success_flow(void)
   };
   openmv_frame_t frame;
   uint8_t result_seq;
+  uint32_t now_ms;
 
   assert(Task5_Init(&controller, &port));
   Task5_Enter(&controller);
@@ -778,24 +827,29 @@ static void test_complete_success_flow(void)
   frame.payload[7] = 95U;
   result_seq = frame.seq;
   Task5_OnFrame(&controller, &frame, 250U);
-  assert(fake.type == OPENMV_MSG_STOP_TASK);
+  assert(fake.type == OPENMV_MSG_VISUAL_LOCK_START);
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
+  assert(status.state == TASK5_STATE_WAIT_VISUAL_LOCK_ACK);
 
+  now_ms = 250U;
+  finish_visual_line_lock(&controller, &fake, &now_ms);
   frame = ack_for(&fake);
-  Task5_OnFrame(&controller, &frame, 260U);
-  assert(!fake.phase_started);
+  Task5_OnFrame(&controller, &frame, now_ms + 1U);
+  assert(fake.phase_started);
   assert(fake.dds_frequency_hz == 5200U);
   assert(fake.dds_set_count == 1U);
+  assert(fake.seed_frequency_millihz == 5200000UL);
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_PHASE_LOCKING);
   Task5_NotifyPhaseLock(&controller, true, false);
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_FREQUENCY_HOLD);
+  assert(status.state == TASK5_STATE_LOCKED);
   assert(status.dds_frequency_hz == 5200U);
   Task5_Process(&controller, 1260U);
   assert(fake.dds_frequency_hz == 5200U);
   assert(fake.dds_set_count == 1U);
 
-  /* A duplicated result is ACKed but must not leave frequency hold. */
+  /* A duplicated search result is ACKed but must not leave final lock. */
   memset(&frame, 0, sizeof(frame));
   frame.version = OPENMV_PROTOCOL_VERSION;
   frame.type = OPENMV_MSG_DDS_TEST_RESULT;
@@ -806,14 +860,14 @@ static void test_complete_success_flow(void)
   frame.payload[4] = TEST_DDS_TARGET_REACHED;
   Task5_OnFrame(&controller, &frame, 270U);
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_FREQUENCY_HOLD);
+  assert(status.state == TASK5_STATE_LOCKED);
   assert(status.duplicate_result_count == 1U);
-  assert(!fake.phase_started);
+  assert(fake.phase_started);
   assert(fake.dds_frequency_hz == 5200U);
   assert(fake.dds_set_count == 1U);
 }
 
-static void test_lost_stop_ack_still_holds_frequency(void)
+static void test_lost_stop_ack_still_starts_phase_lock(void)
 {
   fake_port_t fake = {0};
   task5_controller_t controller;
@@ -827,24 +881,57 @@ static void test_lost_stop_ack_still_holds_frequency(void)
   finish_dds_test(
       &controller, &fake, TEST_DDS_TARGET_REACHED,
       0x47U, &now_ms);
+  finish_visual_line_lock(&controller, &fake, &now_ms);
   Task5_GetStatus(&controller, &status);
   assert(status.state == TASK5_STATE_WAIT_STOP_ACK);
   assert(fake.dds_frequency_hz == 5200U);
 
-  /* Drop every STOP ACK. Reliable cleanup exhausts its retries, but the
-   * already established TARGET result must remain a successful hold. */
+  /* Drop every STOP ACK. Visual lock is already established, so cleanup
+   * exhaustion must still hand off to the local phase loop. */
   for (retry = 0U; retry < 4U; retry++) {
     now_ms += 100U;
     Task5_Process(&controller, now_ms);
   }
 
   Task5_GetStatus(&controller, &status);
-  assert(status.state == TASK5_STATE_FREQUENCY_HOLD);
+  assert(status.state == TASK5_STATE_PHASE_LOCKING);
   assert(status.last_error == TASK5_ERROR_NONE);
-  assert(!fake.phase_started);
+  assert(fake.phase_started);
+  assert(fake.seed_frequency_millihz == 5200000UL);
   assert(!fake.saw_running);
   assert(fake.dds_frequency_hz == 5200U);
   assert(fake.dds_set_count == 1U);
+}
+
+static void test_infinity_handoff_doubles_only_after_visual_lock(void)
+{
+  fake_port_t fake = {0};
+  task5_controller_t controller;
+  task5_status_t status;
+  openmv_frame_t frame;
+  uint32_t now_ms;
+
+  now_ms = begin_frequency_search(
+      &controller, &fake, TASK5_MODE_INFINITY_2X_0_DEG,
+      1000U, 5200U);
+  assert(fake.dds_frequency_hz == 5200U);
+
+  finish_dds_test(
+      &controller, &fake, TEST_DDS_TARGET_REACHED,
+      0x48U, &now_ms);
+  assert(fake.type == OPENMV_MSG_VISUAL_LOCK_START);
+  assert(OpenMV_ReadU32LE(&fake.payload[2]) == 5200000UL);
+
+  finish_visual_line_lock(&controller, &fake, &now_ms);
+  frame = ack_for(&fake);
+  Task5_OnFrame(&controller, &frame, now_ms + 1U);
+
+  Task5_GetStatus(&controller, &status);
+  assert(status.state == TASK5_STATE_PHASE_LOCKING);
+  assert(fake.phase_started);
+  assert(fake.lock_mode == TASK5_MODE_INFINITY_2X_0_DEG);
+  assert(fake.seed_frequency_millihz == 10400000UL);
+  assert(status.dds_frequency_hz == 10400U);
 }
 
 static void test_ack_retry_keeps_sequence(void)
@@ -852,7 +939,7 @@ static void test_ack_retry_keeps_sequence(void)
   fake_port_t fake = {0};
   task5_controller_t controller;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
   uint8_t first_seq;
 
@@ -873,7 +960,7 @@ static void test_coarse_wait_has_no_hard_timeout(void)
   task5_controller_t controller;
   task5_status_t status;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
   openmv_frame_t frame;
   uint32_t now_ms;
@@ -906,7 +993,7 @@ static void test_bad_coarse_result_restarts_instead_of_error(void)
   task5_status_t before;
   task5_status_t after;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
   openmv_frame_t frame;
 
@@ -951,7 +1038,7 @@ static void test_ack_timeout_keeps_dac_running(void)
   task5_controller_t controller;
   task5_status_t status;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
 
   assert(Task5_Init(&controller, &port));
@@ -984,7 +1071,7 @@ static void test_active_session_can_be_reselected(void)
   uint8_t old_start_seq;
   uint16_t old_session_id;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
 
   assert(Task5_Init(&controller, &port));
@@ -1059,7 +1146,7 @@ static void test_uart_send_failure_becomes_visible_error(void)
   task5_controller_t controller;
   task5_status_t status;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
 
   fake.send_fails = true;
@@ -1089,7 +1176,7 @@ static void test_uart_retry_failure_becomes_visible_error(void)
   task5_controller_t controller;
   task5_status_t status;
   task5_port_t port = {
-      fake_start_saw, fake_stop_saw, fake_set_dds,
+      fake_start_saw, fake_stop_saw, fake_set_dds, fake_set_tone,
       fake_start_lock, fake_safe, fake_send, &fake};
 
   assert(Task5_Init(&controller, &port));
@@ -1130,7 +1217,8 @@ int main(void)
   test_image_error_retries_forever_without_output_change();
   test_high_image_error_never_changes_output_or_errors();
   test_complete_success_flow();
-  test_lost_stop_ack_still_holds_frequency();
+  test_lost_stop_ack_still_starts_phase_lock();
+  test_infinity_handoff_doubles_only_after_visual_lock();
   test_ack_retry_keeps_sequence();
   test_coarse_wait_has_no_hard_timeout();
   test_bad_coarse_result_restarts_instead_of_error();

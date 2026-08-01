@@ -2,6 +2,7 @@
 #define TASK5_CONTROLLER_H
 
 #include "openmv_protocol.h"
+#include "visual_lock.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,6 +25,8 @@ typedef enum {
   TASK5_STATE_DDS_SETTLING,
   TASK5_STATE_WAIT_DDS_ACK,
   TASK5_STATE_WAIT_DDS_RESULT,
+  TASK5_STATE_WAIT_VISUAL_LOCK_ACK,
+  TASK5_STATE_VISUAL_LOCKING,
   TASK5_STATE_WAIT_STOP_ACK,
   TASK5_STATE_FREQUENCY_HOLD,
   TASK5_STATE_PHASE_LOCKING,
@@ -51,9 +54,12 @@ typedef struct {
   bool (*start_saw)(void *context, uint32_t frequency_hz);
   void (*stop_saw)(void *context);
   bool (*set_dds_frequency)(void *context, uint32_t frequency_hz);
+  bool (*set_dds_tone)(void *context,
+                       uint32_t frequency_millihz,
+                       int32_t phase_offset_mdeg);
   bool (*start_phase_lock)(void *context,
                            task5_lock_mode_t mode,
-                           uint32_t seed_frequency_hz);
+                           uint32_t seed_frequency_millihz);
   void (*safe_outputs)(void *context);
   bool (*send_frame)(void *context,
                      uint8_t type,
@@ -73,6 +79,14 @@ typedef struct {
   uint32_t saw_frequency_hz;
   uint32_t estimated_input_frequency_hz;
   uint32_t dds_frequency_hz;
+  uint32_t visual_frequency_millihz;
+  int32_t visual_phase_offset_mdeg;
+  uint32_t visual_phase_mdeg;
+  uint16_t visual_speed_millihz;
+  uint8_t visual_quality;
+  int8_t visual_frequency_direction;
+  uint8_t visual_direction_reversals;
+  uint8_t visual_boundary_reversals;
   uint8_t search_stage;
   uint8_t last_openmv_result;
   uint8_t last_nack_code;
@@ -128,6 +142,9 @@ typedef struct {
   uint32_t search_step_hz;
   uint32_t search_lower_hz;
   uint32_t search_upper_hz;
+  visual_lock_controller_t visual_lock;
+  uint16_t last_visual_sample_id;
+  bool visual_sample_valid;
   uint8_t undirected_attempt;
   uint8_t image_retry_count;
   bool high_frequency_search;
@@ -160,6 +177,7 @@ void Task5_OnFrame(task5_controller_t *controller,
 void Task5_NotifyPhaseLock(task5_controller_t *controller,
                            bool locked,
                            bool error);
+void Task5_NotifyDDSError(task5_controller_t *controller);
 void Task5_GetStatus(const task5_controller_t *controller,
                      task5_status_t *status);
 

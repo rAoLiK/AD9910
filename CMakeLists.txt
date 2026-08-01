@@ -61,6 +61,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/openmv_protocol.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/openmv_uart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/app_saw.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/visual_lock.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Usr/TASK5/task5_controller.c
 )
 
