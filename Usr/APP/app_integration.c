@@ -691,7 +691,7 @@ static void AppIntegration_Task5ErrorText(
       (void)snprintf(reason, reason_size, "DAC start failed");
       break;
     case TASK5_ERROR_UART_SEND:
-      (void)snprintf(reason, reason_size, "UART5 TX failed");
+      (void)snprintf(reason, reason_size, "USART2 TX failed");
       break;
     case TASK5_ERROR_ACK_TIMEOUT:
       (void)snprintf(

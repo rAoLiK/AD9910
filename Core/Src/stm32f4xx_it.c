@@ -58,7 +58,7 @@
 extern DMA_HandleTypeDef hdma_adc1;
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
-extern UART_HandleTypeDef huart5;
+extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart6;
 /* USER CODE BEGIN EV */
 
@@ -232,11 +232,11 @@ void USART6_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles UART5 global interrupt.
+  * @brief This function handles USART2 global interrupt.
   */
-void UART5_IRQHandler(void)
+void USART2_IRQHandler(void)
 {
-  HAL_UART_IRQHandler(&huart5);
+  HAL_UART_IRQHandler(&huart2);
 }
 
 /**

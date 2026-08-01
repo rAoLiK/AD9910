@@ -60,7 +60,7 @@ static void OpenMV_UART_KickTx(void)
 
   if (start &&
       (HAL_UART_Transmit_IT(
-           &huart5, &s_openmv_uart.tx_byte, 1U) != HAL_OK)) {
+           &huart2, &s_openmv_uart.tx_byte, 1U) != HAL_OK)) {
     primask = OpenMV_UART_EnterCritical();
     s_openmv_uart.tx_active = false;
     s_openmv_uart.diagnostics.tx_start_error_count++;
@@ -78,7 +78,7 @@ HAL_StatusTypeDef OpenMV_UART_Init(
   s_openmv_uart.handler_context = context;
 
   if (HAL_UART_Receive_IT(
-          &huart5, &s_openmv_uart.rx_byte, 1U) != HAL_OK) {
+          &huart2, &s_openmv_uart.rx_byte, 1U) != HAL_OK) {
     s_openmv_uart.diagnostics.rx_restart_error_count++;
     return HAL_ERROR;
   }
@@ -176,7 +176,7 @@ bool OpenMV_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   uint16_t next;
 
-  if ((huart == NULL) || (huart->Instance != UART5)) {
+  if ((huart == NULL) || (huart->Instance != USART2)) {
     return false;
   }
 
@@ -192,7 +192,7 @@ bool OpenMV_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   }
 
   if (HAL_UART_Receive_IT(
-          &huart5, &s_openmv_uart.rx_byte, 1U) != HAL_OK) {
+          &huart2, &s_openmv_uart.rx_byte, 1U) != HAL_OK) {
     s_openmv_uart.diagnostics.rx_restart_error_count++;
   }
   return true;
@@ -200,7 +200,7 @@ bool OpenMV_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 bool OpenMV_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if ((huart == NULL) || (huart->Instance != UART5)) {
+  if ((huart == NULL) || (huart->Instance != USART2)) {
     return false;
   }
 
@@ -218,7 +218,7 @@ bool OpenMV_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 bool OpenMV_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if ((huart == NULL) || (huart->Instance != UART5)) {
+  if ((huart == NULL) || (huart->Instance != USART2)) {
     return false;
   }
 
@@ -226,7 +226,7 @@ bool OpenMV_UART_ErrorCallback(UART_HandleTypeDef *huart)
   s_openmv_uart.tx_active = false;
   (void)HAL_UART_AbortReceive(huart);
   if (HAL_UART_Receive_IT(
-          &huart5, &s_openmv_uart.rx_byte, 1U) != HAL_OK) {
+          &huart2, &s_openmv_uart.rx_byte, 1U) != HAL_OK) {
     s_openmv_uart.diagnostics.rx_restart_error_count++;
   }
   OpenMV_UART_KickTx();

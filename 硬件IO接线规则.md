@@ -30,7 +30,7 @@
 | Task5 信号源选择 | `PE0` | DDS/DAC 模拟选择器的 SEL | 输出 | 高=DDS，低=PA4 DAC |
 | Task5 按键 | `PA0/PB9/PB8` | 三枚无源按键 | 输入 | PA0 按下接 3.3 V；PB9/PB8 按下接 GND |
 | TJC 串口屏 | `PC6/PC7 / USART6` | 屏幕 RX/TX | 双向 | 115200、8N1、交叉连接、共地 |
-| OpenMV 通信 | `PC12/PD2 / UART5` | OpenMV `P13/P14 / UART7` | 双向 | 115200、8N1、交叉连接、共地 |
+| OpenMV 通信 | `PA2/PA3 / USART2` | OpenMV `P13/P14 / UART7` | 双向 | 115200、8N1、交叉连接、共地 |
 | OpenMV OLED | OpenMV `P7/P8` | SSD1309 `SCL/SDA` | 双向 | 软件 I2C，100 kHz，地址 0x3C，拉到 3.3 V |
 | SWD 调试 | `PA13/PA14` | ST-Link `SWDIO/SWCLK` | 双向 | 另接 GND、VTref，建议接 NRST |
 | STM32 主时钟 | `PH0/PH1` | 8 MHz HSE 晶体网络 | 时钟 | 当前代码为晶体模式 `HSE_ON`，不是旁路时钟模式 |
@@ -55,8 +55,8 @@
 | `PC0` | 模拟输入 | `ADC1_IN10`，参考输入采样 | 0～3.3 V | 接信号源调理通道输出 |
 | `PC1` | 模拟输入 | `ADC2_IN11`，DDS 反馈采样 | 0～3.3 V | 接 AD9910 反馈调理通道输出 |
 | `PA4` | 模拟输出 | `DAC_OUT1`，Task5 锯齿波 | 0～3.3 V 标称域 | 接 Task5 模拟选择器的 DAC 输入 |
-| `PC12` | AF8 推挽输出 | `UART5_TX` | 115200 8N1 | 接 OpenMV `P13 / UART7_RX` |
-| `PD2` | AF8 输入 | `UART5_RX` | 115200 8N1 | 接 OpenMV `P14 / UART7_TX` |
+| `PA2` | AF7 推挽输出 | `USART2_TX` | 115200 8N1 | 接 OpenMV `P13 / UART7_RX` |
+| `PA3` | AF7 输入 | `USART2_RX` | 115200 8N1 | 接 OpenMV `P14 / UART7_TX` |
 | `PC6` | AF8 推挽输出 | `USART6_TX` | 115200 8N1 | 接 TJC 屏 `RX` |
 | `PC7` | AF8 输入 | `USART6_RX` | 115200 8N1 | 接 TJC 屏 `TX`；若屏幕 TX 为 5 V，必须电平转换 |
 | `PA13` | SWD | `SWDIO` | 调试接口 | 接 ST-Link `SWDIO`，不要复用为普通 IO |
@@ -197,11 +197,11 @@ STM32 GND              ──────  TJC GND
 - 屏幕电源按具体型号额定值供电，不要默认由 STM32 3.3 V 引脚供电。
 - 当前蜂鸣提示通过 TJC 串口命令 `beep 500` 使用屏幕内部蜂鸣器，工程没有独立的 STM32 蜂鸣器 IO。
 
-### 8.2 OpenMV N6：UART5 ↔ UART7
+### 8.2 OpenMV N6：USART2 ↔ UART7
 
 ```text
-STM32 PC12 / UART5_TX  ─────>  OpenMV P13 / UART7_RX
-STM32 PD2  / UART5_RX  <─────  OpenMV P14 / UART7_TX
+STM32 PA2 / USART2_TX  ─────>  OpenMV P13 / UART7_RX
+STM32 PA3 / USART2_RX  <─────  OpenMV P14 / UART7_TX
 STM32 GND               ─────  OpenMV GND
 ```
 
@@ -297,7 +297,7 @@ Task5 的 OpenMV 识别依赖示波器 XY 绘图。推荐验收连接为：
 3. `PC0/PC1` 静态约为 1.65 V，动态峰值始终位于 0～3.3 V。
 4. AD9910 `PROFILE0/1/2` 全部可靠接地，`CS/RESET/IO_UPDATE/SCLK/SDIO` 未接错。
 5. AD9910 实际参考时钟确为 40 MHz，输出端具备正确的 50 Ω/变压器/滤波网络。
-6. UART 已交叉：PC6→TJC RX、PC7←TJC TX；PC12→OpenMV P13、PD2←OpenMV P14。
+6. UART 已交叉：PC6→TJC RX、PC7←TJC TX；PA2→OpenMV P13、PA3←OpenMV P14。
 7. OLED 使用 P7=SCL、P8=SDA、地址 0x3C，I2C 上拉接 3.3 V。
 8. PA0 按键接 3.3 V；PB9、PB8 按键接地；三者都没有外接 5 V。
 9. PE0、PE1 只接逻辑控制端，继电器线圈有独立驱动和感性负载保护。

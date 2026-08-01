@@ -6,12 +6,12 @@
 
 ## 1. 硬件与串口参数
 
-### 1.1 UART5 接线
+### 1.1 USART2 接线
 
 | STM32F407 引脚 | 功能 | 连接 OpenMV |
 |---|---|---|
-| `PC12` | `UART5_TX` | OpenMV 的 UART RX |
-| `PD2` | `UART5_RX` | OpenMV 的 UART TX |
+| `PA2` | `USART2_TX` | OpenMV 的 UART RX |
+| `PA3` | `USART2_RX` | OpenMV 的 UART TX |
 | `GND` | 信号地 | OpenMV GND |
 
 双方均使用 3.3 V TTL 电平，必须共地。TX 与 RX 交叉连接，不能把
@@ -26,7 +26,7 @@ STM32 TX 接到 OpenMV TX。
 | 流控 | 无 |
 | 字节序 | 多字节整数均为小端序 |
 
-USART6 已被 TJC 串口屏占用；OpenMV 仍只使用 UART5。
+USART6 已被 TJC 串口屏占用；OpenMV 只使用 USART2。
 
 ### 1.2 锯齿波输出
 
@@ -419,8 +419,8 @@ OpenMV 收到后应停止当前识别、清除本 Session 的运行态、返回 
 锁定。
 
 用户在 Task5 运行中重新选择模式时，STM32 将旧 Session 的
-`STOP_TASK(reason=0x04)` 作为尽力发送帧排入 UART5 TX 环，随后立即用
-递增的新 Session ID 排入 `START_TASK`，不等待旧 STOP 的 ACK。UART5
+`STOP_TASK(reason=0x04)` 作为尽力发送帧排入 USART2 TX 环，随后立即用
+递增的新 Session ID 排入 `START_TASK`，不等待旧 STOP 的 ACK。USART2
 保证两个完整帧按 STOP、START 的顺序发出。OpenMV 必须按接收顺序处理：
 先 ACK STOP、清理旧 Session 并回到 IDLE，再 ACK START 并启动新
 Session。STM32 会忽略旧 Session 迟到的 ACK、NACK 和识别结果。
@@ -467,14 +467,14 @@ STM32                                      OpenMV
 等待结果超时时，STM32 不是创建新命令，而是重放原 START_TASK 或
 DDS_TEST，TYPE、SEQ、Session ID、Test ID 和 Payload 全部保持不变。
 
-UART5 发送队列在首次发送或 ACK 重发阶段持续失败时，也按 100 ms 间隔
-有限重试；累计 4 次发送尝试仍失败后进入 `UART5 TX failed` 错误态。
+USART2 发送队列在首次发送或 ACK 重发阶段持续失败时，也按 100 ms 间隔
+有限重试；累计 4 次发送尝试仍失败后进入 `USART2 TX failed` 错误态。
 
 ### 14.1 STM32 错误锁存与现场显示
 
 下列故障不会使 STM32 自动离开 Task5 页面：
 
-- UART5 发送持续失败；
+- USART2 发送持续失败；
 - START_TASK、DDS_TEST 或 STOP_TASK 的 ACK 超时；
 - COARSE_RESULT 或 DDS_TEST_RESULT 超时；
 - OpenMV 返回 NACK、非法/失败结果或 `ERROR_REPORT`；
@@ -496,9 +496,9 @@ RX<合法帧数> CRC<CRC错误数> U<UART硬件错误数>
 ```
 
 `RX=0, CRC=0, U=0` 且出现 START ACK 超时时，通常表示 STM32 没有收到
-任何完整帧，应优先检查 UART5 交叉接线、共地、115200 8N1 以及 OpenMV
+任何完整帧，应优先检查 USART2 交叉接线、共地、115200 8N1 以及 OpenMV
 所用 UART 实例。`CRC` 增长表示已有字节到达但帧校验失败；`U` 增长表示
-STM32 UART5 发生硬件错误。
+STM32 USART2 发生硬件错误。
 
 OpenMV 对重复命令的处理：
 

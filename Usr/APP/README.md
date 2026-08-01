@@ -3,7 +3,7 @@
 ## 1. 集成结果
 
 本目录把题目任务、串口屏输入、板级继电器/按键和原有锁相模块组合为
-一个非阻塞应用状态机。USART6 只服务 TJC 串口屏，UART5 只服务
+一个非阻塞应用状态机。USART6 只服务 TJC 串口屏，USART2 只服务
 OpenMV；原 `pll_demo.c` 中的 ASCII CLI 已移除。锁相计算与 Task5
 协议状态转换只在主循环执行，ADC/DMA、UART 和按键 ISR 只发布固定
 大小事件或搬运一个字节。
@@ -24,7 +24,7 @@ while (1) {
 | `app_hmi_map.h/.c` | 页面/控件/触发沿到逻辑命令的表驱动映射 |
 | `app_board.h/.c` | PE1 输出通路、PE0 DDS/DAC 选择、PA0/PB9/PB8 按键、EXTI 和安全输出 |
 | `app_integration.h/.c` | 装配 PLL、TJC、板级端口，调度主循环并集中转发 UART 回调 |
-| `../TASK5/*` | UART5 OpenMV 协议、Task5 状态机及 PA4 DAC 锯齿波 |
+| `../TASK5/*` | USART2 OpenMV 协议、Task5 状态机及 PA4 DAC 锯齿波 |
 | `../PLL/pll_demo.*` | 非阻塞锁相服务及 ADC ISR 入口 |
 | `../SCREEN_TJC/*` | USART6 传输、协议解析和控件命令 |
 
@@ -33,7 +33,7 @@ while (1) {
 ```text
 TJC UART ISR -> RX 字节环 -> 主循环协议解析 -> HMI 映射 -> 逻辑命令队列
 按键 EXTI ISR -> 饱和计数器 -> 短按/长按判定 ----------^
-UART5 ISR -> RX 字节环 -> OpenMV 帧解析 -> Task5 状态机
+USART2 ISR -> RX 字节环 -> OpenMV 帧解析 -> Task5 状态机
 主循环 -> app_core -> board/PLL 端口 -> PLL_Demo_Process
 ADC DMA ISR -> 半缓冲就绪位 -----------> PLL_Demo_Process
 app_core 状态 -> HMI 语义渲染 -> 非阻塞 UART TX 环
@@ -150,7 +150,7 @@ ADC2 在放大器前，因此它只用于频率/相位反馈，不能验证放�
 | PB9 | Task5 圆，按下接地，内部上拉，EXTI 下降沿 |
 | PB8 | Task5 ∞，按下接地，内部上拉，EXTI 下降沿 |
 | USART6 PC6/PC7 | TJC，115200 8N1，逐字节 RX/TX 中断 |
-| UART5 PC12/PD2 | OpenMV TX/RX，115200 8N1，逐字节中断和环形缓冲 |
+| USART2 PA2/PA3 | OpenMV TX/RX，115200 8N1，逐字节中断和环形缓冲 |
 | PA4 | DAC_OUT1，Task5 单调递增锯齿波 |
 | TIM6/DMA1 Stream5 | 100 点锯齿波触发与循环搬运 |
 | DMA2 Stream0 | ADC1/ADC2 双重模式采样，保持原分配 |
@@ -259,7 +259,7 @@ RAM:   27,168 bytes
    长按至少 400 ms 输出 10 kHz。进入任一 Task5 运行/锁定/错误状态后，
    再次短按或长按另一个模式键，确认旧 Session 被停止并进入新模式；
    Task1–4 页面按键无作用。
-8. 断开 UART5 或让 OpenMV 不应答，确认仍停留在 Task5 页面，屏幕显示
+8. 断开 USART2 或让 OpenMV 不应答，确认仍停留在 Task5 页面，屏幕显示
    具体错误以及 `RX/CRC/U` 计数，PE0 为低且所选满码域 DAC 锯齿波持续。
 9. 绝对频率确认后检查 DDS 直接呈现所选图像，所有视觉纠偏均在目标输出
    `±5 Hz` 内；锁定后让源频率小幅漂移，确认能原地重捕获且不退出。
@@ -267,7 +267,7 @@ RAM:   27,168 bytes
 11. 用户退出 Task5 后回到直通安全态，DAC、DDS 和 ADC 停止。
 12. 检查 TJC 与 OpenMV 的 RX/TX/CRC/队列诊断计数不异常增长。
 
-Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
+Task5 已实现 USART2 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
 去重、粗识别、DDS 测试搜索以及命中后向本地相位锁定的交接。OpenMV
 端必须按 `ref/Task5与OpenMV串口通信协议-最终版.md` 实现对应状态机。
 声光提示不在本工程现有硬件范围内。
@@ -297,7 +297,7 @@ Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
   STM32F42xxx/F43xxx，Device ID `0x419`，连接电压 3.24 V。
 - 旧固件现场捕获到 `START_TASK ACK timeout`：ACK 已重发 3 次，
   OpenMV 合法帧、CRC 错误、UART 硬件错误和 TX 队列错误均为 0。
-- 新固件主动发送的 9 字节 HEARTBEAT 已全部离开 UART5 TX 环并完成
+- 新固件主动发送的 9 字节 HEARTBEAT 已全部离开 USART2 TX 环并完成
   发送中断，但 OpenMV 未回 ACK；故障边界位于 STM32 UART5_TX 之后、
   OpenMV 回传之前。
 - 新固件板上复现无 ACK 后保持 `TASK5 + ERROR`；实测 PE0 为低，

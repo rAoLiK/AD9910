@@ -58,7 +58,7 @@ Task5 主路径不启动本地 ADC PLL。`LOCK_HOLD` 不是静态等待状态：
 
 ## 联调顺序
 
-1. 核对 UART7/UART5 交叉接线、共地和 `115200 8N1`；
+1. 核对 UART7/USART2 交叉接线、共地和 `115200 8N1`；
 2. 确认双方 `VER=0x02`；
 3. 不接外部信号按模式键，确认 OpenMV 一直显示 `WAIT SIGNAL`，不发送
    `COARSE_RESULT`；

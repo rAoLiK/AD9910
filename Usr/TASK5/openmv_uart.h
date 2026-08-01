@@ -35,7 +35,7 @@ bool OpenMV_UART_Send(uint8_t type,
 void OpenMV_UART_GetDiagnostics(
     openmv_uart_diagnostics_t *diagnostics);
 
-/* HAL callback forwarders. Return true only for UART5. */
+/* HAL callback forwarders. Return true only for USART2. */
 bool OpenMV_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 bool OpenMV_UART_TxCpltCallback(UART_HandleTypeDef *huart);
 bool OpenMV_UART_ErrorCallback(UART_HandleTypeDef *huart);

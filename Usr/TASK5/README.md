@@ -5,7 +5,7 @@
 | 文件 | 职责 |
 |---|---|
 | `openmv_protocol.*` | 帧编解码、CRC16/MODBUS、流式解析 |
-| `openmv_uart.*` | UART5 中断收发环形缓冲与主循环服务 |
+| `openmv_uart.*` | USART2 中断收发环形缓冲与主循环服务 |
 | `task5_controller.*` | Session/Test、可靠命令、单倍绝对频率搜索、视觉保持状态机 |
 | `visual_lock.*` | 基于图像运动速度的永久 DDS 频率闭环，硬限制 ±5 Hz |
 | `app_saw.*` | PA4 DAC、TIM6 TRGO、DMA1 Stream5 的满码锯齿波 |
@@ -13,7 +13,7 @@
 ## 执行结构
 
 ```text
-UART5 ISR -> RX ring -> OpenMV_UART_Service -> Task5_OnFrame
+USART2 ISR -> RX ring -> OpenMV_UART_Service -> Task5_OnFrame
 button EXTI -> debounce/hold event -> Task5_Start / Task5_Exit
 main loop -> Task5_Process -> UART TX / DAC / DDS / TJC HMI
 ```

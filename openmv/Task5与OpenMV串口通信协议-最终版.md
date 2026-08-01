@@ -24,8 +24,8 @@
 ## 2. 物理层与帧格式
 
 - 串口：115200、8N1、3.3 V、共地；
-- F407 `PC12/UART5_TX` → OpenMV `P13/UART7_RX`；
-- OpenMV `P14/UART7_TX` → F407 `PD2/UART5_RX`；
+- F407 `PA2/USART2_TX` → OpenMV `P13/UART7_RX`；
+- OpenMV `P14/UART7_TX` → F407 `PA3/USART2_RX`；
 - 多字节整数为小端；
 - CRC 为 CRC16/MODBUS，初值 `0xFFFF`。
 

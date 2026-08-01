@@ -54,8 +54,8 @@ Session，不再显示 `OpenMV bad result`。Task5 三个实体键始终可以�
 
 | F407 | OpenMV N6 | 作用 |
 |---|---|---|
-| PC12 / UART5_TX | P13 / UART7_RX | F407 发给 OpenMV |
-| PD2 / UART5_RX | P14 / UART7_TX | OpenMV 发给 F407 |
+| PA2 / USART2_TX | P13 / UART7_RX | F407 发给 OpenMV |
+| PA3 / USART2_RX | P14 / UART7_TX | OpenMV 发给 F407 |
 | GND | GND | 必须共地 |
 
 TX 和 RX 必须交叉连接，双方均使用 3.3 V 电平。
