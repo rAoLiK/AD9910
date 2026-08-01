@@ -51,22 +51,22 @@ code[i] = floor(i * 4095 / 99), i = 0..99
 
 ### 1.3 DAC/DDS 总输出选择
 
-STM32 使用 `PE6` 控制 Task5 总输出选择继电器：
+STM32 使用 `PE0` 控制 Task5 DDS/DAC 总输出选择：
 
-| PE6 电平 | 总输出信号 |
+| PE0 电平 | 总输出信号 |
 |---|---|
 | 低电平 | `PA4 / DAC_OUT1` 的单增锯齿波 |
 | 高电平 | DDS/Task1–4 输出支路 |
 
-上电初始化、安全初始状态以及 Task1–4 工作期间，PE6 均为高电平。
-Task5 启动粗识别锯齿波之前，STM32 将 PE6 拉低；收到有效
+上电初始化、安全初始状态以及 Task1–4 工作期间，PE0 均为高电平。
+Task5 启动粗识别锯齿波之前，STM32 将 PE0 拉低；收到有效
 `COARSE_RESULT` 后先停止 DAC，再配置 DDS，只有 DDS 配置成功后才将
-PE6 拉高。后续 `DDS_TEST` 搜索和本地相位锁定阶段始终保持高电平。
+PE0 拉高。后续 `DDS_TEST` 搜索和本地相位锁定阶段始终保持高电平。
 为便于联调，Task5 通信或运行错误时不会立即退出：STM32 会重新启动本次
-选择的 DAC 锯齿波并将 PE6 拉低。只有用户明确退出 Task5 时，才停止
-DAC 并将 PE6 恢复高电平。
+选择的 DAC 锯齿波并将 PE0 拉低。只有用户明确退出 Task5 时，才停止
+DAC 并将 PE0 恢复高电平。
 
-PE6 完全由 STM32 本地状态机控制，OpenMV 不发送任何额外控制字段或
+PE0 完全由 STM32 本地状态机控制，OpenMV 不发送任何额外控制字段或
 命令，也不应根据图像自行假定切换已经完成；应以收到的
 `START_TASK`、`DDS_TEST` 和 `STOP_TASK` 协议消息判断当前处理阶段。
 
@@ -481,7 +481,7 @@ UART5 发送队列在首次发送或 ACK 重发阶段持续失败时，也按 10
 - DDS 配置、搜索或本地相位锁定失败。
 
 进入错误态后，STM32 取消当前重试，不主动发送 `STOP_TASK`，重新输出
-本次按键选择的 1 kHz 或 10 kHz DAC 锯齿波，并保持 PE6 为低电平。
+本次按键选择的 1 kHz 或 10 kHz DAC 锯齿波，并保持 PE0 为低电平。
 因此 OpenMV 端可能仍保留当前 Session。用户退出 Task5 时 STM32 会尽力
 发送一次 `STOP_TASK(reason=0x01)`；用户从错误态重新选择模式时会发送
 `STOP_TASK(reason=0x04)`，随后启动新 Session。OpenMV 应在任一 STOP
@@ -664,10 +664,10 @@ CRC = 0x3696
 10. TARGET_REACHED 后 OpenMV 收到 STOP_TASK 并回到 IDLE；STM32 随后
     切入本地相位锁定。
 11. 拔掉 UART 或让 OpenMV 不应答，STM32 在超时后仍停留在 Task5，
-    显示具体错误原因和 `RX/CRC/U` 诊断计数；PE6 保持低电平且所选
+    显示具体错误原因和 `RX/CRC/U` 诊断计数；PE0 保持低电平且所选
     1 kHz/10 kHz 满码域 DAC 锯齿波继续输出。
 12. 从上述错误态退出 Task5，确认 OpenMV 最终收到尽力发送的 STOP_TASK，
-    STM32 随后停止 DAC 并将 PE6 恢复高电平。
+    STM32 随后停止 DAC 并将 PE0 恢复高电平。
 13. 在通信、DDS 搜索、本地锁相、已锁定和错误状态分别重选模式，确认
     OpenMV 依次收到旧 Session 的 `STOP_TASK(reason=0x04)` 与新 Session
     的 `START_TASK`，且旧 Session 的迟到结果不改变新 Session。

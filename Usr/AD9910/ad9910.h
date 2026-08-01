@@ -76,21 +76,21 @@ extern "C" {
 #define AD9910_IO_UPDATE_PORT            ((GPIO_TypeDef *)GPIOE)
 #endif
 #ifndef AD9910_IO_UPDATE_PIN
-#define AD9910_IO_UPDATE_PIN             (GPIO_PIN_2)
+#define AD9910_IO_UPDATE_PIN             (GPIO_PIN_15)
 #endif
 
 #ifndef AD9910_RESET_PORT
-#define AD9910_RESET_PORT                ((GPIO_TypeDef *)GPIOE)
+#define AD9910_RESET_PORT                ((GPIO_TypeDef *)GPIOB)
 #endif
 #ifndef AD9910_RESET_PIN
-#define AD9910_RESET_PIN                 (GPIO_PIN_4)
+#define AD9910_RESET_PIN                 (GPIO_PIN_11)
 #endif
 
 #ifndef AD9910_CS_PORT
 #define AD9910_CS_PORT                   ((GPIO_TypeDef *)GPIOE)
 #endif
 #ifndef AD9910_CS_PIN
-#define AD9910_CS_PIN                    (GPIO_PIN_1)
+#define AD9910_CS_PIN                    (GPIO_PIN_14)
 #endif
 
 #ifndef AD9910_IO_RESET_PORT
@@ -162,14 +162,14 @@ extern "C" {
 #define AD9910_SOFT_SCLK_PORT            ((GPIO_TypeDef *)GPIOE)
 #endif
 #ifndef AD9910_SOFT_SCLK_PIN
-#define AD9910_SOFT_SCLK_PIN             (GPIO_PIN_3)
+#define AD9910_SOFT_SCLK_PIN             (GPIO_PIN_13)
 #endif
 
 #ifndef AD9910_SOFT_SDIO_PORT
-#define AD9910_SOFT_SDIO_PORT            ((GPIO_TypeDef *)GPIOE)
+#define AD9910_SOFT_SDIO_PORT            ((GPIO_TypeDef *)GPIOB)
 #endif
 #ifndef AD9910_SOFT_SDIO_PIN
-#define AD9910_SOFT_SDIO_PIN             (GPIO_PIN_0)
+#define AD9910_SOFT_SDIO_PIN             (GPIO_PIN_10)
 #endif
 
 /* 软 SPI 读回数据脚（可选，不接则读回接口返回 NOT_SUPPORTED） */

@@ -3,9 +3,9 @@
 #include "stm32f4xx_hal.h"
 
 #define APP_RELAY_PORT             GPIOE
-#define APP_RELAY_PIN              GPIO_PIN_5
+#define APP_RELAY_PIN              GPIO_PIN_1
 #define APP_SIGNAL_SELECT_PORT     GPIOE
-#define APP_SIGNAL_SELECT_PIN      GPIO_PIN_6
+#define APP_SIGNAL_SELECT_PIN      GPIO_PIN_0
 #define APP_BUTTON_LINE_PORT       GPIOA
 #define APP_BUTTON_LINE_PIN        GPIO_PIN_0
 #define APP_BUTTON_CIRCLE_PORT     GPIOB

@@ -22,7 +22,7 @@ while (1) {
 |---|---|
 | `app_core.h/.c` | 纯 C 应用状态机、逻辑命令、错误收敛；不包含 HAL 或 TJC 类型 |
 | `app_hmi_map.h/.c` | 页面/控件/触发沿到逻辑命令的表驱动映射 |
-| `app_board.h/.c` | PE5 继电器、PA0/PB9/PB8 按键、EXTI 和安全输出 |
+| `app_board.h/.c` | PE1 输出通路、PE0 DDS/DAC 选择、PA0/PB9/PB8 按键、EXTI 和安全输出 |
 | `app_integration.h/.c` | 装配 PLL、TJC、板级端口，调度主循环并集中转发 UART 回调 |
 | `../TASK5/*` | UART5 OpenMV 协议、Task5 状态机及 PA4 DAC 锯齿波 |
 | `../PLL/pll_demo.*` | 非阻塞锁相服务及 ADC ISR 入口 |
@@ -144,8 +144,8 @@ ADC2 在放大器前，因此它只用于频率/相位反馈，不能验证放�
 
 | 资源 | 配置 |
 |---|---|
-| PE5 | 继电器；默认高电平直通 |
-| PE6 | Task5 总输出选择；高电平选择 DDS/Task1–4 支路，低电平选择 PA4 DAC 锯齿波 |
+| PE1 | 输出通路选择；默认高电平直通，低电平选择 DDS 路径 |
+| PE0 | Task5 DDS/DAC 选择；高电平选择 DDS/Task1–4 支路，低电平选择 PA4 DAC 锯齿波 |
 | PA0 | Task5 对角线（左下到右上的正斜率），按下接 3.3 V，内部下拉，EXTI 上升沿 |
 | PB9 | Task5 圆，按下接地，内部上拉，EXTI 下降沿 |
 | PB8 | Task5 ∞，按下接地，内部上拉，EXTI 下降沿 |
@@ -155,7 +155,7 @@ ADC2 在放大器前，因此它只用于频率/相位反馈，不能验证放�
 | TIM6/DMA1 Stream5 | 100 点锯齿波触发与循环搬运 |
 | DMA2 Stream0 | ADC1/ADC2 双重模式采样，保持原分配 |
 
-PE5 继电器极性由 `APP_RELAY_DIRECT_ACTIVE_HIGH` 控制。PE6 极性固定为
+PE1 输出通路极性由 `APP_RELAY_DIRECT_ACTIVE_HIGH` 控制。PE0 极性固定为
 高电平选择 DDS/Task1–4 支路、低电平选择 DAC 支路：Task1–4 和安全初始
 状态保持高电平；Task5 启动锯齿波前拉低，粗识别结束且 DDS 配置成功后
 重新拉高。Task5 通信或运行错误时重新拉低并保持本次选择的 DAC 锯齿波，
@@ -246,12 +246,12 @@ RAM:   27,168 bytes
 
 ## 11. 上板验收清单
 
-1. 上电停留 page0，PE5 为直通，DDS 零幅度，ADC/TIM2 未运行。
+1. 上电停留 page0，PE1 为高并选择直通，DDS 零幅度，ADC/TIM2 未运行。
 2. page0 b1 进入 page1，再由 page1 b7 进入 Task1，直通对角线正确。
 3. page1 b1 在 1-100 kHz 任意输入下进入 1×锁定并显示圆。
 4. page1 b2 进入 2×锁定并显示上下左右对称的“∞”。
 5. Task1 后选择 2/4/6 div 时确认走 DDS 且幅度误差不超过 0.2 div；
-   选择 8 div 时确认 PLL 停止、PE5 切到物理直通。Task2/3 的
+   选择 8 div 时确认 PLL 停止、PE1 切到物理直通。Task2/3 的
    2/4/6/8 div 均保持 DDS 锁相。
 6. 切换输入频率，确认重新捕获且没有长期停留
    `frequency_change_pending`。
@@ -260,7 +260,7 @@ RAM:   27,168 bytes
    再次短按或长按另一个模式键，确认旧 Session 被停止并进入新模式；
    Task1–4 页面按键无作用。
 8. 断开 UART5 或让 OpenMV 不应答，确认仍停留在 Task5 页面，屏幕显示
-   具体错误以及 `RX/CRC/U` 计数，PE6 为低且所选满码域 DAC 锯齿波持续。
+   具体错误以及 `RX/CRC/U` 计数，PE0 为低且所选满码域 DAC 锯齿波持续。
 9. 绝对频率确认后检查 DDS 直接呈现所选图像，所有视觉纠偏均在目标输出
    `±5 Hz` 内；锁定后让源频率小幅漂移，确认能原地重捕获且不退出。
 10. 暂时断开 OpenMV TX，确认 DDS 保持；恢复通信后确认视觉闭环恢复。
@@ -300,7 +300,7 @@ Task5 已实现 UART5 帧解析、CRC、ACK/NACK、同 SEQ 重发、Session/Test
 - 新固件主动发送的 9 字节 HEARTBEAT 已全部离开 UART5 TX 环并完成
   发送中断，但 OpenMV 未回 ACK；故障边界位于 STM32 UART5_TX 之后、
   OpenMV 回传之前。
-- 新固件板上复现无 ACK 后保持 `TASK5 + ERROR`；实测 PE6 为低，
+- 新固件板上复现无 ACK 后保持 `TASK5 + ERROR`；实测 PE0 为低，
   DAC1/TIM6/DMA1 Stream5 均运行，锯齿表端点为 `0x000/0xFFF`，
   DAC 启动错误和 DMA 欠载计数均为 0。
 
