@@ -23,6 +23,29 @@ class FakeDetector:
         return (90000, 25, 80, 0x03)
 
 
+class FakeSignalDetector:
+    def __init__(self):
+        self.confirm_frames = 6
+        self.consecutive_frames = 0
+        self.candidate_rect = None
+        self.accept_next = False
+
+    def reset(self):
+        self.consecutive_frames = 0
+        self.candidate_rect = None
+        self.accept_next = False
+
+    def update(self, frame):
+        del frame
+        if not self.accept_next:
+            self.consecutive_frames = 0
+            self.candidate_rect = None
+            return False
+        self.consecutive_frames = self.confirm_frames
+        self.candidate_rect = (160, 40, 120, 150)
+        return True
+
+
 class FakeLink:
     def __init__(self):
         self.replies = []
@@ -64,6 +87,7 @@ def load_protocol_controller():
     namespace = {
         "gc": gc,
         "struct": struct,
+        "InputSignalDetector": FakeSignalDetector,
         "LissajousStabilityDetector": FakeDetector,
     }
     module = ast.Module(body=selected, type_ignores=[])
@@ -145,10 +169,23 @@ def main():
     switch_payload = struct.pack("<HBI", 8, 1, 1000)
     switch_key = (namespace["TYPE_START_TASK"], 0x24, switch_payload)
     switch_controller._handle_start(0x24, switch_payload, switch_key)
-    assert switch_controller.state == namespace["STATE_COARSE"]
+    assert switch_controller.state == namespace["STATE_WAIT_SIGNAL"]
     assert switch_controller.session_id == 8
     assert switch_controller.lock_mode == 1
+    assert switch_controller.pending_model_spec is None
     assert switch_link.replies[-1][-1] == namespace["ACK_ACCEPTED"]
+
+    # START only selects the mode. No classifier may be loaded until the
+    # signal-presence gate confirms a real two-dimensional trace.
+    switch_controller.process_signal_frame(object())
+    assert switch_controller.state == namespace["STATE_WAIT_SIGNAL"]
+    assert switch_controller.pending_model_spec is None
+    switch_controller.prepare_classifier_if_needed()
+    assert switch_controller.classifier is None
+    switch_controller.signal_detector.accept_next = True
+    switch_controller.process_signal_frame(object())
+    assert switch_controller.state == namespace["STATE_COARSE"]
+    assert switch_controller.pending_model_spec is namespace["MODEL_1K_SPEC"]
 
     print("openmv lock-hold protocol tests passed")
 

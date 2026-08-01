@@ -60,6 +60,23 @@ COARSE_1K_CLUSTER_RADIUS = 0.4
 COARSE_10K_CLUSTER_RADIUS = 0.3
 COARSE_MIN_CONFIDENCE = 50
 
+# A START_TASK only means that the operator selected a Task5 mode. The
+# external source may be connected later, so do not expand the frequency
+# model or feed frames into it until a real two-dimensional XY trace has been
+# present for several consecutive frames. With only the scope scan channel
+# connected, the XY display is a narrow vertical line; the minimum width and
+# aspect-ratio gates below reject that idle pattern.
+SIGNAL_CONFIRM_FRAMES = 6
+SIGNAL_GREEN_MINUS_RED_MIN = 6
+SIGNAL_GREEN_MINUS_BLUE_MIN = 4
+SIGNAL_MASK_DILATION = 2
+SIGNAL_MIN_WIDTH_RATIO = 0.18
+SIGNAL_MAX_WIDTH_RATIO = 0.90
+SIGNAL_MIN_HEIGHT_RATIO = 0.25
+SIGNAL_MAX_HEIGHT_RATIO = 0.95
+SIGNAL_MIN_ASPECT = 0.60
+SIGNAL_MAX_ASPECT = 2.20
+
 # Second-stage Lissajous line/ellipse-family detector. Thresholds below cover
 # all 68 same-frequency calibration captures, including lines, ellipses and
 # circles. The short multi-frame vote rejects accidental conic-like snapshots.
@@ -3455,6 +3472,103 @@ MODEL_10K_SPEC = (
 )
 # ======================== PCA/KNN CLASSIFIER ======================
 
+class InputSignalDetector:
+    """Confirm that the oscilloscope XY window contains a valid input.
+
+    The source-absent reference scene still contains a bright green vertical
+    line, so pixel count alone is not sufficient. A valid unknown source
+    spreads the green XY trace in both axes. Requiring a suitably sized,
+    roughly square connected trace for consecutive frames prevents mode-button
+    frames, single-channel traces, and brief display refresh artifacts from
+    starting frequency recognition.
+    """
+
+    def __init__(self, confirm_frames=SIGNAL_CONFIRM_FRAMES):
+        self.confirm_frames = confirm_frames
+        self.reset()
+
+    def reset(self):
+        self.consecutive_frames = 0
+        self.candidate_rect = None
+        self.confirmed = False
+
+    @staticmethod
+    def _blob_rect(blob):
+        value = blob.rect
+        if isinstance(value, tuple):
+            return value
+        return value()
+
+    @staticmethod
+    def _blob_pixels(blob):
+        value = blob.pixels
+        if isinstance(value, int):
+            return value
+        return value()
+
+    def _find_candidate(self, frame):
+        green = frame.to_grayscale(rgb_channel=1, copy=True)
+        red_difference = frame.to_grayscale(rgb_channel=0, copy=True)
+        blue_difference = frame.to_grayscale(rgb_channel=2, copy=True)
+
+        red_difference.rsub(green)
+        red_difference.binary([(SIGNAL_GREEN_MINUS_RED_MIN, 255)])
+        blue_difference.rsub(green)
+        blue_difference.binary([(SIGNAL_GREEN_MINUS_BLUE_MIN, 255)])
+        red_difference.b_and(blue_difference)
+        red_difference.dilate(SIGNAL_MASK_DILATION)
+
+        frame_width = frame.width()
+        frame_height = frame.height()
+        blobs = red_difference.find_blobs(
+            [(1, 255)],
+            x_stride=1,
+            y_stride=1,
+            area_threshold=500,
+            pixels_threshold=250,
+            merge=False,
+        )
+        best_rect = None
+        best_score = -1.0
+        for blob in blobs:
+            x, y, width, height = self._blob_rect(blob)
+            center_x = x + (0.5 * width)
+            aspect = width / max(1.0, height)
+            if width < (SIGNAL_MIN_WIDTH_RATIO * frame_width):
+                continue
+            if width > (SIGNAL_MAX_WIDTH_RATIO * frame_width):
+                continue
+            if height < (SIGNAL_MIN_HEIGHT_RATIO * frame_height):
+                continue
+            if height > (SIGNAL_MAX_HEIGHT_RATIO * frame_height):
+                continue
+            if aspect < SIGNAL_MIN_ASPECT or aspect > SIGNAL_MAX_ASPECT:
+                continue
+            if center_x < (0.10 * frame_width):
+                continue
+            if center_x > (0.90 * frame_width):
+                continue
+
+            score = self._blob_pixels(blob) * width * height
+            if score > best_score:
+                best_score = score
+                best_rect = (x, y, width, height)
+        return best_rect
+
+    def update(self, frame):
+        candidate = self._find_candidate(frame)
+        self.candidate_rect = candidate
+        if candidate is None:
+            self.consecutive_frames = 0
+            self.confirmed = False
+            return False
+
+        self.consecutive_frames += 1
+        if self.consecutive_frames >= self.confirm_frames:
+            self.consecutive_frames = self.confirm_frames
+            self.confirmed = True
+        return self.confirmed
+
 class RatioResult:
     def __init__(self):
         self.found = False
@@ -5411,6 +5525,7 @@ STATE_WAIT_DDS = 2
 STATE_DDS_RECOGNIZING = 3
 STATE_VISUAL_LOCK = 4
 STATE_LOCK_HOLD = 5
+STATE_WAIT_SIGNAL = 6
 
 
 def ticks_ms():
@@ -5522,6 +5637,7 @@ def annotate(frame, controller, fps):
         "DDS",
         "VISUAL",
         "LOCK HOLD",
+        "WAIT SIGNAL",
     )
     state_name = (
         state_names[controller.state]
@@ -5543,6 +5659,8 @@ def annotate(frame, controller, fps):
         information_line = "VISUAL HOLD  +/-5Hz  MANUAL EXIT"
     elif controller.state == STATE_VISUAL_LOCK:
         information_line = "VISUAL 1X LINE  STREAMING"
+    elif controller.state == STATE_WAIT_SIGNAL:
+        information_line = "CONNECT INPUT SIGNAL"
     elif controller.state == STATE_DDS_RECOGNIZING:
         detector = controller.stability_detector
         information_line = "ROI:%d V:%02d D:%02d X:%02d" % (
@@ -5579,6 +5697,12 @@ def annotate(frame, controller, fps):
         status_line = "P:%5.1f D:%4.2fHz FPS:%3.1f" % (
             controller.visual_phase_mdeg / 1000.0,
             controller.visual_speed_millihz / 1000.0,
+            fps,
+        )
+    elif controller.state == STATE_WAIT_SIGNAL:
+        status_line = "VALID:%d/%d  FPS:%3.1f" % (
+            controller.signal_detector.consecutive_frames,
+            controller.signal_detector.confirm_frames,
             fps,
         )
     elif controller.state == STATE_DDS_RECOGNIZING:
@@ -5630,6 +5754,7 @@ class Task5Controller:
         self.last_completed_session = 0
 
         self.classifier = None
+        self.signal_detector = InputSignalDetector()
         self.stability_detector = LissajousStabilityDetector()
         self.pending_model_spec = None
         self.model_retry_due_ms = 0
@@ -5692,6 +5817,7 @@ class Task5Controller:
         self.saw_frequency_hz = 0
         self.start_command_key = None
         self.classifier = None
+        self.signal_detector.reset()
         self.pending_model_spec = None
         self.model_retry_due_ms = 0
         self.model_error_count = 0
@@ -5814,23 +5940,22 @@ class Task5Controller:
             self.link.send_nack(TYPE_START_TASK, sequence, ERR_SESSION)
             return
 
-        # ACK is deliberately sent before model expansion or recognition.
+        # ACK confirms the mode-button event only. The external source may be
+        # connected later, so model expansion and recognition remain gated by
+        # the independent input-signal detector.
         self.link.send_ack(
             TYPE_START_TASK,
             sequence,
             ACK_ACCEPTED,
         )
-        self.state = STATE_COARSE
+        self.state = STATE_WAIT_SIGNAL
         self.session_id = session_id
         self.lock_mode = lock_mode
         self.saw_frequency_hz = saw_frequency_hz
         self.start_command_key = command_key
-        self.pending_model_spec = (
-            MODEL_1K_SPEC
-            if saw_frequency_hz == 1000
-            else MODEL_10K_SPEC
-        )
+        self.pending_model_spec = None
         self.classifier = None
+        self.signal_detector.reset()
         self.model_retry_due_ms = 0
         self.model_error_count = 0
         now = ticks_ms()
@@ -5856,7 +5981,7 @@ class Task5Controller:
         self.stability_detector.reset_session()
         self._clear_result_cache()
         print(
-            "【开始粗识别】任务%d，扫描%d Hz，模式%d"
+            "[wait signal] session %d, scan %d Hz, mode %d"
             % (session_id, saw_frequency_hz, lock_mode)
         )
 
@@ -6169,6 +6294,43 @@ class Task5Controller:
         for received in self.link.poll():
             self.handle_received(received)
 
+    def process_signal_frame(self, frame):
+        if self.state != STATE_WAIT_SIGNAL:
+            return
+
+        confirmed = self.signal_detector.update(frame)
+        self.last_rect = self.signal_detector.candidate_rect
+        if not confirmed:
+            return
+
+        # Start every recognition timer at the confirmation boundary. Time
+        # spent waiting for the operator to connect the source must never make
+        # the coarse fallback immediately eligible.
+        now = ticks_ms()
+        self.state = STATE_COARSE
+        self.pending_model_spec = (
+            MODEL_1K_SPEC
+            if self.saw_frequency_hz == 1000
+            else MODEL_10K_SPEC
+        )
+        self.classifier = None
+        self.model_retry_due_ms = now
+        self.model_error_count = 0
+        self.coarse_started_ms = now
+        self.coarse_last_trace_ms = now
+        self.coarse_last_decision_ms = now
+        self.coarse_history = []
+        self.coarse_fallback_history = []
+        self.coarse_estimated_hz = 0
+        self.coarse_confidence = 0
+        self.display_ratio = 0.0
+        self._clear_result_cache()
+        gc.collect()
+        print(
+            "[signal confirmed] session %d, start frequency recognition"
+            % self.session_id
+        )
+
     def prepare_classifier_if_needed(self):
         if (
             self.state != STATE_COARSE
@@ -6418,6 +6580,7 @@ while True:
 
     # A command arriving during snapshot is acknowledged before PCA work.
     controller.poll_uart()
+    controller.process_signal_frame(frame)
     controller.process_coarse_frame(frame)
     controller.process_dds_frame(frame)
     controller.process_visual_lock_frame(frame)

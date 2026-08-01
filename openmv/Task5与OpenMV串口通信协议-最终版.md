@@ -5,7 +5,8 @@
 
 ## 1. 必须满足的行为
 
-1. 三种题型都先用单倍 DDS 候选确定绝对输入频率。
+1. 实体按键只负责选择题型；OpenMV 必须先确认外部信号有效，再开始频率
+   识别。三种题型都使用单倍 DDS 候选确定绝对输入频率。
 2. 绝对频率一经确认立即响铃，不等待相位锁定。
 3. 随后直接设置题目要求的图像：
    - 对角线：单倍频、0°，方向为左下到右上；
@@ -83,6 +84,13 @@ session_id:u16, lock_mode:u8, saw_frequency_hz:u32
 `lock_mode`：0 对角线、1 圆、2 “∞”；锯齿波只允许 1000 或 10000 Hz。
 `LOCK_HOLD` 中收到不同 Session 的新 START，视为实体按键人工重选，可原子
 切换到新 Session。
+
+OpenMV ACK `START_TASK` 后进入内部 `WAIT_SIGNAL` 状态。该 ACK 只确认模式
+选择，不代表信号已经接入。在 `WAIT_SIGNAL` 中不得加载频率模型、累计粗识别
+结果或启动粗识别回退计时；无输入时 XY 区域的绿色细竖线不是有效信号。
+只有绿色轨迹横纵跨度均满足条件并连续有效 6 帧后，才进入 `COARSE` 并从零
+开始识别计时。等待期间 STM32 继续处于 `WAIT_COARSE_RESULT`，协议无需新增
+消息类型。
 
 ### 4.2 COARSE_RESULT `0x11`
 
@@ -180,15 +188,17 @@ WAIT_SELECTION
 OpenMV：
 
 ```text
-IDLE -> COARSE -> WAIT_DDS <-> DDS_RECOGNIZING
-                           -> LOCK_HOLD -> 持续发送视觉样本
+IDLE -> WAIT_SIGNAL -> COARSE -> WAIT_DDS <-> DDS_RECOGNIZING
+                                          -> LOCK_HOLD -> 持续发送视觉样本
 LOCK_HOLD -- explicit EXIT --> IDLE
-LOCK_HOLD -- manual new START --> COARSE(new session)
+LOCK_HOLD -- manual new START --> WAIT_SIGNAL(new session)
 ```
 
 ## 6. 验收要点
 
 - 三种模式找频阶段全部使用单倍频率；
+- 未接入外部信号时按模式键，OpenMV 保持 `WAIT_SIGNAL` 且不发送
+  `COARSE_RESULT`；接入后必须连续确认 6 帧才进入 `COARSE`；
 - 绝对频率确认时只响铃一次；
 - 双环只在确认后设置一次二倍种子，不发生重复倍频或超高频输出；
 - 对角线方向为左下到右上；圆和双环相位不会被直线对齐逻辑修改；

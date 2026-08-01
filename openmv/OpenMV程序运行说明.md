@@ -15,6 +15,13 @@ F407 在 `START_TASK` 中发送的 `saw_freq_hz` 决定使用哪个模型：
 - `10000`：使用 10 kHz 扫描模型；
 - 其他值：返回 `NACK 0x04`，OpenMV 不会自行猜测扫描频率。
 
+`START_TASK` 只确认题型按键已经按下。OpenMV ACK 后先进入 `WAIT SIGNAL`，
+此时不会加载 PCA/KNN 模型，也不会把无输入画面送入频率识别。程序以绿色
+XY 轨迹的二维跨度区分有效输入和无输入时的细竖线，并要求连续 6 帧有效；
+中间任何无效帧都会清零计数。确认后才进入 `COARSE`、加载对应档位模型，
+并从该时刻重新开始粗识别的聚类与 30 秒回退计时。IDE 叠字会显示
+`CONNECT INPUT SIGNAL` 和 `VALID:n/6` 便于联调。
+
 1 kHz 与 10 kHz 均使用对应参考程序中的 1820 张新数据集模型、最近
 20 帧中的至少 12 个有效结果，并以 1 秒为周期做聚类投票；1 kHz 的
 聚类半径为 ±0.4 倍，10 kHz 为 ±0.3 倍。任一档连续 1.2 秒丢失波形时
@@ -70,6 +77,7 @@ self.buffer = self.buffer[consumed:]
 - `START_TASK`、`COARSE_RESULT`、`DDS_TEST`、
   `DDS_TEST_RESULT`、`LOCK_HOLD`、`EXIT_TASK`、`HEARTBEAT`；
 - 耗时处理前立即 ACK；
+- `START_TASK` 后先等待有效输入，再启动粗频率识别；
 - 重复命令不重复执行，结果帧按原 SEQ 原字节重发；
 - Session、状态、范围、忙状态及长度检查；
 - 串口信息采用简短中文提示，IDE 图像保留瞄准框；`0x30` 只保留旧实验兼容，

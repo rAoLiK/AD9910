@@ -11,6 +11,7 @@
 
 ```text
 人工选择题型
+  -> OpenMV 等待有效信号输入（二维 XY 轨迹连续 6 帧）
   -> DAC 1 kHz/10 kHz 粗识别
   -> 单倍 DDS 100 Hz 网格确定绝对输入频率
   -> 立即响铃
@@ -20,6 +21,12 @@
   -> F407 在目标输出 ±5 Hz 内微调 DDS，使李萨如图像稳定
   -> 一直保持，直到人工退出或人工重选
 ```
+
+`START_TASK` 只表示实体按键已经选定题型，不表示外部信号源已经接入。
+OpenMV 收到并 ACK 后先进入 `WAIT_SIGNAL`；此时不加载 PCA/KNN 模型、不累计
+粗识别历史，也不启动 30 秒粗识别回退计时。无输入参考画面中的绿色细竖线
+不算有效信号；只有绿色 XY 轨迹在横、纵两个方向都有足够跨度并连续满足
+6 帧，才进入 `COARSE`。任一无效帧都会把连续计数清零。
 
 目标图形：对角线为左下到右上、单倍频、0°；圆为单倍频、-90°；“∞”
 为二倍频、广义相位 0°。“∞”只在绝对频率确定后乘二一次。
@@ -50,14 +57,17 @@ Task5 主路径不启动本地 ADC PLL。`LOCK_HOLD` 不是静态等待状态：
 
 1. 核对 UART7/UART5 交叉接线、共地和 `115200 8N1`；
 2. 确认双方 `VER=0x02`；
-3. 验证三种模式的 DDS_TEST 始终为单倍候选；
-4. TARGET 后确认只响铃一次，并收到 `LOCK_HOLD(0x32)`；
-5. 检查对角线方向、圆及“∞”图形正确；
-6. 记录 DDS 命令，确认所有视觉微调都未超过目标 `±5 Hz`；
-7. 让源频率小幅漂移，确认图像重新稳定且 Task5 不退出；
-8. 暂时断开 OpenMV TX，确认 DDS 保持；恢复后确认视觉样本与闭环恢复；
-9. 用串口屏 `exit`/返回键退出，确认双方回安全态/IDLE；
-10. 在保持态按另一模式键，确认能人工切换到新 Session。
+3. 不接外部信号按模式键，确认 OpenMV 一直显示 `WAIT SIGNAL`，不发送
+   `COARSE_RESULT`；
+4. 接入信号，确认连续 6 帧后才显示 `COARSE` 并开始频率识别；
+5. 验证三种模式的 DDS_TEST 始终为单倍候选；
+6. TARGET 后确认只响铃一次，并收到 `LOCK_HOLD(0x32)`；
+7. 检查对角线方向、圆及“∞”图形正确；
+8. 记录 DDS 命令，确认所有视觉微调都未超过目标 `±5 Hz`；
+9. 让源频率小幅漂移，确认图像重新稳定且 Task5 不退出；
+10. 暂时断开 OpenMV TX，确认 DDS 保持；恢复后确认视觉样本与闭环恢复；
+11. 用串口屏 `exit`/返回键退出，确认双方回安全态/IDLE；
+12. 在保持态按另一模式键，确认能人工切换到新 Session。
 
 ## 主机回归
 
@@ -66,5 +76,6 @@ gcc -std=c11 -Wall -Wextra -Werror -IUsr\TASK5 analysis\test_openmv_protocol.c U
 gcc -std=c11 -Wall -Wextra -Werror -IUsr\TASK5 analysis\test_visual_lock.c Usr\TASK5\visual_lock.c -lm -o analysis\test_visual_lock.exe
 gcc -std=c11 -Wall -Wextra -Werror -IUsr\TASK5 analysis\test_task5_controller.c Usr\TASK5\task5_controller.c Usr\TASK5\openmv_protocol.c Usr\TASK5\visual_lock.c -o analysis\test_task5_controller.exe
 python analysis\test_openmv_lock_hold_protocol.py
+python analysis\test_openmv_input_signal_gate.py
 python analysis\test_lissajous_stability.py
 ```
